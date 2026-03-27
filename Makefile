@@ -13,8 +13,6 @@ DC_FILE   := docker-compose.yml
 
 REDIS_TIMEOUT      := 30
 MONGO_TIMEOUT      := 45
-KAFKA_TIMEOUT      := 90
-LOCALSTACK_TIMEOUT := 60
 
 GREEN  := \033[0;32m
 YELLOW := \033[0;33m
@@ -38,12 +36,20 @@ tidy:      ## Tidy go.mod and go.sum
 
 
 install-lint: ## Install golangci-lint if not present
-ifndef LINT_BIN
-	@echo "golangci-lint not found. Installing..."
-	go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
-else
-	@echo "golangci-lint is already installed."
-endif
+	@if ! command -v golangci-lint &> /dev/null; then \
+		echo "golangci-lint not found. Installing..."; \
+		go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest; \
+	else \
+		echo "golangci-lint is already installed."; \
+	fi
+
+install-releaser: ## Install goreleaser if not present
+	@if ! command -v goreleaser &> /dev/null; then \
+		echo "goreleaser not found. Installing..."; \
+		go install github.com/goreleaser/goreleaser/v2@latest; \
+	else \
+		echo "goreleaser is already installed."; \
+	fi
 
 # Code quality
 lint: install-lint ## Run linter
@@ -57,19 +63,10 @@ test-unit: ## Run unit tests (starts Redis + MongoDB if needed)
 	@$(DC) -f $(DC_FILE) up -d redis mongodb && $(MAKE) _wait-redis && $(MAKE) _wait-mongo
 	$(GOTEST) -v -race -count=1 -timeout=120s ./tests/unit/... 2>&1 | tee /tmp/sluice-unit.log
 
-test-integration: docker-up ## Run all integration tests
+test-integration: docker-up ## Run integration tests
 	REDIS_ADDR=localhost:6379 MONGO_URI=mongodb://localhost:27017 \
-	SQS_ENDPOINT=http://localhost:4566 KAFKA_BROKER=localhost:9092 \
 	$(GOTEST) -v -race -count=1 -timeout=300s -tags=integration \
 		./tests/integration/... 2>&1 | tee /tmp/sluice-integration.log
-
-test-integration-sqs: docker-up ## Run only SQS integration tests
-	REDIS_ADDR=localhost:6379 MONGO_URI=mongodb://localhost:27017 SQS_ENDPOINT=http://localhost:4566 \
-	$(GOTEST) -v -race -count=1 -timeout=180s -tags=integration -run TestSQS ./tests/integration/...
-
-test-integration-kafka: docker-up ## Run only Kafka integration tests
-	REDIS_ADDR=localhost:6379 MONGO_URI=mongodb://localhost:27017 KAFKA_BROKER=localhost:9092 \
-	$(GOTEST) -v -race -count=1 -timeout=240s -tags=integration -run TestKafka ./tests/integration/...
 
 test-all: test-unit test-integration ## Run unit + integration then tear down
 	@$(MAKE) docker-down && printf "$(GREEN)▶ All tests passed.$(RESET)\n"
@@ -79,10 +76,10 @@ coverage: ## Generate HTML coverage report
 	$(GO) tool cover -html=/tmp/sluice-coverage.out -o /tmp/sluice-coverage.html
 	@$(GO) tool cover -func=/tmp/sluice-coverage.out | tail -1
 
-docker-up: ## Start Redis, MongoDB, Kafka, LocalStack
+docker-up: ## Start Redis, MongoDB
 	@printf "$(GREEN)▶ Starting integration stack...$(RESET)\n"
 	$(DC) -f $(DC_FILE) up -d --remove-orphans
-	@$(MAKE) _wait-redis && $(MAKE) _wait-mongo && $(MAKE) _wait-kafka && $(MAKE) _wait-localstack
+	@$(MAKE) _wait-redis && $(MAKE) _wait-mongo
 	@printf "$(GREEN)▶ All services healthy.$(RESET)\n"
 
 docker-down: ## Stop all integration services
@@ -93,10 +90,10 @@ docker-logs: ## Tail logs from all services
 
 docker-restart: docker-down docker-up ## Restart the full stack
 
-release-snapshot: ## Build release snapshot locally
+release-snapshot: install-releaser ## Build release snapshot locally
 	$(GORELEASER) release --snapshot --clean
 
-release-check: ## Validate .goreleaser.yml
+release-check: install-releaser ## Validate .goreleaser.yml
 	$(GORELEASER) check
 
 clean: ## Remove build artefacts and test cache
@@ -116,15 +113,3 @@ _wait-mongo:
 	for i in $$(seq 1 $(MONGO_TIMEOUT)); do \
 		docker exec sluice_mongo mongosh --eval "db.adminCommand('ping').ok" --quiet 2>/dev/null | grep -q 1 && printf " $(GREEN)ready$(RESET)\n" && exit 0; \
 		printf "."; sleep 1; done; printf "\n$(RED)MongoDB timeout$(RESET)\n"; exit 1
-
-_wait-kafka:
-	@printf "$(YELLOW)  Waiting for Kafka$(RESET)"; \
-	for i in $$(seq 1 $(KAFKA_TIMEOUT)); do \
-		docker exec sluice_kafka kafka-topics --bootstrap-server localhost:9092 --list >/dev/null 2>&1 && printf " $(GREEN)ready$(RESET)\n" && exit 0; \
-		printf "."; sleep 1; done; printf "\n$(RED)Kafka timeout$(RESET)\n"; exit 1
-
-_wait-localstack:
-	@printf "$(YELLOW)  Waiting for LocalStack$(RESET)"; \
-	for i in $$(seq 1 $(LOCALSTACK_TIMEOUT)); do \
-		curl -sf http://localhost:4566/_localstack/health 2>/dev/null | grep -q '"sqs": "available"' && printf " $(GREEN)ready$(RESET)\n" && exit 0; \
-		printf "."; sleep 1; done; printf "\n$(RED)LocalStack timeout$(RESET)\n"; exit 1
