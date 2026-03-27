@@ -53,8 +53,8 @@ lint: install-lint ## Run linter
 fmt:       ## Format all Go source files
 	$(GO) fmt ./...
 
-test-unit: ## Run unit tests (starts Redis if needed)
-	@$(DC) -f $(DC_FILE) up -d redis && $(MAKE) _wait-redis
+test-unit: ## Run unit tests (starts Redis + MongoDB if needed)
+	@$(DC) -f $(DC_FILE) up -d redis mongodb && $(MAKE) _wait-redis && $(MAKE) _wait-mongo
 	$(GOTEST) -v -race -count=1 -timeout=120s ./tests/unit/... 2>&1 | tee /tmp/sluice-unit.log
 
 test-integration: docker-up ## Run all integration tests

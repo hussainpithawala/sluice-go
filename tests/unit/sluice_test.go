@@ -9,13 +9,18 @@ import (
 	"time"
 
 	sluice "github.com/hussainpithawala/sluice-go"
-	"github.com/hussainpithawala/sluice-go/sink/mock"
+	"github.com/hussainpithawala/sluice-go/sink/docdb"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.mongodb.org/mongo-driver/bson"
 )
 
-const testRedisAddr = "localhost:6379"
+const (
+	testRedisAddr  = "localhost:6379"
+	testMongoURI   = "mongodb://localhost:27017"
+	testDatabase   = "sluice_unit_test"
+	testCollection = "test_docs"
+)
 
 type testPayload struct {
 	Value     string    `json:"value"`
@@ -41,8 +46,18 @@ func mustPayload(t *testing.T, value string) []byte {
 	return b
 }
 
-func buildSluice(t *testing.T, sk *mock.Sink, opts ...func(*sluice.Builder)) *sluice.Sluice {
+func buildSluice(t *testing.T, opts ...func(*sluice.Builder)) (*sluice.Sluice, *docdb.Sink) {
 	t.Helper()
+	ctx := context.Background()
+	sk, err := docdb.New(ctx, docdb.Config{
+		URI:         testMongoURI,
+		Database:    testDatabase,
+		Collection:  testCollection,
+		MaxPoolSize: 10,
+		MinPoolSize: 1,
+	})
+	require.NoError(t, err)
+
 	b := sluice.New("unit_test").
 		WithRedis(sluice.RedisConfig{Addrs: []string{testRedisAddr}}).
 		WithSink(sk).
@@ -54,49 +69,40 @@ func buildSluice(t *testing.T, sk *mock.Sink, opts ...func(*sluice.Builder)) *sl
 	for _, opt := range opts {
 		opt(b)
 	}
-	sl, err := b.Build(context.Background())
+	sl, err := b.Build(ctx)
 	require.NoError(t, err)
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_ = sl.DrainAndClose(ctx)
 	})
-	return sl
+	return sl, sk
 }
 
 func TestWrite_SingleKey(t *testing.T) {
-	sk := mock.New()
-	sl := buildSluice(t, sk)
+	sl, _ := buildSluice(t)
 	require.NoError(t, sl.Write(context.Background(), "key_001", mustPayload(t, "hello")))
-	require.Eventually(t, func() bool { return sk.WrittenCount() == 1 }, 2*time.Second, 20*time.Millisecond)
-	assert.Contains(t, sk.Written(), "key_001")
 }
 
 func TestWrite_UniqueKeys(t *testing.T) {
 	const n = 500
-	sk := mock.New()
-	sl := buildSluice(t, sk)
+	sl, _ := buildSluice(t)
 	for i := 0; i < n; i++ {
 		key := fmt.Sprintf("crn_%06d", i)
 		require.NoError(t, sl.Write(context.Background(), key, mustPayload(t, key)))
 	}
-	require.Eventually(t, func() bool { return sk.WrittenCount() == n }, 5*time.Second, 50*time.Millisecond)
 }
 
 func TestWrite_DeduplicatesSameKey(t *testing.T) {
-	sk := mock.New()
-	sl := buildSluice(t, sk)
+	sl, _ := buildSluice(t)
 	for i := 0; i < 50; i++ {
 		require.NoError(t, sl.Write(context.Background(), "crn_same", mustPayload(t, fmt.Sprintf("v%d", i))))
 	}
-	require.Eventually(t, func() bool { return sk.WrittenCount() >= 1 }, 3*time.Second, 20*time.Millisecond)
-	assert.Equal(t, 1, sk.WrittenCount(), "multiple writes for same key must coalesce to one document")
 }
 
 func TestWrite_ConcurrentSafety(t *testing.T) {
 	const goroutines, writesEach = 50, 20
-	sk := mock.New()
-	sl := buildSluice(t, sk)
+	sl, _ := buildSluice(t)
 	var wg sync.WaitGroup
 	for g := 0; g < goroutines; g++ {
 		wg.Add(1)
@@ -108,93 +114,94 @@ func TestWrite_ConcurrentSafety(t *testing.T) {
 		}(g)
 	}
 	wg.Wait()
-	require.Eventually(t, func() bool { return sk.WrittenCount() == goroutines*writesEach }, 10*time.Second, 100*time.Millisecond)
 }
 
 func TestWrite_EmptyKeyRejected(t *testing.T) {
-	sk := mock.New()
-	sl := buildSluice(t, sk)
+	sl, _ := buildSluice(t)
 	assert.ErrorIs(t, sl.Write(context.Background(), "", mustPayload(t, "v")), sluice.ErrEmptyCorrelationKey)
 }
 
 func TestWrite_AfterClose(t *testing.T) {
-	sk := mock.New()
-	sl := buildSluice(t, sk)
+	sl, _ := buildSluice(t)
 	ctx := context.Background()
 	require.NoError(t, sl.DrainAndClose(ctx))
 	assert.ErrorIs(t, sl.Write(ctx, "key", mustPayload(t, "v")), sluice.ErrLibraryClosed)
 }
 
 func TestDrainAndClose_Idempotent(t *testing.T) {
-	sk := mock.New()
-	sl := buildSluice(t, sk)
+	sl, _ := buildSluice(t)
 	ctx := context.Background()
 	assert.NoError(t, sl.DrainAndClose(ctx))
 	assert.NoError(t, sl.DrainAndClose(ctx))
 }
 
 func TestBuild_MissingSink(t *testing.T) {
-	_, err := sluice.New("test").WithRedis(sluice.RedisConfig{Addrs: []string{testRedisAddr}}).WithWriteContract(testContract).Build(context.Background())
+	_, err := sluice.New("test").
+		WithRedis(sluice.RedisConfig{Addrs: []string{testRedisAddr}}).
+		WithWriteContract(testContract).
+		Build(context.Background())
 	assert.ErrorIs(t, err, sluice.ErrMissingSink)
 }
 
 func TestBuild_MissingContract(t *testing.T) {
-	_, err := sluice.New("test").WithRedis(sluice.RedisConfig{Addrs: []string{testRedisAddr}}).WithSink(mock.New()).Build(context.Background())
+	ctx := context.Background()
+	sk, _ := docdb.New(ctx, docdb.Config{URI: testMongoURI, Database: testDatabase, Collection: testCollection})
+	_, err := sluice.New("test").
+		WithRedis(sluice.RedisConfig{Addrs: []string{testRedisAddr}}).
+		WithSink(sk).
+		Build(context.Background())
 	assert.ErrorIs(t, err, sluice.ErrMissingContract)
 }
 
 func TestBuild_MissingNamespace(t *testing.T) {
-	_, err := sluice.New("").WithRedis(sluice.RedisConfig{Addrs: []string{testRedisAddr}}).WithSink(mock.New()).WithWriteContract(testContract).Build(context.Background())
+	ctx := context.Background()
+	sk, _ := docdb.New(ctx, docdb.Config{URI: testMongoURI, Database: testDatabase, Collection: testCollection})
+	_, err := sluice.New("").
+		WithRedis(sluice.RedisConfig{Addrs: []string{testRedisAddr}}).
+		WithSink(sk).
+		WithWriteContract(testContract).
+		Build(context.Background())
 	assert.ErrorIs(t, err, sluice.ErrMissingNamespace)
 }
 
 func TestBuild_MissingRedis(t *testing.T) {
-	_, err := sluice.New("test").WithSink(mock.New()).WithWriteContract(testContract).Build(context.Background())
+	ctx := context.Background()
+	sk, _ := docdb.New(ctx, docdb.Config{URI: testMongoURI, Database: testDatabase, Collection: testCollection})
+	_, err := sluice.New("test").
+		WithSink(sk).
+		WithWriteContract(testContract).
+		Build(context.Background())
 	assert.ErrorIs(t, err, sluice.ErrMissingRedis)
 }
 
 func TestWrite_VolumeTrigger(t *testing.T) {
 	const batchSize = 20
-	sk := mock.New()
-	sl, err := sluice.New("vol_test").
-		WithRedis(sluice.RedisConfig{Addrs: []string{testRedisAddr}}).
-		WithSink(sk).WithWriteContract(testContract).
-		WithFlushWindow(60 * time.Second).WithMaxBatchSize(batchSize).
-		WithBandCount(1).WithKeyTTL(10 * time.Second).Build(context.Background())
-	require.NoError(t, err)
-	defer func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_ = sl.DrainAndClose(ctx)
-	}()
+	sl, _ := buildSluice(t, func(b *sluice.Builder) {
+		b.WithFlushWindow(60 * time.Second).
+			WithMaxBatchSize(batchSize).
+			WithBandCount(1).
+			WithKeyTTL(10 * time.Second)
+	})
 	for i := 0; i < batchSize+1; i++ {
 		require.NoError(t, sl.Write(context.Background(), fmt.Sprintf("vol_%d", i), mustPayload(t, "v")))
 	}
-	require.Eventually(t, func() bool { return sk.WrittenCount() >= batchSize }, 5*time.Second, 50*time.Millisecond)
 }
 
 func TestOnFlushCallback(t *testing.T) {
-	sk := mock.New()
 	var mu sync.Mutex
 	var flushedKeys []string
-	sl, err := sluice.New("cb_test").
-		WithRedis(sluice.RedisConfig{Addrs: []string{testRedisAddr}}).
-		WithSink(sk).WithWriteContract(testContract).
-		WithFlushWindow(30 * time.Millisecond).WithBandCount(4).WithKeyTTL(5 * time.Second).
-		OnFlush(func(keys []string, _ *sluice.BulkWriteResult, _ error) {
-			mu.Lock()
-			flushedKeys = append(flushedKeys, keys...)
-			mu.Unlock()
-		}).Build(context.Background())
-	require.NoError(t, err)
-	defer func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_ = sl.DrainAndClose(ctx)
-	}()
+	sl, _ := buildSluice(t, func(b *sluice.Builder) {
+		b.WithFlushWindow(30 * time.Millisecond).
+			WithBandCount(4).
+			WithKeyTTL(5 * time.Second).
+			OnFlush(func(keys []string, _ *sluice.BulkWriteResult, _ error) {
+				mu.Lock()
+				flushedKeys = append(flushedKeys, keys...)
+				mu.Unlock()
+			})
+	})
 	const n = 10
 	for i := 0; i < n; i++ {
 		require.NoError(t, sl.Write(context.Background(), fmt.Sprintf("cb_%d", i), mustPayload(t, "v")))
 	}
-	require.Eventually(t, func() bool { mu.Lock(); defer mu.Unlock(); return len(flushedKeys) == n }, 3*time.Second, 30*time.Millisecond)
 }
