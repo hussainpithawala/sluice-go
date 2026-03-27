@@ -1,6 +1,6 @@
 # sluice
 
-[![CI](https://github.com/hussainpithawala/sluice-go/actions/workflows/ci.yml/badge.svg)](https://github.com/hussainpithawala/sluice-go/actions/workflows/ci.yml)
+[![Release](https://github.com/hussainpithawala/sluice-go/actions/workflows/release.yml/badge.svg)](https://github.com/hussainpithawala/sluice-go/actions/workflows/release.yml)
 [![Go Reference](https://pkg.go.dev/badge/github.com/hussainpithawala/sluice-go.svg)](https://pkg.go.dev/github.com/hussainpithawala/sluice-go)
 [![Go Version](https://img.shields.io/badge/go-1.25-blue)](https://go.dev)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
