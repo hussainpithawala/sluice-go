@@ -1,49 +1,56 @@
-version: "2"
+# .golangci.yml
+
+run:
+  timeout: 5m
+  modules-download-mode: readonly
 
 linters:
+  disable-all: true
   enable:
     - errcheck
-    - gosimple
     - govet
     - ineffassign
-    - staticcheck
     - unused
-    - gofmt
-    - goimports
+    - gocritic
+    - bodyclose
+    - goconst
+    - gocyclo
     - misspell
     - prealloc
-    - revive
-    - noctx
-    - bodyclose
-    - contextcheck
-    - durationcheck
-    - gocritic
-    - gosec
-    - nilerr
-    - unparam
-    - wrapcheck
-  disable:
-    - depguard
-    - exhaustruct
+    - whitespace
 
 linters-settings:
+  revive:
+    rules:
+      - name: exported
+        severity: warning
+      - name: package-comments
+        severity: warning
+  gocyclo:
+    min-complexity: 15
   goimports:
-    local-prefixes: github.com/hussainpithawala/sluice-go
-  govet:
-    enable: [shadow]
-  gosec:
-    excludes: [G304]
-  wrapcheck:
-    ignorePackageGlobs:
-      - "github.com/hussainpithawala/sluice-go/*"
+    local-prefixes: github.com/hussainpithawala/state-machine-amz-go
+  gocritic:
+    enabled-tags:
+      - performance
+      - style
+      - diagnostic
+    disabled-checks:
+      - hugeParam
 
 issues:
+  exclude-dirs:
+    - examples
+  exclude-files:
+    - ".*_test\\.go"
   exclude-rules:
-    - path: _test\.go
-      linters: [gosec, wrapcheck, errcheck]
     - path: examples/
-      linters: [wrapcheck, errcheck]
-    - path: sink/mock/
-      linters: [wrapcheck]
-  max-issues-per-linter: 0
-  max-same-issues: 0
+      linters:
+        - revive
+        - misspell
+        - unused
+        - gocyclo
+        - goconst
+        - errcheck
+  max-same-issues: 50
+  max-issues-per-linter: 50

@@ -36,8 +36,19 @@ vet:       ## Run go vet
 tidy:      ## Tidy go.mod and go.sum
 	$(GO) mod tidy && $(GO) mod verify
 
-lint:      ## Run golangci-lint
-	$(GOLINT) run ./...
+
+install-lint: ## Install golangci-lint if not present
+ifndef LINT_BIN
+	@echo "golangci-lint not found. Installing..."
+	go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
+else
+	@echo "golangci-lint is already installed."
+endif
+
+# Code quality
+lint: install-lint ## Run linter
+	@echo "${GREEN}Running linter...${RESET}"
+	@golangci-lint run --timeout=5m --config=.golangci.yml
 
 fmt:       ## Format all Go source files
 	$(GO) fmt ./...
