@@ -1,0 +1,81 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]*"
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  GO_VERSION: "1.25"
+
+jobs:
+
+  test-gate:
+    name: Pre-release test gate
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7.2-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - name: Verify module graph
+        run: go mod tidy && git diff --exit-code go.mod go.sum
+      - name: go vet
+        run: go vet ./...
+      - name: Unit tests
+        env:
+          REDIS_ADDR: localhost:6379
+        run: go test -race -count=1 -timeout=120s ./tests/unit/...
+
+  release:
+    name: Publish release
+    runs-on: ubuntu-latest
+    needs: test-gate
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Trigger pkg.go.dev indexing
+        run: GOPROXY=proxy.golang.org go list -m github.com/hussainpithawala/sluice-go@${{ github.ref_name }} || true
+
+  announce:
+    name: Release summary
+    runs-on: ubuntu-latest
+    needs: release
+    steps:
+      - name: Write step summary
+        run: |
+          echo "## Released ${{ github.ref_name }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Module**: \`github.com/hussainpithawala/sluice-go@${{ github.ref_name }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo '```bash' >> "$GITHUB_STEP_SUMMARY"
+          echo "go get github.com/hussainpithawala/sluice-go@${{ github.ref_name }}" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "**Docs**: https://pkg.go.dev/github.com/hussainpithawala/sluice-go@${{ github.ref_name }}" >> "$GITHUB_STEP_SUMMARY"

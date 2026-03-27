@@ -1,0 +1,16 @@
+dist/
+*.exe
+*.test
+*.out
+/vendor/
+/tmp/sluice-*.log
+/tmp/sluice-*.out
+/tmp/sluice-*.html
+/tmp/sluice-*.json
+coverage.out
+coverage.html
+.idea/
+.vscode/
+*.iml
+.DS_Store
+Thumbs.db

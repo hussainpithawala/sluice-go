@@ -1,0 +1,49 @@
+version: "2"
+
+linters:
+  enable:
+    - errcheck
+    - gosimple
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - gofmt
+    - goimports
+    - misspell
+    - prealloc
+    - revive
+    - noctx
+    - bodyclose
+    - contextcheck
+    - durationcheck
+    - gocritic
+    - gosec
+    - nilerr
+    - unparam
+    - wrapcheck
+  disable:
+    - depguard
+    - exhaustruct
+
+linters-settings:
+  goimports:
+    local-prefixes: github.com/hussainpithawala/sluice-go
+  govet:
+    enable: [shadow]
+  gosec:
+    excludes: [G304]
+  wrapcheck:
+    ignorePackageGlobs:
+      - "github.com/hussainpithawala/sluice-go/*"
+
+issues:
+  exclude-rules:
+    - path: _test\.go
+      linters: [gosec, wrapcheck, errcheck]
+    - path: examples/
+      linters: [wrapcheck, errcheck]
+    - path: sink/mock/
+      linters: [wrapcheck]
+  max-issues-per-linter: 0
+  max-same-issues: 0
