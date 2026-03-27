@@ -8,19 +8,46 @@ import (
 	"sync"
 	"time"
 
-	"github.com/hussainpithawala/sluice-go"
 	"github.com/hussainpithawala/sluice-go/internal/shield"
 	"github.com/hussainpithawala/sluice-go/sink"
 )
 
+// Config holds every tunable for the library.
+type Config struct {
+	Namespace          string
+	BandCount          int
+	FlushWindow        time.Duration
+	MaxBatchSize       int
+	KeyTTL             time.Duration
+	DegradedModeDirect bool
+	Redis              shield.RedisConfig
+	Metrics            MetricsRecorder
+}
+
+// MetricsRecorder emits library-internal telemetry.
+type MetricsRecorder interface {
+	RecordWrite(namespace string)
+	RecordDegradedWrite(namespace string, reason error)
+	RecordRedisOp(namespace, op string, duration time.Duration, err error)
+	RecordFlush(namespace, band string, batchSize int, duration time.Duration, err error)
+	RecordDirtyQueueDepth(namespace, band string, depth int)
+	RecordContractError(namespace, correlationKey string, err error)
+}
+
+// WriteContract converts a correlation key and raw payload into a WriteModel.
+type WriteContract func(correlationKey string, payload []byte) (*sink.WriteModel, error)
+
+// OnFlushCallback is invoked after every BulkWrite attempt.
+type OnFlushCallback func(correlationKeys []string, result *sink.BulkWriteResult, err error)
+
 // Engine runs one goroutine per band with a time trigger and a volume trigger.
 type Engine struct {
-	cfg           sluice.Config
+	cfg           Config
 	shield        *shield.Shield
 	sink          sink.FlushSink
-	contract      sluice.WriteContract
-	metrics       sluice.MetricsRecorder
-	callback      sluice.OnFlushCallback
+	contract      WriteContract
+	metrics       MetricsRecorder
+	callback      OnFlushCallback
 	volumeSignals []chan struct{}
 	wg            sync.WaitGroup
 	stopCh        chan struct{}
@@ -28,8 +55,8 @@ type Engine struct {
 }
 
 // New constructs an Engine. Call Start() to begin band goroutines.
-func New(cfg sluice.Config, sh *shield.Shield, sk sink.FlushSink,
-	contract sluice.WriteContract, metrics sluice.MetricsRecorder, cb sluice.OnFlushCallback) *Engine {
+func New(cfg Config, sh *shield.Shield, sk sink.FlushSink,
+	contract WriteContract, metrics MetricsRecorder, cb OnFlushCallback) *Engine {
 	signals := make([]chan struct{}, cfg.BandCount)
 	for i := range signals {
 		signals[i] = make(chan struct{}, 1)
@@ -83,7 +110,7 @@ func (e *Engine) runBand(band int) {
 }
 
 func (e *Engine) flushBand(ctx context.Context, band int) error {
-	start   := time.Now()
+	start := time.Now()
 	bandStr := fmt.Sprintf("%d", band)
 
 	if depth, err := e.shield.DirtyQueueDepth(ctx, band); err == nil {
@@ -97,7 +124,7 @@ func (e *Engine) flushBand(ctx context.Context, band int) error {
 	if len(records) == 0 {
 		return nil
 	}
-	models   := make([]sink.WriteModel, 0, len(records))
+	models := make([]sink.WriteModel, 0, len(records))
 	corrKeys := make([]string, 0, len(records))
 	for _, rec := range records {
 		wm, contractErr := e.contract(rec.CorrelationKey, rec.Payload)
@@ -106,13 +133,13 @@ func (e *Engine) flushBand(ctx context.Context, band int) error {
 			if e.callback != nil {
 				e.callback(
 					[]string{rec.CorrelationKey},
-					&sluice.BulkWriteResult{Errors: []sluice.SinkError{{CorrelationKey: rec.CorrelationKey, Err: contractErr}}},
-					fmt.Errorf("%w: %v", sluice.ErrContractViolation, contractErr),
+					&sink.BulkWriteResult{Errors: []sink.SinkError{{CorrelationKey: rec.CorrelationKey, Err: contractErr}}},
+					fmt.Errorf("%w: %v", sink.ErrContractViolation, contractErr),
 				)
 			}
 			continue
 		}
-		models   = append(models, sink.WriteModel{CorrelationKey: rec.CorrelationKey, Filter: wm.Filter, Update: wm.Update, Upsert: wm.Upsert})
+		models = append(models, sink.WriteModel{CorrelationKey: rec.CorrelationKey, Filter: wm.Filter, Update: wm.Update, Upsert: wm.Upsert})
 		corrKeys = append(corrKeys, rec.CorrelationKey)
 	}
 	if len(models) == 0 {

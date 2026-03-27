@@ -8,9 +8,26 @@ import (
 	"hash/fnv"
 	"time"
 
-	"github.com/hussainpithawala/sluice-go"
 	"github.com/redis/go-redis/v9"
 )
+
+// FlushRecord is the internal unit that travels through the pipeline.
+type FlushRecord struct {
+	CorrelationKey string
+	Payload        []byte
+	ReceivedAt     time.Time
+}
+
+// RedisConfig holds Redis connectivity parameters.
+type RedisConfig struct {
+	Addrs        []string
+	Password     string
+	DB           int
+	DialTimeout  time.Duration
+	ReadTimeout  time.Duration
+	WriteTimeout time.Duration
+	PoolSize     int
+}
 
 // Shield manages all Redis interactions for the library.
 type Shield struct {
@@ -32,7 +49,7 @@ return 1
 `
 
 // New initialises the Redis client and validates connectivity.
-func New(cfg sluice.RedisConfig, namespace string, bandCount int, keyTTL time.Duration) (*Shield, error) {
+func New(cfg RedisConfig, namespace string, bandCount int, keyTTL time.Duration) (*Shield, error) {
 	applyDefaults(&cfg)
 	var client redis.UniversalClient
 	if len(cfg.Addrs) == 1 {
@@ -71,7 +88,7 @@ func (s *Shield) Write(ctx context.Context, correlationKey string, payload []byt
 
 // DrainBand reads up to maxBatch dirty keys, fetches payloads via pipeline,
 // removes them from the dirty set, and returns FlushRecords for BulkWrite.
-func (s *Shield) DrainBand(ctx context.Context, band, maxBatch int) ([]sluice.FlushRecord, error) {
+func (s *Shield) DrainBand(ctx context.Context, band, maxBatch int) ([]FlushRecord, error) {
 	dirtyKey := s.dirtyKeyForBand(band)
 	members, err := s.client.ZRangeByScoreWithScores(ctx, dirtyKey, &redis.ZRangeBy{
 		Min: "-inf", Max: "+inf", Offset: 0, Count: int64(maxBatch),
@@ -96,7 +113,7 @@ func (s *Shield) DrainBand(ctx context.Context, band, maxBatch int) ([]sluice.Fl
 	if _, err := pipe.Exec(ctx); err != nil && err != redis.Nil {
 		return nil, fmt.Errorf("sluice/shield: pipeline hmget band %d: %w", band, err)
 	}
-	records  := make([]sluice.FlushRecord, 0, len(members))
+	records := make([]FlushRecord, 0, len(members))
 	toRemove := make([]interface{}, 0, len(members))
 	for i, cmd := range cmds {
 		toRemove = append(toRemove, corrKeys[i])
@@ -108,7 +125,7 @@ func (s *Shield) DrainBand(ctx context.Context, band, maxBatch int) ([]sluice.Fl
 		if !ok || payload == "" {
 			continue
 		}
-		records = append(records, sluice.FlushRecord{
+		records = append(records, FlushRecord{
 			CorrelationKey: corrKeys[i],
 			Payload:        []byte(payload),
 			ReceivedAt:     time.Now(),
@@ -134,13 +151,25 @@ func (s *Shield) BandFor(correlationKey string) int {
 
 func (s *Shield) Close() error { return s.client.Close() }
 
-func (s *Shield) payloadKey(ck string) string    { return fmt.Sprintf("sl:%s:payload:%s", s.namespace, ck) }
-func (s *Shield) dirtyKey(ck string) string      { return s.dirtyKeyForBand(s.BandFor(ck)) }
-func (s *Shield) dirtyKeyForBand(band int) string { return fmt.Sprintf("sl:%s:dirty:%d", s.namespace, band) }
+func (s *Shield) payloadKey(ck string) string {
+	return fmt.Sprintf("sl:%s:payload:%s", s.namespace, ck)
+}
+func (s *Shield) dirtyKey(ck string) string { return s.dirtyKeyForBand(s.BandFor(ck)) }
+func (s *Shield) dirtyKeyForBand(band int) string {
+	return fmt.Sprintf("sl:%s:dirty:%d", s.namespace, band)
+}
 
-func applyDefaults(c *sluice.RedisConfig) {
-	if c.DialTimeout == 0  { c.DialTimeout = 5 * time.Second }
-	if c.ReadTimeout == 0  { c.ReadTimeout = 3 * time.Second }
-	if c.WriteTimeout == 0 { c.WriteTimeout = 3 * time.Second }
-	if c.PoolSize == 0     { c.PoolSize = 20 }
+func applyDefaults(c *RedisConfig) {
+	if c.DialTimeout == 0 {
+		c.DialTimeout = 5 * time.Second
+	}
+	if c.ReadTimeout == 0 {
+		c.ReadTimeout = 3 * time.Second
+	}
+	if c.WriteTimeout == 0 {
+		c.WriteTimeout = 3 * time.Second
+	}
+	if c.PoolSize == 0 {
+		c.PoolSize = 20
+	}
 }

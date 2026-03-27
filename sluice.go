@@ -55,8 +55,8 @@ func New(namespace string) *Builder {
 	return &Builder{cfg: defaultConfig(namespace)}
 }
 
-func (b *Builder) WithRedis(rc RedisConfig) *Builder          { b.cfg.Redis = rc; return b }
-func (b *Builder) WithSink(s sink.FlushSink) *Builder         { b.sk = s; return b }
+func (b *Builder) WithRedis(rc RedisConfig) *Builder           { b.cfg.Redis = rc; return b }
+func (b *Builder) WithSink(s sink.FlushSink) *Builder          { b.sk = s; return b }
 func (b *Builder) WithWriteContract(wc WriteContract) *Builder { b.contract = wc; return b }
 func (b *Builder) WithFlushWindow(d time.Duration) *Builder    { b.cfg.FlushWindow = d; return b }
 func (b *Builder) WithMaxBatchSize(n int) *Builder             { b.cfg.MaxBatchSize = n; return b }
@@ -79,24 +79,70 @@ func (b *Builder) Build(ctx context.Context) (*Sluice, error) {
 	if err := b.sk.Ping(ctx); err != nil {
 		return nil, fmt.Errorf("sluice: sink ping failed: %w", err)
 	}
-	sh, err := shield.New(b.cfg.Redis, b.cfg.Namespace, b.cfg.BandCount, b.cfg.KeyTTL)
+	sh, err := shield.New(b.cfg.Redis.toInternal(), b.cfg.Namespace, b.cfg.BandCount, b.cfg.KeyTTL)
 	if err != nil {
 		return nil, err
 	}
-	eng := engine.New(b.cfg, sh, b.sk, b.contract, metrics, b.callback)
+	// Wrap callback to convert internal types to public types
+	var wrappedCb engine.OnFlushCallback
+	if b.callback != nil {
+		wrappedCb = func(keys []string, result *sink.BulkWriteResult, err error) {
+			pubResult := &BulkWriteResult{
+				InsertedCount: result.InsertedCount,
+				MatchedCount:  result.MatchedCount,
+				ModifiedCount: result.ModifiedCount,
+				UpsertedCount: result.UpsertedCount,
+				Errors:        make([]SinkError, len(result.Errors)),
+			}
+			for i, se := range result.Errors {
+				pubResult.Errors[i] = SinkError{CorrelationKey: se.CorrelationKey, Err: se.Err}
+			}
+			b.callback(keys, pubResult, err)
+		}
+	}
+	// Wrap contract to convert public WriteModel to sink.WriteModel
+	wrappedContract := func(crn string, payload []byte) (*sink.WriteModel, error) {
+		wm, err := b.contract(crn, payload)
+		if err != nil {
+			return nil, err
+		}
+		return &sink.WriteModel{
+			CorrelationKey: "", // not used in flush path
+			Filter:         wm.Filter,
+			Update:         wm.Update,
+			Upsert:         wm.Upsert,
+		}, nil
+	}
+	eng := engine.New(b.cfg.toInternal(), sh, b.sk, wrappedContract, metrics, wrappedCb)
 	eng.Start()
 	return &Sluice{cfg: b.cfg, shield: sh, engine: eng, sk: b.sk, contract: b.contract, metrics: metrics}, nil
 }
 
 func (b *Builder) validate() error {
-	if b.cfg.Namespace == ""         { return ErrMissingNamespace }
-	if b.sk == nil                   { return ErrMissingSink }
-	if b.contract == nil             { return ErrMissingContract }
-	if len(b.cfg.Redis.Addrs) == 0   { return ErrMissingRedis }
-	if b.cfg.BandCount <= 0          { b.cfg.BandCount = 16 }
-	if b.cfg.MaxBatchSize <= 0       { b.cfg.MaxBatchSize = 1000 }
-	if b.cfg.FlushWindow <= 0        { b.cfg.FlushWindow = 250 * time.Millisecond }
-	if b.cfg.KeyTTL <= 0             { b.cfg.KeyTTL = 30 * time.Second }
+	if b.cfg.Namespace == "" {
+		return ErrMissingNamespace
+	}
+	if b.sk == nil {
+		return ErrMissingSink
+	}
+	if b.contract == nil {
+		return ErrMissingContract
+	}
+	if len(b.cfg.Redis.Addrs) == 0 {
+		return ErrMissingRedis
+	}
+	if b.cfg.BandCount <= 0 {
+		b.cfg.BandCount = 16
+	}
+	if b.cfg.MaxBatchSize <= 0 {
+		b.cfg.MaxBatchSize = 1000
+	}
+	if b.cfg.FlushWindow <= 0 {
+		b.cfg.FlushWindow = 250 * time.Millisecond
+	}
+	if b.cfg.KeyTTL <= 0 {
+		b.cfg.KeyTTL = 30 * time.Second
+	}
 	return nil
 }
 

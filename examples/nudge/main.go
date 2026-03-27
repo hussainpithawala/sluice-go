@@ -61,23 +61,31 @@ func nudgeWriteContract(crn string, rawPayload []byte) (*sluice.WriteModel, erro
 type logMetrics struct{ log *slog.Logger }
 
 func (m *logMetrics) RecordWrite(_ string) {}
-func (m *logMetrics) RecordDegradedWrite(ns string, err error) { m.log.Warn("degraded write", "ns", ns, "err", err) }
+func (m *logMetrics) RecordDegradedWrite(ns string, err error) {
+	m.log.Warn("degraded write", "ns", ns, "err", err)
+}
 func (m *logMetrics) RecordRedisOp(ns, op string, d time.Duration, err error) {
-	if err != nil { m.log.Error("redis op", "ns", ns, "op", op, "ms", d.Milliseconds(), "err", err) }
+	if err != nil {
+		m.log.Error("redis op", "ns", ns, "op", op, "ms", d.Milliseconds(), "err", err)
+	}
 }
 func (m *logMetrics) RecordFlush(ns, band string, batch int, d time.Duration, err error) {
 	m.log.Info("flush", "ns", ns, "band", band, "batch", batch, "ms", d.Milliseconds(), "err", err)
 }
 func (m *logMetrics) RecordDirtyQueueDepth(ns, band string, depth int) {
-	if depth > 100 { m.log.Warn("dirty queue depth", "ns", ns, "band", band, "depth", depth) }
+	if depth > 100 {
+		m.log.Warn("dirty queue depth", "ns", ns, "band", band, "depth", depth)
+	}
 }
-func (m *logMetrics) RecordContractError(ns, crn string, err error) { m.log.Error("contract error", "ns", ns, "crn", crn, "err", err) }
+func (m *logMetrics) RecordContractError(ns, crn string, err error) {
+	m.log.Error("contract error", "ns", ns, "crn", crn, "err", err)
+}
 
 func simulatedConsumer(ctx context.Context, workerID int, sl *sluice.Sluice, log *slog.Logger, written *atomic.Int64, wg *sync.WaitGroup) {
 	defer wg.Done()
 	nudgeMasters := []string{"nm_spring_retarget_2026", "nm_cart_abandonment", "nm_win_back_q2", "nm_first_purchase", "nm_loyalty_upgrade"}
-	channels     := []string{"push", "email", "sms", "in_app"}
-	ticker       := time.NewTicker(1 * time.Millisecond)
+	channels := []string{"push", "email", "sms", "in_app"}
+	ticker := time.NewTicker(1 * time.Millisecond)
 	defer ticker.Stop()
 	for {
 		select {
@@ -110,30 +118,43 @@ func main() {
 	defer stop()
 
 	mongoURI := getEnv("MONGO_URI", "mongodb://localhost:27017")
-	sk, err  := docdb.New(ctx, docdb.Config{URI: mongoURI, Database: "adroll", Collection: "nudge_inventory", MaxPoolSize: 100, MinPoolSize: 10})
-	if err != nil { log.Error("failed to connect to MongoDB", "err", err); os.Exit(1) }
+	sk, err := docdb.New(ctx, docdb.Config{URI: mongoURI, Database: "adroll", Collection: "nudge_inventory", MaxPoolSize: 100, MinPoolSize: 10})
+	if err != nil {
+		log.Error("failed to connect to MongoDB", "err", err)
+		os.Exit(1)
+	}
 	log.Info("connected to MongoDB", "uri", mongoURI)
 
 	redisAddr := getEnv("REDIS_ADDR", "localhost:6379")
-	sl, err   := sluice.New("nudge_inventory").
+	sl, err := sluice.New("nudge_inventory").
 		WithRedis(sluice.RedisConfig{Addrs: []string{redisAddr}, PoolSize: 30, DialTimeout: 5 * time.Second, ReadTimeout: 3 * time.Second, WriteTimeout: 3 * time.Second}).
 		WithSink(sk).WithWriteContract(nudgeWriteContract).
 		WithFlushWindow(250 * time.Millisecond).WithMaxBatchSize(1000).
 		WithBandCount(16).WithKeyTTL(30 * time.Second).WithDegradedModeDirect(true).
 		WithMetrics(&logMetrics{log: log}).
 		OnFlush(func(crns []string, result *sluice.BulkWriteResult, err error) {
-			if err != nil { log.Error("flush failed", "crns", len(crns), "err", err); return }
-			for _, se := range result.Errors { log.Warn("partial write failure", "crn", se.CorrelationKey, "err", se.Err) }
+			if err != nil {
+				log.Error("flush failed", "crns", len(crns), "err", err)
+				return
+			}
+			for _, se := range result.Errors {
+				log.Warn("partial write failure", "crn", se.CorrelationKey, "err", se.Err)
+			}
 			log.Debug("flush complete", "crns", len(crns), "upserted", result.UpsertedCount, "modified", result.ModifiedCount)
 		}).Build(ctx)
-	if err != nil { log.Error("failed to build sluice", "err", err); os.Exit(1) }
+	if err != nil {
+		log.Error("failed to build sluice", "err", err)
+		os.Exit(1)
+	}
 	log.Info("sluice ready", "redis", redisAddr, "flush_window", "250ms", "bands", 16)
 
 	defer func() {
 		log.Info("draining sluice...")
 		shutCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		if err := sl.DrainAndClose(shutCtx); err != nil { log.Error("drain error", "err", err) }
+		if err := sl.DrainAndClose(shutCtx); err != nil {
+			log.Error("drain error", "err", err)
+		}
 		log.Info("sluice drained and closed")
 	}()
 
@@ -141,7 +162,10 @@ func main() {
 	var wg sync.WaitGroup
 	var written atomic.Int64
 	log.Info("starting consumer workers", "count", workerCount)
-	for i := 0; i < workerCount; i++ { wg.Add(1); go simulatedConsumer(ctx, i, sl, log, &written, &wg) }
+	for i := 0; i < workerCount; i++ {
+		wg.Add(1)
+		go simulatedConsumer(ctx, i, sl, log, &written, &wg)
+	}
 
 	statsTicker := time.NewTicker(5 * time.Second)
 	defer statsTicker.Stop()
@@ -149,9 +173,10 @@ func main() {
 	go func() {
 		for {
 			select {
-			case <-ctx.Done(): return
+			case <-ctx.Done():
+				return
 			case <-statsTicker.C:
-				total   := written.Load()
+				total := written.Load()
 				elapsed := time.Since(start).Seconds()
 				log.Info("throughput", "events", total, "elapsed_s", fmt.Sprintf("%.1f", elapsed), "rate", fmt.Sprintf("%.0f/s", float64(total)/elapsed))
 			}
@@ -161,12 +186,14 @@ func main() {
 	<-ctx.Done()
 	log.Info("shutdown signal received")
 	wg.Wait()
-	total   := written.Load()
+	total := written.Load()
 	elapsed := time.Since(start)
 	log.Info("final summary", "total_events", total, "elapsed", elapsed.Round(time.Second), "avg_rate", fmt.Sprintf("%.0f events/sec", float64(total)/elapsed.Seconds()))
 }
 
 func getEnv(key, def string) string {
-	if v := os.Getenv(key); v != "" { return v }
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
 	return def
 }

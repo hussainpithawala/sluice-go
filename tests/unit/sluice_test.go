@@ -164,7 +164,8 @@ func TestWrite_VolumeTrigger(t *testing.T) {
 	require.NoError(t, err)
 	defer func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel(); _ = sl.DrainAndClose(ctx)
+		defer cancel()
+		_ = sl.DrainAndClose(ctx)
 	}()
 	for i := 0; i < batchSize+1; i++ {
 		require.NoError(t, sl.Write(context.Background(), fmt.Sprintf("vol_%d", i), mustPayload(t, "v")))
@@ -181,12 +182,15 @@ func TestOnFlushCallback(t *testing.T) {
 		WithSink(sk).WithWriteContract(testContract).
 		WithFlushWindow(30 * time.Millisecond).WithBandCount(4).WithKeyTTL(5 * time.Second).
 		OnFlush(func(keys []string, _ *sluice.BulkWriteResult, _ error) {
-			mu.Lock(); flushedKeys = append(flushedKeys, keys...); mu.Unlock()
+			mu.Lock()
+			flushedKeys = append(flushedKeys, keys...)
+			mu.Unlock()
 		}).Build(context.Background())
 	require.NoError(t, err)
 	defer func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel(); _ = sl.DrainAndClose(ctx)
+		defer cancel()
+		_ = sl.DrainAndClose(ctx)
 	}()
 	const n = 10
 	for i := 0; i < n; i++ {

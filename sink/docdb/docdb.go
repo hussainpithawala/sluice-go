@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/hussainpithawala/sluice-go"
 	"github.com/hussainpithawala/sluice-go/sink"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
@@ -79,9 +78,9 @@ func New(ctx context.Context, cfg Config) (*Sink, error) {
 }
 
 // BulkWrite executes all models as a single ordered=false BulkWrite call.
-func (s *Sink) BulkWrite(ctx context.Context, models []sink.WriteModel) (*sluice.BulkWriteResult, error) {
+func (s *Sink) BulkWrite(ctx context.Context, models []sink.WriteModel) (*sink.BulkWriteResult, error) {
 	if len(models) == 0 {
-		return &sluice.BulkWriteResult{}, nil
+		return &sink.BulkWriteResult{}, nil
 	}
 	mongoModels := make([]mongo.WriteModel, 0, len(models))
 	for _, m := range models {
@@ -95,21 +94,21 @@ func (s *Sink) BulkWrite(ctx context.Context, models []sink.WriteModel) (*sluice
 	res, err := s.collection.BulkWrite(ctx, mongoModels, options.BulkWrite().SetOrdered(false))
 	if err != nil {
 		if bwe, ok := err.(mongo.BulkWriteException); ok {
-			errs := make([]sluice.SinkError, 0, len(bwe.WriteErrors))
+			errs := make([]sink.SinkError, 0, len(bwe.WriteErrors))
 			for _, we := range bwe.WriteErrors {
 				key := ""
 				if we.Index >= 0 && we.Index < len(models) {
 					key = models[we.Index].CorrelationKey
 				}
-				errs = append(errs, sluice.SinkError{
+				errs = append(errs, sink.SinkError{
 					CorrelationKey: key,
 					Err:            fmt.Errorf("code %d: %s", we.Code, we.Message),
 				})
 			}
-			result := &sluice.BulkWriteResult{Errors: errs}
+			result := &sink.BulkWriteResult{Errors: errs}
 			if res != nil {
 				result.InsertedCount = res.InsertedCount
-				result.MatchedCount  = res.MatchedCount
+				result.MatchedCount = res.MatchedCount
 				result.ModifiedCount = res.ModifiedCount
 				result.UpsertedCount = res.UpsertedCount
 			}
@@ -117,7 +116,7 @@ func (s *Sink) BulkWrite(ctx context.Context, models []sink.WriteModel) (*sluice
 		}
 		return nil, fmt.Errorf("sluice/docdb: bulkwrite: %w", err)
 	}
-	return &sluice.BulkWriteResult{
+	return &sink.BulkWriteResult{
 		InsertedCount: res.InsertedCount,
 		MatchedCount:  res.MatchedCount,
 		ModifiedCount: res.ModifiedCount,
@@ -134,5 +133,5 @@ func (s *Sink) Write(ctx context.Context, model sink.WriteModel) error {
 	return nil
 }
 
-func (s *Sink) Ping(ctx context.Context) error { return s.client.Ping(ctx, readpref.Primary()) }
+func (s *Sink) Ping(ctx context.Context) error  { return s.client.Ping(ctx, readpref.Primary()) }
 func (s *Sink) Close(ctx context.Context) error { return s.client.Disconnect(ctx) }
