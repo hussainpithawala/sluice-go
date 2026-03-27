@@ -93,6 +93,15 @@ docker-restart: docker-down docker-up ## Restart the full stack
 release-snapshot: install-releaser ## Build release snapshot locally
 	$(GORELEASER) release --snapshot --clean
 
+release: install-releaser ## Create a full release (requires git tag)
+	@echo "$(YELLOW)⚠️  Creating a full release...$(RESET)"
+	@echo "$(YELLOW)   Ensure you have pushed a git tag (e.g., git tag v1.0.0 && git push origin --tags)$(RESET)"
+	@echo ""
+	$(GORELEASER) release --clean
+	@echo ""
+	@echo "$(GREEN)✓ Release complete!$(RESET)"
+	@echo "$(GREEN)   Check GitHub releases: https://github.com/hussainpithawala/sluice-go/releases$(RESET)"
+
 release-check: install-releaser ## Validate .goreleaser.yml
 	$(GORELEASER) check
 
