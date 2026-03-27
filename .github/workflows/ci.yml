@@ -8,7 +8,7 @@ on:
 
 env:
   GO_VERSION: "1.25"
-  GOLANGCI_LINT_VERSION: "v1.59.1"
+  GOLANGCI_LINT_VERSION: "v1.64.8"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -48,6 +48,14 @@ jobs:
           --health-interval 5s
           --health-timeout 3s
           --health-retries 10
+      mongodb:
+        image: mongo:7.0
+        ports: ["27017:27017"]
+        options: >-
+          --health-cmd "mongosh --eval 'db.adminCommand(\"ping\").ok' --quiet"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -57,6 +65,7 @@ jobs:
       - name: Run unit tests
         env:
           REDIS_ADDR: localhost:6379
+          MONGO_URI: mongodb://localhost:27017
         run: |
           go test -v -race -count=1 -timeout=120s \
             -coverprofile=coverage.out -covermode=atomic \
@@ -87,24 +96,11 @@ jobs:
         run: for i in $(seq 1 30); do docker exec sluice_redis redis-cli ping 2>/dev/null | grep -q PONG && echo "Redis ready" && break; echo "waiting ($i)..."; sleep 2; done
       - name: Wait — MongoDB
         run: for i in $(seq 1 45); do docker exec sluice_mongo mongosh --eval "db.adminCommand('ping').ok" --quiet 2>/dev/null | grep -q 1 && echo "MongoDB ready" && break; echo "waiting ($i)..."; sleep 2; done
-      - name: Wait — Kafka
-        run: for i in $(seq 1 60); do docker exec sluice_kafka kafka-topics --bootstrap-server localhost:9092 --list >/dev/null 2>&1 && echo "Kafka ready" && break; echo "waiting ($i)..."; sleep 2; done
-      - name: Wait — LocalStack
-        run: for i in $(seq 1 60); do curl -sf http://localhost:4566/_localstack/health 2>/dev/null | grep -q '"sqs": "available"' && echo "LocalStack ready" && break; echo "waiting ($i)..."; sleep 2; done
-      - name: SQS integration tests
+      - name: Run integration tests
         env:
           REDIS_ADDR: localhost:6379
           MONGO_URI: mongodb://localhost:27017
-          SQS_ENDPOINT: http://localhost:4566
-          KAFKA_BROKER: localhost:9092
-        run: go test -v -race -count=1 -timeout=180s -tags=integration -run TestSQS ./tests/integration/... 2>&1 | tee /tmp/sqs-test.log
-      - name: Kafka integration tests
-        env:
-          REDIS_ADDR: localhost:6379
-          MONGO_URI: mongodb://localhost:27017
-          SQS_ENDPOINT: http://localhost:4566
-          KAFKA_BROKER: localhost:9092
-        run: go test -v -race -count=1 -timeout=240s -tags=integration -run TestKafka ./tests/integration/... 2>&1 | tee /tmp/kafka-test.log
+        run: go test -v -race -count=1 -timeout=300s -tags=integration ./tests/integration/... 2>&1 | tee /tmp/integration-test.log
       - name: Upload logs on failure
         if: failure()
         uses: actions/upload-artifact@v4
