@@ -93,14 +93,26 @@ docker-restart: docker-down docker-up ## Restart the full stack
 release-snapshot: install-releaser ## Build release snapshot locally
 	$(GORELEASER) release --snapshot --clean
 
-release: install-releaser ## Create a full release (requires git tag)
-	@echo "$(YELLOW)⚠️  Creating a full release...$(RESET)"
-	@echo "$(YELLOW)   Ensure you have pushed a git tag (e.g., git tag v1.0.0 && git push origin --tags)$(RESET)"
+release: install-releaser ## Create and push a release tag (triggers GitHub Actions)
+	@echo "$(YELLOW)⚠️  Creating release tag...$(RESET)"
+	@if [ -z "$(TAG)" ]; then \
+		echo "$(RED)✗ Error: TAG is required. Usage: make release TAG=v1.0.0$(RESET)"; \
+		exit 1; \
+	fi
+	@echo "$(GREEN)✓ Tag: $(TAG)$(RESET)"
 	@echo ""
-	$(GORELEASER) release --clean
+	@echo "$(YELLOW)1. Validating .goreleaser.yml...$(RESET)"
+	$(GORELEASER) check
 	@echo ""
-	@echo "$(GREEN)✓ Release complete!$(RESET)"
-	@echo "$(GREEN)   Check GitHub releases: https://github.com/hussainpithawala/sluice-go/releases$(RESET)"
+	@echo "$(YELLOW)2. Creating git tag...$(RESET)"
+	git tag -a $(TAG) -m "Release $(TAG)"
+	@echo ""
+	@echo "$(YELLOW)3. Pushing tag to remote...$(RESET)"
+	git push origin $(TAG)
+	@echo ""
+	@echo "$(GREEN)✓ Tag $(TAG) pushed successfully!$(RESET)"
+	@echo "$(GREEN)  GitHub Actions will now build and publish the release.$(RESET)"
+	@echo "$(GREEN)  Monitor: https://github.com/hussainpithawala/sluice-go/actions$(RESET)"
 
 release-check: install-releaser ## Validate .goreleaser.yml
 	$(GORELEASER) check

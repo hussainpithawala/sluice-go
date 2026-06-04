@@ -35,6 +35,7 @@ type Shield struct {
 	namespace   string
 	bandCount   int
 	keyTTL      time.Duration
+	dlqTTL      time.Duration // how long dead-letter payload hashes are kept
 	writeScript *redis.Script
 }
 
@@ -72,8 +73,11 @@ func New(cfg RedisConfig, namespace string, bandCount int, keyTTL time.Duration)
 		return nil, fmt.Errorf("sluice/shield: ping: %w", err)
 	}
 	return &Shield{
-		client: client, namespace: namespace,
-		bandCount: bandCount, keyTTL: keyTTL,
+		client:      client,
+		namespace:   namespace,
+		bandCount:   bandCount,
+		keyTTL:      keyTTL,
+		dlqTTL:      7 * 24 * time.Hour, // dead-letter payloads kept 7 days
 		writeScript: redis.NewScript(atomicWriteLua),
 	}, nil
 }
@@ -86,10 +90,23 @@ func (s *Shield) Write(ctx context.Context, correlationKey string, payload []byt
 	).Err()
 }
 
-// DrainBand reads up to maxBatch dirty keys, fetches payloads via pipeline,
-// removes them from the dirty set, and returns FlushRecords for BulkWrite.
+// DrainBand reads up to maxBatch dirty keys and returns their payloads as
+// FlushRecords ready for BulkWrite assembly.
+//
+// Two-phase commit contract:
+//   - Keys whose payload hash has expired (TTL elapsed) are removed from the
+//     dirty set immediately — there is nothing to flush for them.
+//   - Keys with a valid payload are returned WITHOUT being removed from the
+//     dirty set. The caller MUST call CommitKeys after a confirmed successful
+//     BulkWrite, and MoveToDeadLetter for permanently failed keys.
+//     Keys that fail with a transient error require no action here — they
+//     remain in the dirty set and are retried on the next flush cycle.
+//
+// This design ensures that a BulkWrite failure (including unique-ID collision
+// during DrainAndClose) never causes silent record loss.
 func (s *Shield) DrainBand(ctx context.Context, band, maxBatch int) ([]FlushRecord, error) {
 	dirtyKey := s.dirtyKeyForBand(band)
+
 	members, err := s.client.ZRangeByScoreWithScores(ctx, dirtyKey, &redis.ZRangeBy{
 		Min: "-inf", Max: "+inf", Offset: 0, Count: int64(maxBatch),
 	}).Result()
@@ -99,12 +116,15 @@ func (s *Shield) DrainBand(ctx context.Context, band, maxBatch int) ([]FlushReco
 	if len(members) == 0 {
 		return nil, nil
 	}
+
 	corrKeys := make([]string, len(members))
 	hashKeys := make([]string, len(members))
 	for i, m := range members {
 		corrKeys[i] = m.Member.(string)
 		hashKeys[i] = s.payloadKey(corrKeys[i])
 	}
+
+	// Pipeline all HMGET calls — one network round-trip for the entire batch.
 	pipe := s.client.Pipeline()
 	cmds := make([]*redis.SliceCmd, len(hashKeys))
 	for i, hk := range hashKeys {
@@ -113,33 +133,116 @@ func (s *Shield) DrainBand(ctx context.Context, band, maxBatch int) ([]FlushReco
 	if _, err := pipe.Exec(ctx); err != nil && err != redis.Nil {
 		return nil, fmt.Errorf("sluice/shield: pipeline hmget band %d: %w", band, err)
 	}
+
 	records := make([]FlushRecord, 0, len(members))
-	toRemove := make([]interface{}, 0, len(members))
+	// expired collects keys whose payload TTL elapsed before we could flush them.
+	// These are cleaned from the dirty set immediately — there is nothing to write.
+	expired := make([]interface{}, 0)
+
 	for i, cmd := range cmds {
-		toRemove = append(toRemove, corrKeys[i])
 		vals, cmdErr := cmd.Result()
 		if cmdErr != nil || vals[0] == nil {
+			// Payload hash evicted by Redis TTL — safe to remove from dirty set.
+			expired = append(expired, corrKeys[i])
 			continue
 		}
 		payload, ok := vals[0].(string)
 		if !ok || payload == "" {
+			expired = append(expired, corrKeys[i])
 			continue
 		}
+		// Valid payload — return WITHOUT ZREMing. CommitKeys is called
+		// by the engine only after a confirmed successful BulkWrite.
 		records = append(records, FlushRecord{
 			CorrelationKey: corrKeys[i],
 			Payload:        []byte(payload),
 			ReceivedAt:     time.Now(),
 		})
 	}
-	if len(toRemove) > 0 {
-		_ = s.client.ZRem(ctx, dirtyKey, toRemove...).Err()
+
+	// Clean up expired keys immediately — there is nothing to flush for them.
+	if len(expired) > 0 {
+		_ = s.client.ZRem(ctx, dirtyKey, expired...).Err()
 	}
+
 	return records, nil
 }
 
-// DirtyQueueDepth returns queued dirty key count for a band.
+// CommitKeys removes successfully persisted correlation keys from the dirty
+// sorted set. Must be called by the engine after a BulkWrite that confirmed
+// every key in the list was written (or upserted) successfully.
+//
+// Calling this for keys that were never in the dirty set is a no-op.
+func (s *Shield) CommitKeys(ctx context.Context, band int, corrKeys []string) error {
+	if len(corrKeys) == 0 {
+		return nil
+	}
+	members := make([]interface{}, len(corrKeys))
+	for i, k := range corrKeys {
+		members[i] = k
+	}
+	if err := s.client.ZRem(ctx, s.dirtyKeyForBand(band), members...).Err(); err != nil {
+		return fmt.Errorf("sluice/shield: commit keys band %d: %w", band, err)
+	}
+	return nil
+}
+
+// MoveToDeadLetter moves permanently failed keys out of the dirty sorted set
+// and into the dead-letter sorted set for this band. The payload hash is
+// preserved with an extended TTL (dlqTTL) and annotated with the failure
+// reason, so records can be inspected and replayed without data loss.
+//
+// Use this for non-retryable sink errors — primarily unique-index violations
+// (ErrCodeDuplicateKey / MongoDB code 11000). Calling this for transient errors
+// would incorrectly suppress legitimate retries.
+//
+// Dead-letter key: sl:{namespace}:dlq:{band}
+// Payload key:     sl:{namespace}:payload:{corrKey}   (TTL extended to dlqTTL)
+func (s *Shield) MoveToDeadLetter(ctx context.Context, band int, corrKeys []string, reason string) error {
+	if len(corrKeys) == 0 {
+		return nil
+	}
+
+	now := float64(time.Now().UnixMilli())
+	dirtyKey := s.dirtyKeyForBand(band)
+	dlqKey := s.dlqKey(band)
+
+	pipe := s.client.Pipeline()
+
+	for _, ck := range corrKeys {
+		// Enqueue in dead-letter sorted set (score = failure timestamp).
+		pipe.ZAdd(ctx, dlqKey, redis.Z{Score: now, Member: ck})
+		// Annotate the payload hash with failure metadata.
+		pipe.HSet(ctx, s.payloadKey(ck),
+			"dlq_reason", reason,
+			"dlq_at", fmt.Sprintf("%.0f", now),
+		)
+		// Extend payload hash TTL so it survives for the full DLQ inspection window.
+		pipe.Expire(ctx, s.payloadKey(ck), s.dlqTTL)
+	}
+
+	// Remove from dirty sorted set — these will not be retried via normal flush.
+	members := make([]interface{}, len(corrKeys))
+	for i, k := range corrKeys {
+		members[i] = k
+	}
+	pipe.ZRem(ctx, dirtyKey, members...)
+
+	if _, err := pipe.Exec(ctx); err != nil {
+		return fmt.Errorf("sluice/shield: move to dead-letter band %d: %w", band, err)
+	}
+	return nil
+}
+
+// DirtyQueueDepth returns the number of keys currently queued for a band.
 func (s *Shield) DirtyQueueDepth(ctx context.Context, band int) (int64, error) {
 	return s.client.ZCard(ctx, s.dirtyKeyForBand(band)).Result()
+}
+
+// DeadLetterDepth returns the number of keys currently in the dead-letter
+// set for a band. A non-zero value indicates records that require investigation.
+func (s *Shield) DeadLetterDepth(ctx context.Context, band int) (int64, error) {
+	return s.client.ZCard(ctx, s.dlqKey(band)).Result()
 }
 
 // BandFor returns the band index for the given correlation key using FNV-32a.
@@ -151,12 +254,24 @@ func (s *Shield) BandFor(correlationKey string) int {
 
 func (s *Shield) Close() error { return s.client.Close() }
 
+// ── Key naming ────────────────────────────────────────────────────────────────
+
 func (s *Shield) payloadKey(ck string) string {
 	return fmt.Sprintf("sl:%s:payload:%s", s.namespace, ck)
 }
-func (s *Shield) dirtyKey(ck string) string { return s.dirtyKeyForBand(s.BandFor(ck)) }
+
+func (s *Shield) dirtyKey(ck string) string {
+	return s.dirtyKeyForBand(s.BandFor(ck))
+}
+
 func (s *Shield) dirtyKeyForBand(band int) string {
 	return fmt.Sprintf("sl:%s:dirty:%d", s.namespace, band)
+}
+
+// dlqKey returns the dead-letter sorted set key for a band.
+// Pattern: sl:{namespace}:dlq:{band}
+func (s *Shield) dlqKey(band int) string {
+	return fmt.Sprintf("sl:%s:dlq:%d", s.namespace, band)
 }
 
 func applyDefaults(c *RedisConfig) {

@@ -11,7 +11,6 @@ type FlushRecord struct {
 }
 
 // WriteModel is the fully resolved upsert instruction returned by a WriteContract.
-// Filter and Update must be BSON-compatible values (bson.D, bson.M, etc.).
 type WriteModel struct {
 	Filter interface{}
 	Update interface{}
@@ -19,9 +18,7 @@ type WriteModel struct {
 }
 
 // WriteContract is the only domain function the caller contributes.
-// It converts a correlation key and raw payload into a WriteModel.
 // Called once per unique correlation key per flush cycle — never on Write().
-// Must be safe for concurrent use.
 type WriteContract func(correlationKey string, payload []byte) (*WriteModel, error)
 
 // OnFlushCallback is invoked after every BulkWrite attempt — success or failure.
@@ -33,11 +30,23 @@ type BulkWriteResult struct {
 	MatchedCount  int64
 	ModifiedCount int64
 	UpsertedCount int64
-	Errors        []SinkError
+	// Errors lists per-record failures. Empty on full success.
+	// Records in Errors whose Code == ErrCodeDuplicateKey are routed
+	// to the dead-letter set and will not be retried.
+	Errors []SinkError
 }
 
 // SinkError ties a write failure back to its originating correlation key.
+// Code carries the document-store error code when available (e.g. 11000 for
+// a MongoDB/DocumentDB duplicate-key violation). Zero means unknown or
+// not applicable.
 type SinkError struct {
 	CorrelationKey string
+	Code           int
 	Err            error
 }
+
+// ErrCodeDuplicateKey is the MongoDB / AWS DocumentDB error code for a
+// unique-index violation. sluice uses this to distinguish permanent failures
+// (route to dead-letter) from transient ones (leave in dirty set for retry).
+const ErrCodeDuplicateKey = 11000

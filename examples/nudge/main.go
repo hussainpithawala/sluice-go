@@ -80,6 +80,9 @@ func (m *logMetrics) RecordDirtyQueueDepth(ns, band string, depth int) {
 func (m *logMetrics) RecordContractError(ns, crn string, err error) {
 	m.log.Error("contract error", "ns", ns, "crn", crn, "err", err)
 }
+func (m *logMetrics) RecordDeadLetter(ns, band string, count int) {
+	m.log.Warn("dead-letter", "ns", ns, "band", band, "count", count)
+}
 
 func simulatedConsumer(ctx context.Context, workerID int, sl *sluice.Sluice, log *slog.Logger, written *atomic.Int64, wg *sync.WaitGroup) {
 	defer wg.Done()

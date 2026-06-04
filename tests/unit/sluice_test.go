@@ -8,11 +8,13 @@ import (
 	"testing"
 	"time"
 
-	sluice "github.com/hussainpithawala/sluice-go"
-	"github.com/hussainpithawala/sluice-go/sink/docdb"
+	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.mongodb.org/mongo-driver/bson"
+
+	sluice "github.com/hussainpithawala/sluice-go"
+	"github.com/hussainpithawala/sluice-go/sink/docdb"
 )
 
 const (
@@ -203,5 +205,246 @@ func TestOnFlushCallback(t *testing.T) {
 	const n = 10
 	for i := 0; i < n; i++ {
 		require.NoError(t, sl.Write(context.Background(), fmt.Sprintf("cb_%d", i), mustPayload(t, "v")))
+	}
+	// Verify keys are eventually flushed via callback.
+	require.Eventually(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(flushedKeys) >= n
+	}, 3*time.Second, 20*time.Millisecond, "expected %d flushed keys via callback", n)
+}
+
+// redisClient returns a test Redis client pointing at the unit-test Redis.
+func redisClient(t *testing.T) *redis.Client {
+	t.Helper()
+	c := redis.NewClient(&redis.Options{Addr: testRedisAddr})
+	t.Cleanup(func() { _ = c.Close() })
+	return c
+}
+
+// TestFlush_TwoPhaseCommit_DirtySetEmptied verifies that after a successful
+// flush cycle the dirty sorted set is empty — i.e. CommitKeys ran.
+func TestFlush_TwoPhaseCommit_DirtySetEmptied(t *testing.T) {
+	const ns = "tpc_test"
+	rc := redisClient(t)
+	ctx := context.Background()
+
+	// Clean up any leftover keys from previous runs.
+	cleanRedisKeys(t, rc, ns)
+
+	sk, err := docdb.New(ctx, docdb.Config{
+		URI: testMongoURI, Database: testDatabase, Collection: "tpc_docs",
+		MaxPoolSize: 10, MinPoolSize: 1,
+	})
+	require.NoError(t, err)
+
+	sl, err := sluice.New(ns).
+		WithRedis(sluice.RedisConfig{Addrs: []string{testRedisAddr}}).
+		WithSink(sk).
+		WithWriteContract(testContract).
+		WithFlushWindow(50 * time.Millisecond).
+		WithMaxBatchSize(100).
+		WithBandCount(2).
+		WithKeyTTL(10 * time.Second).
+		Build(ctx)
+	require.NoError(t, err)
+
+	// Write several keys.
+	for i := 0; i < 10; i++ {
+		require.NoError(t, sl.Write(ctx, fmt.Sprintf("tpc_%d", i), mustPayload(t, "v")))
+	}
+
+	// Wait for flush to drain all bands.
+	require.Eventually(t, func() bool {
+		total := int64(0)
+		for band := 0; band < 2; band++ {
+			n, _ := rc.ZCard(ctx, fmt.Sprintf("sl:%s:dirty:%d", ns, band)).Result()
+			total += n
+		}
+		return total == 0
+	}, 3*time.Second, 20*time.Millisecond, "dirty set should be empty after flush")
+
+	require.NoError(t, sl.DrainAndClose(ctx))
+}
+
+// TestContractError_MovesToDeadLetter verifies that a key whose contract
+// rejects the payload ends up in the dead-letter sorted set, not stuck
+// in the dirty set forever.
+func TestContractError_MovesToDeadLetter(t *testing.T) {
+	const ns = "dlq_test"
+	rc := redisClient(t)
+	ctx := context.Background()
+
+	cleanRedisKeys(t, rc, ns)
+
+	sk, err := docdb.New(ctx, docdb.Config{
+		URI: testMongoURI, Database: testDatabase, Collection: "dlq_docs",
+		MaxPoolSize: 10, MinPoolSize: 1,
+	})
+	require.NoError(t, err)
+
+	// Contract that rejects keys starting with "bad_".
+	selectiveContract := func(key string, payload []byte) (*sluice.WriteModel, error) {
+		if len(key) >= 4 && key[:4] == "bad_" {
+			return nil, fmt.Errorf("rejected key: %s", key)
+		}
+		return testContract(key, payload)
+	}
+
+	sl, err := sluice.New(ns).
+		WithRedis(sluice.RedisConfig{Addrs: []string{testRedisAddr}}).
+		WithSink(sk).
+		WithWriteContract(selectiveContract).
+		WithFlushWindow(50 * time.Millisecond).
+		WithMaxBatchSize(100).
+		WithBandCount(1). // single band for deterministic DLQ key
+		WithKeyTTL(10 * time.Second).
+		Build(ctx)
+	require.NoError(t, err)
+
+	// Write one good key and two bad keys.
+	require.NoError(t, sl.Write(ctx, "good_1", mustPayload(t, "ok")))
+	require.NoError(t, sl.Write(ctx, "bad_1", mustPayload(t, "nope")))
+	require.NoError(t, sl.Write(ctx, "bad_2", mustPayload(t, "nope")))
+
+	dlqKey := fmt.Sprintf("sl:%s:dlq:0", ns)
+
+	// Bad keys should appear in the DLQ.
+	require.Eventually(t, func() bool {
+		n, _ := rc.ZCard(ctx, dlqKey).Result()
+		return n >= 2
+	}, 3*time.Second, 20*time.Millisecond, "expected 2 keys in dead-letter set")
+
+	// Bad keys should NOT remain in the dirty set.
+	require.Eventually(t, func() bool {
+		dirtyKey := fmt.Sprintf("sl:%s:dirty:0", ns)
+		n, _ := rc.ZCard(ctx, dirtyKey).Result()
+		return n == 0
+	}, 3*time.Second, 20*time.Millisecond, "dirty set should be empty after flush")
+
+	// Verify DLQ payload hash is annotated with reason.
+	vals, err := rc.HGetAll(ctx, fmt.Sprintf("sl:%s:payload:bad_1", ns)).Result()
+	require.NoError(t, err)
+	assert.Equal(t, "contract_violation", vals["dlq_reason"])
+	assert.NotEmpty(t, vals["dlq_at"])
+
+	require.NoError(t, sl.DrainAndClose(ctx))
+}
+
+// TestOnFlushCallback_SuccessReceivesNilError verifies that the callback
+// receives a nil error (not the raw flush error) when BulkWrite succeeds.
+func TestOnFlushCallback_SuccessReceivesNilError(t *testing.T) {
+	var mu sync.Mutex
+	var callbackErrors []error
+
+	sl, _ := buildSluice(t, func(b *sluice.Builder) {
+		b.WithFlushWindow(50 * time.Millisecond).
+			WithBandCount(1).
+			WithKeyTTL(5 * time.Second).
+			OnFlush(func(_ []string, _ *sluice.BulkWriteResult, err error) {
+				mu.Lock()
+				callbackErrors = append(callbackErrors, err)
+				mu.Unlock()
+			})
+	})
+
+	ctx := context.Background()
+	for i := 0; i < 5; i++ {
+		require.NoError(t, sl.Write(ctx, fmt.Sprintf("nilcb_%d", i), mustPayload(t, "v")))
+	}
+
+	require.Eventually(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(callbackErrors) > 0
+	}, 3*time.Second, 20*time.Millisecond, "callback should have been invoked")
+
+	mu.Lock()
+	defer mu.Unlock()
+	for i, e := range callbackErrors {
+		assert.Nil(t, e, "callback invocation %d should have nil error", i)
+	}
+}
+
+// TestOnFlushCallback_ContractErrorCallsBack verifies that the callback
+// is invoked for contract-rejected keys with a non-nil error and the
+// offending correlation key in the result Errors slice.
+func TestOnFlushCallback_ContractErrorCallsBack(t *testing.T) {
+	var mu sync.Mutex
+	var cbErrors []sluice.SinkError
+
+	rejectContract := func(key string, payload []byte) (*sluice.WriteModel, error) {
+		if key == "reject_me" {
+			return nil, fmt.Errorf("nope")
+		}
+		return testContract(key, payload)
+	}
+
+	ctx := context.Background()
+	sk, err := docdb.New(ctx, docdb.Config{
+		URI: testMongoURI, Database: testDatabase, Collection: "cb_contract_docs",
+		MaxPoolSize: 10, MinPoolSize: 1,
+	})
+	require.NoError(t, err)
+
+	sl, err := sluice.New("cb_contract_test").
+		WithRedis(sluice.RedisConfig{Addrs: []string{testRedisAddr}}).
+		WithSink(sk).
+		WithWriteContract(rejectContract).
+		WithFlushWindow(50 * time.Millisecond).
+		WithMaxBatchSize(100).
+		WithBandCount(1).
+		WithKeyTTL(5 * time.Second).
+		OnFlush(func(_ []string, result *sluice.BulkWriteResult, _ error) {
+			mu.Lock()
+			if result != nil {
+				cbErrors = append(cbErrors, result.Errors...)
+			}
+			mu.Unlock()
+		}).
+		Build(ctx)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		cctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = sl.DrainAndClose(cctx)
+	})
+
+	require.NoError(t, sl.Write(ctx, "reject_me", mustPayload(t, "v")))
+
+	require.Eventually(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(cbErrors) > 0
+	}, 3*time.Second, 20*time.Millisecond, "callback should report contract error")
+
+	mu.Lock()
+	defer mu.Unlock()
+	found := false
+	for _, se := range cbErrors {
+		if se.CorrelationKey == "reject_me" {
+			found = true
+			assert.NotNil(t, se.Err)
+		}
+	}
+	assert.True(t, found, "expected SinkError for 'reject_me' in callback")
+}
+
+// cleanRedisKeys removes all keys matching the given namespace pattern
+// to ensure test isolation.
+func cleanRedisKeys(t *testing.T, rc *redis.Client, ns string) {
+	t.Helper()
+	ctx := context.Background()
+	var cursor uint64
+	for {
+		keys, next, err := rc.Scan(ctx, cursor, fmt.Sprintf("sl:%s:*", ns), 100).Result()
+		require.NoError(t, err)
+		if len(keys) > 0 {
+			rc.Del(ctx, keys...)
+		}
+		cursor = next
+		if cursor == 0 {
+			break
+		}
 	}
 }

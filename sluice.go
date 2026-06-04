@@ -95,7 +95,7 @@ func (b *Builder) Build(ctx context.Context) (*Sluice, error) {
 				Errors:        make([]SinkError, len(result.Errors)),
 			}
 			for i, se := range result.Errors {
-				pubResult.Errors[i] = SinkError{CorrelationKey: se.CorrelationKey, Err: se.Err}
+				pubResult.Errors[i] = SinkError{CorrelationKey: se.CorrelationKey, Code: se.Code, Err: se.Err}
 			}
 			b.callback(keys, pubResult, err)
 		}
