@@ -127,7 +127,6 @@ func main() {
 	sk, err := docdb.New(ctx, docdb.Config{URI: mongoURI, Database: "adroll", Collection: "nudge_inventory", MaxPoolSize: 100, MinPoolSize: 10})
 	if err != nil {
 		log.Error("failed to connect to MongoDB", "err", err)
-		os.Exit(1)
 	}
 	log.Info("connected to MongoDB", "uri", mongoURI)
 
@@ -150,7 +149,6 @@ func main() {
 		}).Build(ctx)
 	if err != nil {
 		log.Error("failed to build sluice", "err", err)
-		os.Exit(1)
 	}
 	log.Info("sluice ready", "redis", redisAddr, "flush_window", "250ms", "bands", 16)
 

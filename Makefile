@@ -15,10 +15,10 @@ REDIS_TIMEOUT      := 30
 MONGO_TIMEOUT      := 45
 KAFKA_TIMEOUT      := 60
 
-GREEN  := \033[0;32m
-YELLOW := \033[0;33m
-RED    := \033[0;31m
-RESET  := \033[0m
+GREEN  := $(shell tput -Txterm setaf 2)
+YELLOW := $(shell tput -Txterm setaf 3)
+BLUE   := $(shell tput -Txterm setaf 4)
+RESET  := $(shell tput -Txterm sgr0)
 
 .PHONY: help
 help:
