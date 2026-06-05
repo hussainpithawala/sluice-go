@@ -430,6 +430,103 @@ func TestOnFlushCallback_ContractErrorCallsBack(t *testing.T) {
 	assert.True(t, found, "expected SinkError for 'reject_me' in callback")
 }
 
+// TestWrite_BatchedMode verifies that with batched writes enabled, all writes
+// eventually land in Redis (dirty sorted set + payload hash) after DrainAndClose.
+func TestWrite_BatchedMode(t *testing.T) {
+	const ns = "batched_write_test"
+	const n = 50
+	rc := redisClient(t)
+	ctx := context.Background()
+
+	cleanRedisKeys(t, rc, ns)
+	t.Cleanup(func() { cleanRedisKeys(t, rc, ns) })
+
+	sk, err := docdb.New(ctx, docdb.Config{
+		URI: testMongoURI, Database: testDatabase, Collection: "batched_docs",
+		MaxPoolSize: 10, MinPoolSize: 1,
+	})
+	require.NoError(t, err)
+
+	sl, err := sluice.New(ns).
+		WithRedis(sluice.RedisConfig{Addrs: []string{testRedisAddr}}).
+		WithSink(sk).
+		WithWriteContract(testContract).
+		WithFlushWindow(60*time.Second). // long window — rely on batcher, not timer flush
+		WithMaxBatchSize(100).
+		WithBandCount(4).
+		WithKeyTTL(10*time.Second).
+		WithBatchedWrites(20, 5*time.Millisecond).
+		Build(ctx)
+	require.NoError(t, err)
+
+	keys := make([]string, n)
+	for i := 0; i < n; i++ {
+		keys[i] = fmt.Sprintf("bw_%04d", i)
+		require.NoError(t, sl.Write(ctx, keys[i], mustPayload(t, keys[i])))
+	}
+
+	// StopBatcher (inside DrainAndClose) must flush all buffered entries before drain.
+	require.NoError(t, sl.DrainAndClose(ctx))
+
+	// After DrainAndClose the dirty sets should be empty (engine drained them).
+	totalDirty := int64(0)
+	for band := 0; band < 4; band++ {
+		n, _ := rc.ZCard(ctx, fmt.Sprintf("sl:%s:dirty:%d", ns, band)).Result()
+		totalDirty += n
+	}
+	assert.Equal(t, int64(0), totalDirty, "all dirty keys should be committed after drain")
+}
+
+// TestWrite_BatchedMode_FlushesToMongo verifies that batched writes are
+// ultimately flushed to MongoDB through the normal engine drain cycle.
+func TestWrite_BatchedMode_FlushesToMongo(t *testing.T) {
+	const ns = "batched_mongo_test"
+	const n = 30
+	rc := redisClient(t)
+	ctx := context.Background()
+
+	cleanRedisKeys(t, rc, ns)
+	t.Cleanup(func() { cleanRedisKeys(t, rc, ns) })
+
+	sk, err := docdb.New(ctx, docdb.Config{
+		URI: testMongoURI, Database: testDatabase, Collection: "batched_mongo_docs",
+		MaxPoolSize: 10, MinPoolSize: 1,
+	})
+	require.NoError(t, err)
+
+	sl, err := sluice.New(ns).
+		WithRedis(sluice.RedisConfig{Addrs: []string{testRedisAddr}}).
+		WithSink(sk).
+		WithWriteContract(testContract).
+		WithFlushWindow(50*time.Millisecond).
+		WithMaxBatchSize(100).
+		WithBandCount(2).
+		WithKeyTTL(10*time.Second).
+		WithBatchedWrites(10, 5*time.Millisecond).
+		Build(ctx)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		cctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = sl.DrainAndClose(cctx)
+	})
+
+	for i := 0; i < n; i++ {
+		key := fmt.Sprintf("bm_%04d", i)
+		require.NoError(t, sl.Write(ctx, key, mustPayload(t, key)))
+	}
+
+	// All dirty sets should empty once the engine has flushed.
+	require.Eventually(t, func() bool {
+		total := int64(0)
+		for band := 0; band < 2; band++ {
+			c, _ := rc.ZCard(ctx, fmt.Sprintf("sl:%s:dirty:%d", ns, band)).Result()
+			total += c
+		}
+		return total == 0
+	}, 3*time.Second, 20*time.Millisecond, "dirty sets should be empty after batched flush")
+}
+
 // cleanRedisKeys removes all keys matching the given namespace pattern
 // to ensure test isolation.
 func cleanRedisKeys(t *testing.T, rc *redis.Client, ns string) {

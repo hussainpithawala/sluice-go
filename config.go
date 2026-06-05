@@ -18,6 +18,13 @@ type Config struct {
 	DegradedModeDirect bool
 	Redis              RedisConfig
 	Metrics            MetricsRecorder
+
+	// BatchedWrites enables pipelined Redis writes. When true, Write() calls
+	// are buffered in memory and flushed to Redis in a single pipeline,
+	// reducing per-call round-trips from N to 1. Opt-in; default false.
+	BatchedWrites    bool
+	WriteBatchSize   int           // buffer capacity before pipeline flush; default 200
+	WriteBatchWindow time.Duration // max time before a partial buffer is flushed; default 5ms
 }
 
 // RedisConfig holds Redis connectivity parameters.

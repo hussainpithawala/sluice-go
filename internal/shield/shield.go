@@ -6,6 +6,8 @@ import (
 	"context"
 	"fmt"
 	"hash/fnv"
+	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -29,14 +31,35 @@ type RedisConfig struct {
 	PoolSize     int
 }
 
+// VolumeSignaler is called by the batcher after flushing a batch to signal
+// the engine that a band may have reached its volume threshold.
+type VolumeSignaler func(band int)
+
+// writeEntry is a single buffered write waiting to be pipelined.
+type writeEntry struct {
+	correlationKey string
+	payload        []byte
+	ts             float64
+}
+
 // Shield manages all Redis interactions for the library.
 type Shield struct {
-	client      redis.UniversalClient
-	namespace   string
-	bandCount   int
-	keyTTL      time.Duration
-	dlqTTL      time.Duration // how long dead-letter payload hashes are kept
-	writeScript *redis.Script
+	client         redis.UniversalClient
+	namespace      string
+	bandCount      int
+	keyTTL         time.Duration
+	dlqTTL         time.Duration // how long dead-letter payload hashes are kept
+	writeScript    *redis.Script
+	writeScriptSHA string // pre-loaded SHA; used by flushBatch to avoid sending script text each time
+
+	// Batching fields — all nil/zero when batching is disabled.
+	batchCh        chan writeEntry
+	batchSize      int
+	batchWin       time.Duration
+	stopBatch      chan struct{}
+	batchWg        sync.WaitGroup
+	volumeSignaler VolumeSignaler
+	batchCtx       context.Context // parent context; cancellation stops the batcher
 }
 
 // atomicWriteLua atomically stores payload + marks the key dirty in one round-trip.
@@ -72,18 +95,37 @@ func New(cfg RedisConfig, namespace string, bandCount int, keyTTL time.Duration)
 		_ = client.Close()
 		return nil, fmt.Errorf("sluice/shield: ping: %w", err)
 	}
+	// Pre-load the write script so the batcher can use EVALSHA in pipelines,
+	// avoiding sending the full script text on every pipelined batch flush.
+	// For cluster clients, go-redis broadcasts SCRIPT LOAD to all nodes.
+	sha, err := client.ScriptLoad(ctx, atomicWriteLua).Result()
+	if err != nil {
+		_ = client.Close()
+		return nil, fmt.Errorf("sluice/shield: script load: %w", err)
+	}
 	return &Shield{
-		client:      client,
-		namespace:   namespace,
-		bandCount:   bandCount,
-		keyTTL:      keyTTL,
-		dlqTTL:      7 * 24 * time.Hour, // dead-letter payloads kept 7 days
-		writeScript: redis.NewScript(atomicWriteLua),
+		client:         client,
+		namespace:      namespace,
+		bandCount:      bandCount,
+		keyTTL:         keyTTL,
+		dlqTTL:         7 * 24 * time.Hour, // dead-letter payloads kept 7 days
+		writeScript:    redis.NewScript(atomicWriteLua),
+		writeScriptSHA: sha,
 	}, nil
 }
 
 // Write atomically stores payload and marks the correlation key dirty.
+// When batching is enabled, the write is buffered and pipelined to Redis
+// by the background batcher goroutine. Returns nil immediately in that case.
 func (s *Shield) Write(ctx context.Context, correlationKey string, payload []byte) error {
+	if s.batchCh != nil {
+		s.batchCh <- writeEntry{
+			correlationKey: correlationKey,
+			payload:        payload,
+			ts:             float64(time.Now().UnixMilli()),
+		}
+		return nil
+	}
 	return s.writeScript.Run(ctx, s.client,
 		[]string{s.payloadKey(correlationKey), s.dirtyKey(correlationKey)},
 		payload, float64(time.Now().UnixMilli()), correlationKey, int64(s.keyTTL.Seconds()),
@@ -348,6 +390,154 @@ func (s *Shield) BandFor(correlationKey string) int {
 }
 
 func (s *Shield) Close() error { return s.client.Close() }
+
+// ── Write batcher ─────────────────────────────────────────────────────────────
+
+// EnableBatching configures the shield for batched pipeline writes.
+// Must be called before StartBatcher. batchSize is the max entries per pipeline
+// flush; batchWindow is the max time before a partial buffer is flushed.
+func (s *Shield) EnableBatching(batchSize int, batchWindow time.Duration) {
+	if batchSize <= 0 {
+		batchSize = 200
+	}
+	if batchWindow <= 0 {
+		batchWindow = 5 * time.Millisecond
+	}
+	s.batchSize = batchSize
+	s.batchWin = batchWindow
+	// Channel capacity = 4x batch size to absorb bursts without blocking callers.
+	s.batchCh = make(chan writeEntry, batchSize*4)
+	s.stopBatch = make(chan struct{})
+}
+
+// SetVolumeSignaler sets the callback invoked after each batch flush to trigger
+// volume-based drain. Must be called before StartBatcher.
+func (s *Shield) SetVolumeSignaler(fn VolumeSignaler) {
+	s.volumeSignaler = fn
+}
+
+// StartBatcher launches the background goroutine that consumes from the write
+// channel and flushes entries to Redis via pipeline. No-op if batching is not enabled.
+// ctx is the application-level parent context; cancellation unblocks the batcher immediately.
+func (s *Shield) StartBatcher(ctx context.Context) {
+	if s.batchCh == nil {
+		return
+	}
+	s.batchCtx = ctx
+	s.batchWg.Add(1)
+	go s.runBatcher()
+}
+
+// StopBatcher signals the batcher to drain remaining entries and stop.
+// Blocks until the goroutine has exited. No-op if batching is not enabled.
+func (s *Shield) StopBatcher() {
+	if s.stopBatch == nil {
+		return
+	}
+	close(s.stopBatch)
+	s.batchWg.Wait()
+}
+
+func (s *Shield) runBatcher() {
+	defer s.batchWg.Done()
+	buf := make([]writeEntry, 0, s.batchSize)
+	ticker := time.NewTicker(s.batchWin)
+	defer ticker.Stop()
+
+	flush := func() {
+		if len(buf) == 0 {
+			return
+		}
+		// Copy before reset: buf[:0] reuses the underlying array, so any
+		// future async use of flushBatch would race against the next append.
+		// A copy makes the hand-off safe regardless of how flushBatch evolves.
+		ready := make([]writeEntry, len(buf))
+		copy(ready, buf)
+		buf = buf[:0]
+		s.flushBatch(ready)
+	}
+
+	for {
+		select {
+		case <-s.batchCtx.Done():
+			// Application context cancelled (e.g. SIGTERM). Flush what we have and stop.
+			flush()
+			return
+		case entry := <-s.batchCh:
+			buf = append(buf, entry)
+			if len(buf) >= s.batchSize {
+				flush()
+				ticker.Reset(s.batchWin)
+			}
+		case <-ticker.C:
+			flush()
+		case <-s.stopBatch:
+			// Drain any remaining entries in the channel.
+			for {
+				select {
+				case entry := <-s.batchCh:
+					buf = append(buf, entry)
+					if len(buf) >= s.batchSize {
+						flush()
+					}
+				default:
+					flush()
+					return
+				}
+			}
+		}
+	}
+}
+
+func (s *Shield) flushBatch(entries []writeEntry) {
+	ctx, cancel := context.WithTimeout(s.batchCtx, 10*time.Second)
+	defer cancel()
+
+	// Use EvalSha (pre-loaded at startup) so the pipeline carries only the
+	// 40-byte SHA rather than the full Lua script text on every flush.
+	// Each key's HSET+EXPIRE+ZADD remains atomic inside the Lua execution.
+	pipe := s.client.Pipeline()
+	ttlSec := int64(s.keyTTL.Seconds())
+
+	for _, e := range entries {
+		pipe.EvalSha(ctx, s.writeScriptSHA,
+			[]string{s.payloadKey(e.correlationKey), s.dirtyKey(e.correlationKey)},
+			e.payload, fmt.Sprintf("%.0f", e.ts), e.correlationKey, ttlSec,
+		)
+	}
+
+	// Collect the unique bands touched by this batch and append ZCARD for each
+	// into the same pipeline — one round-trip for writes + depth checks combined.
+	var touchedBands []int
+	if s.volumeSignaler != nil {
+		seen := make(map[int]bool, s.bandCount)
+		for _, e := range entries {
+			if b := s.BandFor(e.correlationKey); !seen[b] {
+				seen[b] = true
+				touchedBands = append(touchedBands, b)
+			}
+		}
+		zcardCmds := make([]*redis.IntCmd, len(touchedBands))
+		for i, b := range touchedBands {
+			zcardCmds[i] = pipe.ZCard(ctx, s.dirtyKeyForBand(b))
+		}
+		if _, err := pipe.Exec(ctx); err != nil && err != redis.Nil {
+			slog.Error("sluice/shield: batch pipeline exec failed",
+				"namespace", s.namespace, "batch_size", len(entries), "err", err)
+		}
+		for i, b := range touchedBands {
+			if depth, err := zcardCmds[i].Result(); err == nil && int(depth) >= s.batchSize {
+				s.volumeSignaler(b)
+			}
+		}
+		return
+	}
+
+	if _, err := pipe.Exec(ctx); err != nil && err != redis.Nil {
+		slog.Error("sluice/shield: batch pipeline exec failed",
+			"namespace", s.namespace, "batch_size", len(entries), "err", err)
+	}
+}
 
 // ── Key naming ────────────────────────────────────────────────────────────────
 
