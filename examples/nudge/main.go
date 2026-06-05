@@ -83,6 +83,9 @@ func (m *logMetrics) RecordContractError(ns, crn string, err error) {
 func (m *logMetrics) RecordDeadLetter(ns, band string, count int) {
 	m.log.Warn("dead-letter", "ns", ns, "band", band, "count", count)
 }
+func (m *logMetrics) RecordDLQProcess(ns, strategy string, processed, succeeded, failed int) {
+	m.log.Info("dlq-process", "ns", ns, "strategy", strategy, "processed", processed, "succeeded", succeeded, "failed", failed)
+}
 
 func simulatedConsumer(ctx context.Context, workerID int, sl *sluice.Sluice, log *slog.Logger, written *atomic.Int64, wg *sync.WaitGroup) {
 	defer wg.Done()

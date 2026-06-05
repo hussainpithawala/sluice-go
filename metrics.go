@@ -16,6 +16,9 @@ type MetricsRecorder interface {
 	// dead-letter set after a permanent sink failure (e.g. duplicate key).
 	// count is the number of correlation keys moved in this operation.
 	RecordDeadLetter(namespace, band string, count int)
+
+	// RecordDLQProcess is called after a ProcessDLQ invocation completes.
+	RecordDLQProcess(namespace, strategy string, processed, succeeded, failed int)
 }
 
 type noopMetrics struct{}
@@ -27,3 +30,4 @@ func (n *noopMetrics) RecordFlush(_ string, _ string, _ int, _ time.Duration, _ 
 func (n *noopMetrics) RecordDirtyQueueDepth(_ string, _ string, _ int)                 {}
 func (n *noopMetrics) RecordContractError(_ string, _ string, _ error)                 {}
 func (n *noopMetrics) RecordDeadLetter(_ string, _ string, _ int)                      {}
+func (n *noopMetrics) RecordDLQProcess(_ string, _ string, _ int, _ int, _ int)        {}

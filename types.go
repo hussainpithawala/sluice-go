@@ -50,3 +50,22 @@ type SinkError struct {
 // unique-index violation. sluice uses this to distinguish permanent failures
 // (route to dead-letter) from transient ones (leave in dirty set for retry).
 const ErrCodeDuplicateKey = 11000
+
+// DLQStrategy selects how dead-letter records are processed.
+type DLQStrategy int
+
+const (
+	// DLQIgnore logs each dead-letter record and discards it.
+	DLQIgnore DLQStrategy = iota
+	// DLQUpsert re-runs the WriteContract with Upsert=true and BulkWrites.
+	DLQUpsert
+	// DLQReInsert mutates the key and pushes the record back to the dirty queue.
+	DLQReInsert
+)
+
+// DLQResult carries the outcome of a ProcessDLQ invocation.
+type DLQResult struct {
+	Processed int // total records handled across all bands
+	Succeeded int // successfully committed/re-queued
+	Failed    int // records that failed during DLQ processing
+}
