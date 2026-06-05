@@ -44,14 +44,10 @@ func (c RedisConfig) toInternal() shield.RedisConfig {
 // toInternal converts to internal engine.Config.
 func (c Config) toInternal() engine.Config {
 	return engine.Config{
-		Namespace:          c.Namespace,
-		BandCount:          c.BandCount,
-		FlushWindow:        c.FlushWindow,
-		MaxBatchSize:       c.MaxBatchSize,
-		KeyTTL:             c.KeyTTL,
-		DegradedModeDirect: c.DegradedModeDirect,
-		Redis:              c.Redis.toInternal(),
-		Metrics:            c.Metrics,
+		Namespace:    c.Namespace,
+		BandCount:    c.BandCount,
+		FlushWindow:  c.FlushWindow,
+		MaxBatchSize: c.MaxBatchSize,
 	}
 }
 

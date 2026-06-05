@@ -17,8 +17,12 @@ type BulkWriteResult struct {
 }
 
 // SinkError ties a write failure back to its originating correlation key.
+// Code carries the document-store error code when available (e.g. 11000 for
+// a MongoDB/DocumentDB duplicate-key violation). Zero means unknown or
+// not applicable.
 type SinkError struct {
 	CorrelationKey string
+	Code           int
 	Err            error
 }
 

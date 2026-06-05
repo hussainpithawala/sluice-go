@@ -80,6 +80,12 @@ func (m *logMetrics) RecordDirtyQueueDepth(ns, band string, depth int) {
 func (m *logMetrics) RecordContractError(ns, crn string, err error) {
 	m.log.Error("contract error", "ns", ns, "crn", crn, "err", err)
 }
+func (m *logMetrics) RecordDeadLetter(ns, band string, count int) {
+	m.log.Warn("dead-letter", "ns", ns, "band", band, "count", count)
+}
+func (m *logMetrics) RecordDLQProcess(ns, strategy string, processed, succeeded, failed int) {
+	m.log.Info("dlq-process", "ns", ns, "strategy", strategy, "processed", processed, "succeeded", succeeded, "failed", failed)
+}
 
 func simulatedConsumer(ctx context.Context, workerID int, sl *sluice.Sluice, log *slog.Logger, written *atomic.Int64, wg *sync.WaitGroup) {
 	defer wg.Done()
@@ -121,7 +127,6 @@ func main() {
 	sk, err := docdb.New(ctx, docdb.Config{URI: mongoURI, Database: "adroll", Collection: "nudge_inventory", MaxPoolSize: 100, MinPoolSize: 10})
 	if err != nil {
 		log.Error("failed to connect to MongoDB", "err", err)
-		os.Exit(1)
 	}
 	log.Info("connected to MongoDB", "uri", mongoURI)
 
@@ -144,7 +149,6 @@ func main() {
 		}).Build(ctx)
 	if err != nil {
 		log.Error("failed to build sluice", "err", err)
-		os.Exit(1)
 	}
 	log.Info("sluice ready", "redis", redisAddr, "flush_window", "250ms", "bands", 16)
 

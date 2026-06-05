@@ -1,8 +1,4 @@
 // Package docdb provides a FlushSink implementation for AWS DocumentDB and MongoDB.
-//
-// DocumentDB URI:
-//
-//	mongodb://user:pass@cluster.docdb.amazonaws.com:27017/?tls=true&replicaSet=rs0
 package docdb
 
 import (
@@ -78,10 +74,15 @@ func New(ctx context.Context, cfg Config) (*Sink, error) {
 }
 
 // BulkWrite executes all models as a single ordered=false BulkWrite call.
+// Partial success is handled: failed records are returned in BulkWriteResult.Errors
+// with their Code field populated from the MongoDB write error code. Callers
+// use Code == 11000 to distinguish permanent failures (unique-index violation)
+// from transient ones.
 func (s *Sink) BulkWrite(ctx context.Context, models []sink.WriteModel) (*sink.BulkWriteResult, error) {
 	if len(models) == 0 {
 		return &sink.BulkWriteResult{}, nil
 	}
+
 	mongoModels := make([]mongo.WriteModel, 0, len(models))
 	for _, m := range models {
 		upsert := m.Upsert
@@ -91,6 +92,7 @@ func (s *Sink) BulkWrite(ctx context.Context, models []sink.WriteModel) (*sink.B
 			Upsert: &upsert,
 		})
 	}
+
 	res, err := s.collection.BulkWrite(ctx, mongoModels, options.BulkWrite().SetOrdered(false))
 	if err != nil {
 		if bwe, ok := err.(mongo.BulkWriteException); ok {
@@ -102,7 +104,12 @@ func (s *Sink) BulkWrite(ctx context.Context, models []sink.WriteModel) (*sink.B
 				}
 				errs = append(errs, sink.SinkError{
 					CorrelationKey: key,
-					Err:            fmt.Errorf("code %d: %s", we.Code, we.Message),
+					// Code is populated directly from the MongoDB write error code.
+					// Code 11000 = duplicate key error (unique index violation).
+					// The engine uses this to route permanent failures to dead-letter
+					// instead of retrying them indefinitely.
+					Code: we.Code,
+					Err:  fmt.Errorf("code %d: %s", we.Code, we.Message),
 				})
 			}
 			result := &sink.BulkWriteResult{Errors: errs}
@@ -112,10 +119,13 @@ func (s *Sink) BulkWrite(ctx context.Context, models []sink.WriteModel) (*sink.B
 				result.ModifiedCount = res.ModifiedCount
 				result.UpsertedCount = res.UpsertedCount
 			}
+			// Return partial result without wrapping as a fatal error.
+			// The engine partitions errors by Code to decide the next action.
 			return result, nil
 		}
 		return nil, fmt.Errorf("sluice/docdb: bulkwrite: %w", err)
 	}
+
 	return &sink.BulkWriteResult{
 		InsertedCount: res.InsertedCount,
 		MatchedCount:  res.MatchedCount,
@@ -124,9 +134,13 @@ func (s *Sink) BulkWrite(ctx context.Context, models []sink.WriteModel) (*sink.B
 	}, nil
 }
 
+// Write performs a single-document upsert. Used in degraded mode only.
 func (s *Sink) Write(ctx context.Context, model sink.WriteModel) error {
 	upsert := model.Upsert
-	_, err := s.collection.UpdateOne(ctx, model.Filter, model.Update, options.Update().SetUpsert(upsert))
+	_, err := s.collection.UpdateOne(
+		ctx, model.Filter, model.Update,
+		options.Update().SetUpsert(upsert),
+	)
 	if err != nil {
 		return fmt.Errorf("sluice/docdb: single write: %w", err)
 	}

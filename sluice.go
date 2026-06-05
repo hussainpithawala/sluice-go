@@ -24,6 +24,9 @@ import (
 	"sync/atomic"
 	"time"
 
+	"log/slog"
+
+	"github.com/hussainpithawala/sluice-go/internal/dlq"
 	"github.com/hussainpithawala/sluice-go/internal/engine"
 	"github.com/hussainpithawala/sluice-go/internal/shield"
 	"github.com/hussainpithawala/sluice-go/sink"
@@ -95,7 +98,7 @@ func (b *Builder) Build(ctx context.Context) (*Sluice, error) {
 				Errors:        make([]SinkError, len(result.Errors)),
 			}
 			for i, se := range result.Errors {
-				pubResult.Errors[i] = SinkError{CorrelationKey: se.CorrelationKey, Err: se.Err}
+				pubResult.Errors[i] = SinkError{CorrelationKey: se.CorrelationKey, Code: se.Code, Err: se.Err}
 			}
 			b.callback(keys, pubResult, err)
 		}
@@ -186,6 +189,84 @@ func (s *Sluice) DrainAndClose(ctx context.Context) error {
 		return fmt.Errorf("sluice: redis close: %w", err)
 	}
 	return s.sk.Close(ctx)
+}
+
+// ── DLQ Processing ──────────────────────────────────────────────────────────
+
+// DLQOption configures the behaviour of ProcessDLQ.
+type DLQOption func(*dlqOptions)
+
+type dlqOptions struct {
+	maxBatchSize int
+	keyMutator   func(string) string
+	logger       *slog.Logger
+}
+
+// WithDLQBatchSize sets the per-band batch size for DLQ processing.
+func WithDLQBatchSize(n int) DLQOption {
+	return func(o *dlqOptions) { o.maxBatchSize = n }
+}
+
+// WithKeyMutator sets the key mutation function for DLQReInsert strategy.
+// If not set, DefaultKeyMutator is used.
+func WithKeyMutator(fn func(string) string) DLQOption {
+	return func(o *dlqOptions) { o.keyMutator = fn }
+}
+
+// WithDLQLogger sets a structured logger for DLQ processing.
+// Defaults to slog.Default().
+func WithDLQLogger(l *slog.Logger) DLQOption {
+	return func(o *dlqOptions) { o.logger = l }
+}
+
+// DefaultKeyMutator appends a timestamp suffix to avoid key collision.
+// Used by DLQReInsert when no custom KeyMutator is provided.
+func DefaultKeyMutator(oldKey string) string {
+	return dlq.DefaultKeyMutator(oldKey)
+}
+
+// ProcessDLQ drains and handles dead-letter records across all bands using the
+// given strategy. This is a one-shot operation — call it from a cron job, admin
+// endpoint, or CLI tool when you want to process accumulated DLQ records.
+func (s *Sluice) ProcessDLQ(ctx context.Context, strategy DLQStrategy, opts ...DLQOption) (*DLQResult, error) {
+	if s.closed.Load() {
+		return nil, ErrLibraryClosed
+	}
+
+	o := &dlqOptions{maxBatchSize: s.cfg.MaxBatchSize}
+	for _, opt := range opts {
+		opt(o)
+	}
+
+	// Wrap the public WriteContract to produce sink.WriteModel.
+	wrappedContract := func(crn string, payload []byte) (*sink.WriteModel, error) {
+		wm, err := s.contract(crn, payload)
+		if err != nil {
+			return nil, err
+		}
+		return &sink.WriteModel{
+			Filter: wm.Filter,
+			Update: wm.Update,
+			Upsert: wm.Upsert,
+		}, nil
+	}
+
+	proc := dlq.NewProcessor(s.shield, s.sk, wrappedContract, s.metrics, dlq.Config{
+		Strategy:     dlq.Strategy(strategy),
+		MaxBatchSize: o.maxBatchSize,
+		KeyMutator:   o.keyMutator,
+		Logger:       o.logger,
+	})
+
+	result, err := proc.Process(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &DLQResult{
+		Processed: result.Processed,
+		Succeeded: result.Succeeded,
+		Failed:    result.Failed,
+	}, nil
 }
 
 func (s *Sluice) degradedWrite(ctx context.Context, correlationKey string, payload []byte) error {

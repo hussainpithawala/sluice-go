@@ -46,21 +46,43 @@ func ensureKafkaTopic(t *testing.T, topic string, partitions int) {
 	conn, err := kafka.Dial("tcp", kafkaBroker())
 	require.NoError(t, err)
 	defer conn.Close()
-	_ = conn.CreateTopics(kafka.TopicConfig{Topic: topic, NumPartitions: partitions, ReplicationFactor: 1})
+
+	err = conn.CreateTopics(kafka.TopicConfig{
+		Topic:             topic,
+		NumPartitions:     partitions,
+		ReplicationFactor: 1,
+	})
+	if err != nil {
+		t.Logf("CreateTopics (may already exist): %v", err)
+	}
+
+	// Wait for topic metadata to propagate so the writer doesn't hit
+	// "Unknown Topic Or Partition".
+	require.Eventually(t, func() bool {
+		c, dialErr := kafka.Dial("tcp", kafkaBroker())
+		if dialErr != nil {
+			return false
+		}
+		defer c.Close()
+		parts, readErr := c.ReadPartitions(topic)
+		return readErr == nil && len(parts) >= partitions
+	}, 30*time.Second, 500*time.Millisecond, "topic %s not ready with %d partitions", topic, partitions)
 }
 
 func publishKafkaMessages(t *testing.T, w *kafka.Writer, n int, nudgeMasterID string) {
 	t.Helper()
-	ctx  := context.Background()
+	ctx := context.Background()
 	msgs := make([]kafka.Message, 0, n)
 	for i := 0; i < n; i++ {
-		crn  := fmt.Sprintf("crn_kafka_%07d", i)
+		crn := fmt.Sprintf("crn_kafka_%07d", i)
 		body, _ := json.Marshal(kafkaEvent{CRN: crn, NudgeMasterID: nudgeMasterID, SequenceNo: i})
 		msgs = append(msgs, kafka.Message{Key: []byte(crn), Value: body})
 	}
 	for start := 0; start < len(msgs); start += 200 {
 		end := start + 200
-		if end > len(msgs) { end = len(msgs) }
+		if end > len(msgs) {
+			end = len(msgs)
+		}
 		require.NoError(t, w.WriteMessages(ctx, msgs[start:end]...))
 	}
 	t.Logf("published %d messages to Kafka topic %s", n, w.Topic)
@@ -72,13 +94,20 @@ func runKafkaConsumer(ctx context.Context, t *testing.T, reader *kafka.Reader,
 	for processed.Load() < target {
 		msg, err := reader.FetchMessage(ctx)
 		if err != nil {
-			if ctx.Err() != nil { return }
+			if ctx.Err() != nil {
+				return
+			}
 			time.Sleep(100 * time.Millisecond)
 			continue
 		}
 		var evt kafkaEvent
-		if err := json.Unmarshal(msg.Value, &evt); err != nil { _ = reader.CommitMessages(ctx, msg); continue }
-		if writeErr := sl.Write(ctx, evt.CRN, makePayload(evt.NudgeMasterID)); writeErr == nil { processed.Add(1) }
+		if err := json.Unmarshal(msg.Value, &evt); err != nil {
+			_ = reader.CommitMessages(ctx, msg)
+			continue
+		}
+		if writeErr := sl.Write(ctx, evt.CRN, makePayload(evt.NudgeMasterID)); writeErr == nil {
+			processed.Add(1)
+		}
 		_ = reader.CommitMessages(ctx, msg)
 	}
 }
@@ -87,9 +116,9 @@ func TestKafkaConsumer_BatchFlush(t *testing.T) {
 	const totalMessages, partitions, consumerCount = 5_000, 8, 4
 	const topic, groupID, nudgeMasterID = "sluice-nudge-inventory", "sluice-integration", "nm_kafka_test"
 	ensureKafkaTopic(t, topic, partitions)
-	sl, _  := buildIntegrationSluice(t, "kafka_inventory")
-	coll   := mongoCollection(t, "kafka_inventory")
-	_, _    = coll.DeleteMany(context.Background(), bson.M{})
+	sl, _ := buildIntegrationSluice(t, "kafka_inventory")
+	coll := mongoCollection(t, "kafka_inventory")
+	_, _ = coll.DeleteMany(context.Background(), bson.M{})
 	writer := newKafkaWriter(t, topic)
 	publishKafkaMessages(t, writer, totalMessages, nudgeMasterID)
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
@@ -98,7 +127,8 @@ func TestKafkaConsumer_BatchFlush(t *testing.T) {
 	var processed atomic.Int64
 	for i := 0; i < consumerCount; i++ {
 		reader := newKafkaReader(t, topic, groupID)
-		wg.Add(1); go runKafkaConsumer(ctx, t, reader, sl, &processed, int64(totalMessages), &wg)
+		wg.Add(1)
+		go runKafkaConsumer(ctx, t, reader, sl, &processed, int64(totalMessages), &wg)
 	}
 	require.Eventually(t, func() bool { return processed.Load() >= int64(totalMessages) }, 75*time.Second, 500*time.Millisecond)
 	wg.Wait()
@@ -110,10 +140,10 @@ func TestKafkaConsumer_HighThroughput(t *testing.T) {
 	const totalMessages, partitions, consumerCount = 50_000, 16, 8
 	const topic, groupID, nudgeMasterID = "sluice-high-throughput", "sluice-perf", "nm_perf_test"
 	ensureKafkaTopic(t, topic, partitions)
-	sl, _  := buildIntegrationSluice(t, "kafka_perf")
-	coll   := mongoCollection(t, "kafka_perf")
-	_, _    = coll.DeleteMany(context.Background(), bson.M{})
-	start  := time.Now()
+	sl, _ := buildIntegrationSluice(t, "kafka_perf")
+	coll := mongoCollection(t, "kafka_perf")
+	_, _ = coll.DeleteMany(context.Background(), bson.M{})
+	start := time.Now()
 	writer := newKafkaWriter(t, topic)
 	publishKafkaMessages(t, writer, totalMessages, nudgeMasterID)
 	t.Logf("published %d messages in %s", totalMessages, time.Since(start).Round(time.Millisecond))
@@ -123,7 +153,8 @@ func TestKafkaConsumer_HighThroughput(t *testing.T) {
 	var processed atomic.Int64
 	for i := 0; i < consumerCount; i++ {
 		reader := newKafkaReader(t, topic, groupID)
-		wg.Add(1); go runKafkaConsumer(ctx, t, reader, sl, &processed, int64(totalMessages), &wg)
+		wg.Add(1)
+		go runKafkaConsumer(ctx, t, reader, sl, &processed, int64(totalMessages), &wg)
 	}
 	require.Eventually(t, func() bool { return processed.Load() >= int64(totalMessages) }, 100*time.Second, time.Second)
 	wg.Wait()
