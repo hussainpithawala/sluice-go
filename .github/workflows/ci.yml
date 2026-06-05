@@ -29,11 +29,15 @@ jobs:
         run: go mod tidy && git diff --exit-code go.mod go.sum
       - name: go vet
         run: go vet ./...
-      - name: golangci-lint
-        uses: golangci/golangci-lint-action@v6
-        with:
-          version: ${{ env.GOLANGCI_LINT_VERSION }}
-          args: --timeout=5m
+      - name: Install golangci-lint v2.4.0
+        run: |
+          # Install specific version directly
+          curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/HEAD/install.sh | sh -s -- -b $(go env GOPATH)/bin v2.4.0
+          golangci-lint --version
+
+      - name: Run golangci-lint
+        run: |
+          golangci-lint run --timeout=5m --config=.golangci.yml
 
   unit:
     name: Unit Tests
@@ -56,6 +60,7 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
+          --health-start-period 15s
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
