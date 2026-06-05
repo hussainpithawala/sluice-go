@@ -263,6 +263,11 @@ flowchart TD
         subgraph Journal ["Redis cluster — write journal"]
             PH["sl:ns:payload:crn — HSET opaque bytes — TTL 30s"]
             DS["sl:ns:dirty:0..15 — ZSET score=timestamp — 16 band partitions"]
+            DLQ["sl:ns:dlq:0..15 — dead-letter ZSET — TTL 7 days"]
+        end
+        subgraph Batcher ["Write batcher (opt-in)"]
+            BC["In-memory channel — absorbs bursts"]
+            BP["Pipeline flush — EVALSHA×N + ZCARD×bands"]
         end
         subgraph Engine ["Flush engine — 16 band goroutines"]
             TT["Time trigger — 250ms window"]
@@ -270,6 +275,7 @@ flowchart TD
             DR["DrainBand — ZRANGEBYSCORE + pipeline HMGET"]
             WC["WriteContract — caller-supplied domain logic"]
             BW["BulkWrite assembly — ordered=false"]
+            DLP["ProcessDLQ — Ignore / Upsert / ReInsert"]
         end
     end
 
@@ -283,22 +289,30 @@ flowchart TD
     KAF --> CW1
     KAF --> CW2
     KAF --> CWN
-    CW1 -->|"sluice.Write"| PH
-    CW2 -->|"sluice.Write"| PH
-    CWN -->|"sluice.Write"| PH
+    CW1 -->|"sluice.Write"| BC
+    CW2 -->|"sluice.Write"| BC
+    CWN -->|"sluice.Write"| BC
+    BC --> BP
+    BP -->|"pipeline EVALSHA"| PH
     PH --> DS
     TT --> DR
     VT --> DR
     DS --> DR
     DR --> WC
     WC --> BW
+    BW -->|"non-retryable errors"| DLQ
     BW --> DB
+    DLQ --> DLP
+    DLP --> DB
 
     style PH fill:#FAEEDA,stroke:#BA7517,color:#633806
     style DS fill:#FAEEDA,stroke:#BA7517,color:#633806
+    style DLQ fill:#FAECE7,stroke:#993C1D,color:#712B13
     style DB fill:#FAECE7,stroke:#993C1D,color:#712B13
     style TT fill:#E1F5EE,stroke:#0F6E56,color:#085041
     style VT fill:#E1F5EE,stroke:#0F6E56,color:#085041
+    style BC fill:#E8EAF6,stroke:#3949AB,color:#1A237E
+    style BP fill:#E8EAF6,stroke:#3949AB,color:#1A237E
 ```
 
 ---
@@ -363,6 +377,130 @@ s.Write(ctx, crn, payload)
 | `WithDegradedModeDirect(bool)` | `true` | Fall back to single-doc writes when Redis is unavailable |
 | `WithMetrics(m)` | noop | Plug in Prometheus, Datadog, or CloudWatch |
 | `OnFlush(cb)` | nil | Callback invoked after every BulkWrite attempt |
+| `WithBatchedWrites(size, window)` | disabled | Enable pipelined Redis writes for high-velocity streams |
+
+---
+
+## High-velocity write batching
+
+For streams exceeding ~10K writes/sec, the default mode makes one Redis round-trip per `Write()` call. Enable batched writes to pipeline all entries in a single network round-trip:
+
+```go
+s, _ := sluice.New("nudge_inventory").
+    WithRedis(sluice.RedisConfig{Addrs: []string{"redis:6379"}}).
+    WithSink(sk).
+    WithWriteContract(contract).
+    WithBatchedWrites(200, 5*time.Millisecond). // buffer up to 200 entries, flush every 5ms
+    Build(ctx)
+```
+
+**How it works:**
+
+- `Write()` sends the entry to an in-memory channel and returns immediately
+- A background goroutine collects entries and flushes them in a single Redis pipeline
+- The pipeline flush is triggered when the buffer reaches `size` entries **or** `window` elapses — whichever comes first
+- Each key's HSET + EXPIRE + ZADD remains **atomically isolated** via EVALSHA (Lua script pre-loaded at startup)
+- Volume signals (flush triggers) are derived from ZCARD results **batched into the same pipeline** — no extra round-trips
+- `DrainAndClose` stops the batcher first, ensuring all buffered entries land in Redis before the engine drain begins
+
+```mermaid
+sequenceDiagram
+    participant CW as Consumer Workers (N goroutines)
+    participant CH as In-memory channel
+    participant BG as Batcher goroutine
+    participant R  as Redis Pipeline
+
+    CW->>CH: Write(corrKey, payload) — returns immediately
+    CW->>CH: Write(corrKey, payload) — returns immediately
+    CW->>CH: Write ... (up to batchSize)
+    Note over BG: timer fires OR buffer full
+    BG->>R: pipeline [ EVALSHA×N + ZCARD×bands ]
+    R-->>BG: ACK (one round-trip)
+    BG->>BG: signal volume triggers for full bands
+```
+
+| Mode | Redis round-trips for N writes |
+|---|---|
+| Default (unbatched) | N |
+| `WithBatchedWrites` | ⌈N / batchSize⌉ |
+
+**When to use:** Kafka/SQS consumers ingesting >10K msg/sec where the per-write Redis latency becomes the throughput bottleneck. No behaviour change for existing callers — disabled by default.
+
+---
+
+## Dead-letter queue (DLQ)
+
+When a `BulkWrite` fails with a non-retryable error (e.g. duplicate-key violation on a unique index), the offending keys are moved to a per-band dead-letter sorted set rather than dropped or retried indefinitely.
+
+```
+sl:{namespace}:dlq:{band}          — dead-letter sorted set (score = failure timestamp)
+sl:{namespace}:payload:{corrKey}   — payload hash, TTL extended to 7 days for inspection
+```
+
+### Processing DLQ records
+
+Call `ProcessDLQ` from a cron job, admin endpoint, or CLI tool:
+
+```go
+result, err := s.ProcessDLQ(ctx, sluice.DLQIgnore)   // drain and discard
+result, err := s.ProcessDLQ(ctx, sluice.DLQUpsert)   // retry as upsert (force-overwrite)
+result, err := s.ProcessDLQ(ctx, sluice.DLQReInsert)  // mutate key and re-enqueue to normal queue
+```
+
+### Strategies
+
+| Strategy | Behaviour |
+|---|---|
+| `DLQIgnore` | Logs each record and removes it from the DLQ. Use when the failure is expected and the record can be discarded. |
+| `DLQUpsert` | Re-attempts the write with `Upsert: true`, overwriting any conflicting document. Use for duplicate-key collisions where last-write-wins is acceptable. |
+| `DLQReInsert` | Mutates the correlation key (appends a timestamp suffix by default) and re-enqueues to the normal dirty queue. Use to preserve both the original and the new document. |
+
+### Options
+
+```go
+result, err := s.ProcessDLQ(ctx, sluice.DLQReInsert,
+    sluice.WithDLQBatchSize(500),
+    sluice.WithKeyMutator(func(key string) string {
+        return key + ":retry:" + time.Now().Format("20060102T150405")
+    }),
+    sluice.WithDLQLogger(slog.Default()),
+)
+```
+
+| Option | Default | Description |
+|---|---|---|
+| `WithDLQBatchSize(n)` | `MaxBatchSize` | Per-band batch size when draining the DLQ |
+| `WithKeyMutator(fn)` | append timestamp suffix | Key transformation for `DLQReInsert` strategy |
+| `WithDLQLogger(l)` | `slog.Default()` | Structured logger for per-record DLQ activity |
+
+### Result
+
+```go
+type DLQResult struct {
+    Processed int // total records drained across all bands
+    Succeeded int // records handled without error
+    Failed    int // records that failed during processing
+}
+```
+
+```mermaid
+flowchart TD
+    DLQ[("sl:ns:dlq:band — dead-letter set")]
+    ST{"Strategy"}
+    IGN["Log + CommitDLQKeys\n(remove from DLQ)"]
+    UPS["BulkWrite with Upsert=true\nthen CommitDLQKeys"]
+    REI["Mutate key → Write to dirty queue\nthen CommitDLQKeys"]
+
+    DLQ --> ST
+    ST -->|DLQIgnore| IGN
+    ST -->|DLQUpsert| UPS
+    ST -->|DLQReInsert| REI
+
+    style DLQ fill:#FAECE7,stroke:#993C1D,color:#712B13
+    style IGN fill:#E1F5EE,stroke:#0F6E56,color:#085041
+    style UPS fill:#FAEEDA,stroke:#BA7517,color:#633806
+    style REI fill:#E8EAF6,stroke:#3949AB,color:#1A237E
+```
 
 ---
 
