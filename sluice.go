@@ -134,7 +134,7 @@ func (b *Builder) Build(ctx context.Context) (*Sluice, error) {
 	if b.cfg.BatchedWrites {
 		sh.EnableBatching(b.cfg.WriteBatchSize, b.cfg.WriteBatchWindow)
 		sh.SetVolumeSignaler(func(band int) { eng.SignalVolume(band) })
-		sh.StartBatcher()
+		sh.StartBatcher(ctx)
 	}
 
 	return &Sluice{cfg: b.cfg, shield: sh, engine: eng, sk: b.sk, contract: b.contract, metrics: metrics}, nil
