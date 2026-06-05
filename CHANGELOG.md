@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
+## [1.0.1] - 2026-06-05
+
+### Added
+- **Opt-in High-Velocity Redis Write Batching**: Introduced an in-memory buffered pipeline layer for `Sluice.Write()` to combine multiple writes into a single Redis round-trip. This drops network traversal overhead from $N$ to $1$, making the library highly optimized for streams exceeding 10K writes/sec. Enable it via the new `.WithBatchedWrites(size, window)` builder option.
+- **Pre-loaded Lua Script Optimization**: Shifted pipeline storage to use `EVALSHA` (`pipe.EvalSha`) by caching script hashes at client startup. This reduces massive TCP payload block overhead down to a 40-byte identifier per pipeline item.
+- **Pipelined Volume Check Piggybacking**: Unified the band queue depth evaluation (`ZCARD`) directly behind the same pipeline payload as the batch writes. The engine retains automated volume draining triggers without adding sequential network penalties.
+- **Lifecycle Integration**: Integrated background batch worker processes directly with the application's root context topology (`context.Context`). A SIGTERM or explicit service teardown safely intercepts the runtime loop to flush any remaining in-flight memory elements before close.
+- **Data-Race Safety**: Added explicit inner slice memory deep-copy allocations during worker handoffs to guarantee full pointer separation from incoming stream appends.
+- **Observability Enhancement**: Replaced silent error drops during pipeline executions with structural diagnostics leveraging structured `log/slog` reporting.
+---
 ## [1.0.0] - 2026-06-05
 
 ### Added
