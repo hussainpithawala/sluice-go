@@ -13,6 +13,7 @@ DC_FILE   := docker-compose.yml
 
 REDIS_TIMEOUT      := 30
 MONGO_TIMEOUT      := 45
+KAFKA_TIMEOUT      := 60
 
 GREEN  := \033[0;32m
 YELLOW := \033[0;33m
@@ -76,10 +77,10 @@ coverage: ## Generate HTML coverage report
 	$(GO) tool cover -html=/tmp/sluice-coverage.out -o /tmp/sluice-coverage.html
 	@$(GO) tool cover -func=/tmp/sluice-coverage.out | tail -1
 
-docker-up: ## Start Redis, MongoDB
+docker-up: ## Start Redis, MongoDB, Kafka, LocalStack
 	@printf "$(GREEN)▶ Starting integration stack...$(RESET)\n"
 	$(DC) -f $(DC_FILE) up -d --remove-orphans
-	@$(MAKE) _wait-redis && $(MAKE) _wait-mongo
+	@$(MAKE) _wait-redis && $(MAKE) _wait-mongo && $(MAKE) _wait-kafka
 	@printf "$(GREEN)▶ All services healthy.$(RESET)\n"
 
 docker-down: ## Stop all integration services
@@ -134,3 +135,9 @@ _wait-mongo:
 	for i in $$(seq 1 $(MONGO_TIMEOUT)); do \
 		docker exec sluice_mongo mongosh --eval "db.adminCommand('ping').ok" --quiet 2>/dev/null | grep -q 1 && printf " $(GREEN)ready$(RESET)\n" && exit 0; \
 		printf "."; sleep 1; done; printf "\n$(RED)MongoDB timeout$(RESET)\n"; exit 1
+
+_wait-kafka:
+	@printf "$(YELLOW)  Waiting for Kafka$(RESET)"; \
+	for i in $$(seq 1 $(KAFKA_TIMEOUT)); do \
+		docker exec sluice_kafka kafka-broker-api-versions --bootstrap-server localhost:9092 >/dev/null 2>&1 && printf " $(GREEN)ready$(RESET)\n" && exit 0; \
+		printf "."; sleep 1; done; printf "\n$(RED)Kafka timeout$(RESET)\n"; exit 1
