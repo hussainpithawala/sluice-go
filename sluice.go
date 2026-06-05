@@ -69,6 +69,17 @@ func (b *Builder) WithDegradedModeDirect(v bool) *Builder      { b.cfg.DegradedM
 func (b *Builder) WithMetrics(m MetricsRecorder) *Builder      { b.cfg.Metrics = m; return b }
 func (b *Builder) OnFlush(cb OnFlushCallback) *Builder         { b.callback = cb; return b }
 
+// WithBatchedWrites enables pipelined Redis writes. Instead of one Redis
+// round-trip per Write() call, writes are buffered and flushed in a single
+// pipeline when the buffer reaches size entries or window elapses.
+// Recommended for high-velocity streams (>10K writes/sec).
+func (b *Builder) WithBatchedWrites(size int, window time.Duration) *Builder {
+	b.cfg.BatchedWrites = true
+	b.cfg.WriteBatchSize = size
+	b.cfg.WriteBatchWindow = window
+	return b
+}
+
 // Build validates configuration, connects to Redis, pings the sink,
 // starts band goroutines, and returns a ready Sluice instance.
 func (b *Builder) Build(ctx context.Context) (*Sluice, error) {
@@ -118,6 +129,14 @@ func (b *Builder) Build(ctx context.Context) (*Sluice, error) {
 	}
 	eng := engine.New(b.cfg.toInternal(), sh, b.sk, wrappedContract, metrics, wrappedCb)
 	eng.Start()
+
+	// Enable batched writes if configured.
+	if b.cfg.BatchedWrites {
+		sh.EnableBatching(b.cfg.WriteBatchSize, b.cfg.WriteBatchWindow)
+		sh.SetVolumeSignaler(func(band int) { eng.SignalVolume(band) })
+		sh.StartBatcher()
+	}
+
 	return &Sluice{cfg: b.cfg, shield: sh, engine: eng, sk: b.sk, contract: b.contract, metrics: metrics}, nil
 }
 
@@ -152,6 +171,10 @@ func (b *Builder) validate() error {
 // Write buffers payload under correlationKey in Redis and returns immediately.
 // The document store is never touched during Write().
 // Safe for concurrent use from any number of goroutines.
+//
+// When batched writes are enabled, the payload is enqueued to an in-memory
+// buffer and pipelined to Redis by a background goroutine. Volume signaling
+// is handled by the batcher after each pipeline flush.
 func (s *Sluice) Write(ctx context.Context, correlationKey string, payload []byte) error {
 	if s.closed.Load() {
 		return ErrLibraryClosed
@@ -169,10 +192,15 @@ func (s *Sluice) Write(ctx context.Context, correlationKey string, payload []byt
 		return fmt.Errorf("%w: %v", ErrRedisUnavailable, err)
 	}
 	s.metrics.RecordWrite(s.cfg.Namespace)
-	band := s.shield.BandFor(correlationKey)
-	if depth, depthErr := s.shield.DirtyQueueDepth(ctx, band); depthErr == nil {
-		if int(depth) >= s.cfg.MaxBatchSize {
-			s.engine.SignalVolume(band)
+
+	// In batched mode the batcher goroutine handles volume signaling after
+	// each pipeline flush. Skip the per-write depth check.
+	if !s.cfg.BatchedWrites {
+		band := s.shield.BandFor(correlationKey)
+		if depth, depthErr := s.shield.DirtyQueueDepth(ctx, band); depthErr == nil {
+			if int(depth) >= s.cfg.MaxBatchSize {
+				s.engine.SignalVolume(band)
+			}
 		}
 	}
 	return nil
@@ -184,6 +212,8 @@ func (s *Sluice) DrainAndClose(ctx context.Context) error {
 	if !s.closed.CompareAndSwap(false, true) {
 		return nil
 	}
+	// Stop the batcher first so all in-flight writes land in Redis before drain.
+	s.shield.StopBatcher()
 	s.engine.DrainAndStop()
 	if err := s.shield.Close(); err != nil {
 		return fmt.Errorf("sluice: redis close: %w", err)

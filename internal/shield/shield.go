@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"hash/fnv"
+	"sync"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -29,6 +30,17 @@ type RedisConfig struct {
 	PoolSize     int
 }
 
+// VolumeSignaler is called by the batcher after flushing a batch to signal
+// the engine that a band may have reached its volume threshold.
+type VolumeSignaler func(band int)
+
+// writeEntry is a single buffered write waiting to be pipelined.
+type writeEntry struct {
+	correlationKey string
+	payload        []byte
+	ts             float64
+}
+
 // Shield manages all Redis interactions for the library.
 type Shield struct {
 	client      redis.UniversalClient
@@ -37,6 +49,14 @@ type Shield struct {
 	keyTTL      time.Duration
 	dlqTTL      time.Duration // how long dead-letter payload hashes are kept
 	writeScript *redis.Script
+
+	// Batching fields — all nil/zero when batching is disabled.
+	batchCh        chan writeEntry
+	batchSize      int
+	batchWin       time.Duration
+	stopBatch      chan struct{}
+	batchWg        sync.WaitGroup
+	volumeSignaler VolumeSignaler
 }
 
 // atomicWriteLua atomically stores payload + marks the key dirty in one round-trip.
@@ -83,7 +103,17 @@ func New(cfg RedisConfig, namespace string, bandCount int, keyTTL time.Duration)
 }
 
 // Write atomically stores payload and marks the correlation key dirty.
+// When batching is enabled, the write is buffered and pipelined to Redis
+// by the background batcher goroutine. Returns nil immediately in that case.
 func (s *Shield) Write(ctx context.Context, correlationKey string, payload []byte) error {
+	if s.batchCh != nil {
+		s.batchCh <- writeEntry{
+			correlationKey: correlationKey,
+			payload:        payload,
+			ts:             float64(time.Now().UnixMilli()),
+		}
+		return nil
+	}
 	return s.writeScript.Run(ctx, s.client,
 		[]string{s.payloadKey(correlationKey), s.dirtyKey(correlationKey)},
 		payload, float64(time.Now().UnixMilli()), correlationKey, int64(s.keyTTL.Seconds()),
@@ -348,6 +378,126 @@ func (s *Shield) BandFor(correlationKey string) int {
 }
 
 func (s *Shield) Close() error { return s.client.Close() }
+
+// ── Write batcher ─────────────────────────────────────────────────────────────
+
+// EnableBatching configures the shield for batched pipeline writes.
+// Must be called before StartBatcher. batchSize is the max entries per pipeline
+// flush; batchWindow is the max time before a partial buffer is flushed.
+func (s *Shield) EnableBatching(batchSize int, batchWindow time.Duration) {
+	if batchSize <= 0 {
+		batchSize = 200
+	}
+	if batchWindow <= 0 {
+		batchWindow = 5 * time.Millisecond
+	}
+	s.batchSize = batchSize
+	s.batchWin = batchWindow
+	// Channel capacity = 4x batch size to absorb bursts without blocking callers.
+	s.batchCh = make(chan writeEntry, batchSize*4)
+	s.stopBatch = make(chan struct{})
+}
+
+// SetVolumeSignaler sets the callback invoked after each batch flush to trigger
+// volume-based drain. Must be called before StartBatcher.
+func (s *Shield) SetVolumeSignaler(fn VolumeSignaler) {
+	s.volumeSignaler = fn
+}
+
+// StartBatcher launches the background goroutine that consumes from the write
+// channel and flushes entries to Redis via pipeline. No-op if batching is not enabled.
+func (s *Shield) StartBatcher() {
+	if s.batchCh == nil {
+		return
+	}
+	s.batchWg.Add(1)
+	go s.runBatcher()
+}
+
+// StopBatcher signals the batcher to drain remaining entries and stop.
+// Blocks until the goroutine has exited. No-op if batching is not enabled.
+func (s *Shield) StopBatcher() {
+	if s.stopBatch == nil {
+		return
+	}
+	close(s.stopBatch)
+	s.batchWg.Wait()
+}
+
+func (s *Shield) runBatcher() {
+	defer s.batchWg.Done()
+	buf := make([]writeEntry, 0, s.batchSize)
+	ticker := time.NewTicker(s.batchWin)
+	defer ticker.Stop()
+
+	flush := func() {
+		if len(buf) == 0 {
+			return
+		}
+		s.flushBatch(buf)
+		buf = buf[:0]
+	}
+
+	for {
+		select {
+		case entry := <-s.batchCh:
+			buf = append(buf, entry)
+			if len(buf) >= s.batchSize {
+				flush()
+				ticker.Reset(s.batchWin)
+			}
+		case <-ticker.C:
+			flush()
+		case <-s.stopBatch:
+			// Drain any remaining entries in the channel.
+			for {
+				select {
+				case entry := <-s.batchCh:
+					buf = append(buf, entry)
+					if len(buf) >= s.batchSize {
+						flush()
+					}
+				default:
+					flush()
+					return
+				}
+			}
+		}
+	}
+}
+
+func (s *Shield) flushBatch(entries []writeEntry) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	pipe := s.client.Pipeline()
+	ttlSec := int64(s.keyTTL.Seconds())
+
+	for _, e := range entries {
+		payKey := s.payloadKey(e.correlationKey)
+		dirKey := s.dirtyKey(e.correlationKey)
+		pipe.HSet(ctx, payKey, "p", e.payload, "ts", fmt.Sprintf("%.0f", e.ts))
+		pipe.Expire(ctx, payKey, time.Duration(ttlSec)*time.Second)
+		pipe.ZAdd(ctx, dirKey, redis.Z{Score: e.ts, Member: e.correlationKey})
+	}
+
+	_, _ = pipe.Exec(ctx)
+
+	// Signal volume triggers for bands that received writes.
+	if s.volumeSignaler != nil {
+		touched := make(map[int]bool, s.bandCount)
+		for _, e := range entries {
+			band := s.BandFor(e.correlationKey)
+			if touched[band] {
+				continue
+			}
+			touched[band] = true
+			if depth, err := s.DirtyQueueDepth(ctx, band); err == nil && int(depth) >= s.batchSize {
+				s.volumeSignaler(band)
+			}
+		}
+	}
+}
 
 // ── Key naming ────────────────────────────────────────────────────────────────
 
