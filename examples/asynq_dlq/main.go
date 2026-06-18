@@ -1,5 +1,5 @@
-// Package main demonstrates a production-grade nudge inventory consumer
-// that schedules and executes Dead-Letter Queue (DLQ) healing tasks via hibiken/asynq.
+// Package main demonstrates how to implement a distributed, periodic DLQ processor
+// using Hibiken's Asynq library to schedule task executions across Go microservices.
 package main
 
 import (
@@ -182,6 +182,15 @@ func (m *logMetrics) RecordDLQProcess(ns, strategy string, processed, succeeded,
 
 func main() {
 	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
+	// Delegating to run() avoids calling os.Exit after defer setup, satisfying the 'exitAfterDefer' linter rule.
+	if err := run(log); err != nil {
+		log.Error("application run failed", "err", err)
+		os.Exit(1)
+	}
+}
+
+func run(log *slog.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
@@ -191,8 +200,7 @@ func main() {
 	// 1. Initialize MongoDB sink instance
 	sk, err := docdb.New(ctx, docdb.Config{URI: mongoURI, Database: "adroll", Collection: "nudge_inventory", MaxPoolSize: 50, MinPoolSize: 5})
 	if err != nil {
-		log.Error("mongodb connection failure", "err", err)
-		os.Exit(1)
+		return fmt.Errorf("mongodb connection failure: %w", err)
 	}
 
 	// 2. Build Sluice write pipeline instance
@@ -207,8 +215,7 @@ func main() {
 		WithMetrics(&logMetrics{log: log}).
 		Build(ctx)
 	if err != nil {
-		log.Error("failed to build sluice", "err", err)
-		os.Exit(1)
+		return fmt.Errorf("failed to build Sluice: %w", err)
 	}
 
 	// Setup Asynq connection parameters
@@ -228,8 +235,7 @@ func main() {
 	cronExpr := "*/2 * * * *"
 	entryID, err := scheduler.Register(cronExpr, task)
 	if err != nil {
-		log.Error("failed to register cron task", "err", err)
-		os.Exit(1)
+		return fmt.Errorf("failed to register cron task: %w", err)
 	}
 	log.Info("registered periodic DLQ task in cron registry", "entry_id", entryID, "schedule", cronExpr)
 
@@ -239,7 +245,10 @@ func main() {
 		Logger:      &asynqLogger{inner: log},
 	})
 	asynqClient := asynq.NewClient(redisConnOpt)
-	defer asynqClient.Close()
+	defer func() {
+		// Checking the return value of Close() satisfies the 'errcheck' linter rule.
+		_ = asynqClient.Close()
+	}()
 
 	mux := asynq.NewServeMux()
 	mux.Handle(TaskSluiceProcessDLQ, NewDLQTaskHandler(sl, log))
@@ -298,7 +307,7 @@ func main() {
 	select {
 	case <-ctx.Done():
 		log.Info("aborted during wait")
-		return
+		return nil
 	case <-time.After(600 * time.Millisecond):
 	}
 
@@ -335,6 +344,7 @@ func main() {
 	_ = sl.DrainAndClose(shutCtx)
 
 	log.Info("validation script finished cleanly")
+	return nil
 }
 
 func getEnv(key, def string) string {

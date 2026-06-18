@@ -100,14 +100,22 @@ func (m *logMetrics) RecordDLQProcess(ns, strategy string, processed, succeeded,
 
 func main() {
 	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
+	// Delegating to run() avoids calling os.Exit after defer setup, satisfying the 'exitAfterDefer' linter rule.
+	if err := run(log); err != nil {
+		log.Error("application run failed", "err", err)
+		os.Exit(1)
+	}
+}
+
+func run(log *slog.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
 	mongoURI := getEnv("MONGO_URI", "mongodb://localhost:27017")
 	sk, err := docdb.New(ctx, docdb.Config{URI: mongoURI, Database: "adroll", Collection: "nudge_inventory", MaxPoolSize: 50, MinPoolSize: 5})
 	if err != nil {
-		log.Error("failed to connect to MongoDB", "err", err)
-		os.Exit(1)
+		return fmt.Errorf("failed to connect to MongoDB: %w", err)
 	}
 
 	redisAddr := getEnv("REDIS_ADDR", "localhost:6379")
@@ -122,8 +130,7 @@ func main() {
 		WithMetrics(&logMetrics{log: log}).
 		Build(ctx)
 	if err != nil {
-		log.Error("failed to build sluice", "err", err)
-		os.Exit(1)
+		return fmt.Errorf("failed to build sluice: %w", err)
 	}
 
 	// ── Controlled Functional Validation Flow ──
@@ -162,7 +169,7 @@ func main() {
 	select {
 	case <-ctx.Done():
 		log.Info("aborted during wait")
-		return
+		return nil
 	case <-time.After(600 * time.Millisecond):
 	}
 
@@ -204,6 +211,7 @@ func main() {
 		log.Error("drain error during shutdown", "err", err)
 	}
 	log.Info("validation script finished cleanly")
+	return nil
 }
 
 func getEnv(key, def string) string {

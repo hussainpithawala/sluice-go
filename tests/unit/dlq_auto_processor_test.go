@@ -28,10 +28,10 @@ func TestWithDLQAutoProcess_BuilderSetsConfig(t *testing.T) {
 		WithRedis(sluice.RedisConfig{Addrs: []string{testRedisAddr}}).
 		WithSink(sk).
 		WithWriteContract(testContract).
-		WithFlushWindow(50 * time.Millisecond).
+		WithFlushWindow(50*time.Millisecond).
 		WithMaxBatchSize(100).
 		WithBandCount(1).
-		WithKeyTTL(5 * time.Second).
+		WithKeyTTL(5*time.Second).
 		WithDLQAutoProcess(100*time.Millisecond, sluice.DLQUpsert).
 		Build(ctx)
 	require.NoError(t, err)
@@ -73,10 +73,10 @@ func TestWithDLQAutoProcess_ProcessesDLQRecords(t *testing.T) {
 		WithRedis(sluice.RedisConfig{Addrs: []string{testRedisAddr}}).
 		WithSink(sk).
 		WithWriteContract(selectiveContract).
-		WithFlushWindow(50 * time.Millisecond).
+		WithFlushWindow(50*time.Millisecond).
 		WithMaxBatchSize(100).
 		WithBandCount(1).
-		WithKeyTTL(10 * time.Second).
+		WithKeyTTL(10*time.Second).
 		WithDLQAutoProcess(150*time.Millisecond, sluice.DLQIgnore).
 		Build(ctx)
 	require.NoError(t, err)
@@ -125,10 +125,10 @@ func TestWithDLQAutoProcess_StopsOnDrainAndClose(t *testing.T) {
 		WithRedis(sluice.RedisConfig{Addrs: []string{testRedisAddr}}).
 		WithSink(sk).
 		WithWriteContract(testContract).
-		WithFlushWindow(50 * time.Millisecond).
+		WithFlushWindow(50*time.Millisecond).
 		WithMaxBatchSize(100).
 		WithBandCount(1).
-		WithKeyTTL(5 * time.Second).
+		WithKeyTTL(5*time.Second).
 		WithDLQAutoProcess(50*time.Millisecond, sluice.DLQUpsert).
 		Build(ctx)
 	require.NoError(t, err)
@@ -163,10 +163,10 @@ func TestWithDLQAutoProcess_DefaultInterval(t *testing.T) {
 		WithRedis(sluice.RedisConfig{Addrs: []string{testRedisAddr}}).
 		WithSink(sk).
 		WithWriteContract(testContract).
-		WithFlushWindow(50 * time.Millisecond).
+		WithFlushWindow(50*time.Millisecond).
 		WithMaxBatchSize(100).
 		WithBandCount(1).
-		WithKeyTTL(5 * time.Second).
+		WithKeyTTL(5*time.Second).
 		WithDLQAutoProcess(0, sluice.DLQUpsert). // zero interval
 		Build(ctx)
 	require.NoError(t, err)
@@ -194,10 +194,10 @@ func TestWithDLQAutoProcess_DoesNotProcessWhenDLQEmpty(t *testing.T) {
 		WithRedis(sluice.RedisConfig{Addrs: []string{testRedisAddr}}).
 		WithSink(sk).
 		WithWriteContract(testContract).
-		WithFlushWindow(50 * time.Millisecond).
+		WithFlushWindow(50*time.Millisecond).
 		WithMaxBatchSize(100).
 		WithBandCount(1).
-		WithKeyTTL(5 * time.Second).
+		WithKeyTTL(5*time.Second).
 		WithDLQAutoProcess(80*time.Millisecond, sluice.DLQUpsert).
 		Build(ctx)
 	require.NoError(t, err)
@@ -233,7 +233,7 @@ func TestWithDLQAutoProcess_MultipleStrategies(t *testing.T) {
 	for _, tc := range strategies {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
-			ns := fmt.Sprintf("dlq_strat_%s", tc.name)
+			ns := fmt.Sprintf("dlq_start_%s", tc.name)
 			sk, err := docdb.New(ctx, docdb.Config{
 				URI: testMongoURI, Database: testDatabase, Collection: ns,
 				MaxPoolSize: 10, MinPoolSize: 1,
@@ -244,10 +244,10 @@ func TestWithDLQAutoProcess_MultipleStrategies(t *testing.T) {
 				WithRedis(sluice.RedisConfig{Addrs: []string{testRedisAddr}}).
 				WithSink(sk).
 				WithWriteContract(testContract).
-				WithFlushWindow(50 * time.Millisecond).
+				WithFlushWindow(50*time.Millisecond).
 				WithMaxBatchSize(100).
 				WithBandCount(1).
-				WithKeyTTL(5 * time.Second).
+				WithKeyTTL(5*time.Second).
 				WithDLQAutoProcess(100*time.Millisecond, tc.strategy).
 				Build(ctx)
 			require.NoError(t, err)
