@@ -25,6 +25,12 @@ type Config struct {
 	BatchedWrites    bool
 	WriteBatchSize   int           // buffer capacity before pipeline flush; default 200
 	WriteBatchWindow time.Duration // max time before a partial buffer is flushed; default 5ms
+
+	// DLQAutoProcess enables a background ticker that periodically calls
+	// ProcessDLQ with the configured strategy. Opt-in; default false.
+	DLQAutoProcess         bool
+	DLQProcessInterval     time.Duration // ticker interval; default 30s
+	DLQProcessStrategy     DLQStrategy   // strategy for auto-processing; default DLQUpsert
 }
 
 // RedisConfig holds Redis connectivity parameters.

@@ -35,13 +35,15 @@ import (
 // Sluice is the main entry point. Safe for concurrent use.
 // Construct via New().Build() — never instantiate directly.
 type Sluice struct {
-	cfg      Config
-	shield   *shield.Shield
-	engine   *engine.Engine
-	sk       sink.FlushSink
-	contract WriteContract
-	metrics  MetricsRecorder
-	closed   atomic.Bool
+	cfg       Config
+	shield    *shield.Shield
+	engine    *engine.Engine
+	sk        sink.FlushSink
+	contract  WriteContract
+	metrics   MetricsRecorder
+	closed    atomic.Bool
+	dlqCancel context.CancelFunc
+	dlqDone   chan struct{}
 }
 
 // Builder assembles a Sluice instance with a fluent API.
@@ -77,6 +79,16 @@ func (b *Builder) WithBatchedWrites(size int, window time.Duration) *Builder {
 	b.cfg.BatchedWrites = true
 	b.cfg.WriteBatchSize = size
 	b.cfg.WriteBatchWindow = window
+	return b
+}
+
+// WithDLQAutoProcess enables a background goroutine that periodically processes
+// dead-letter records using the given strategy. The ticker fires every interval
+// and calls ProcessDLQ internally. Stopped automatically by DrainAndClose.
+func (b *Builder) WithDLQAutoProcess(interval time.Duration, strategy DLQStrategy) *Builder {
+	b.cfg.DLQAutoProcess = true
+	b.cfg.DLQProcessInterval = interval
+	b.cfg.DLQProcessStrategy = strategy
 	return b
 }
 
@@ -137,7 +149,13 @@ func (b *Builder) Build(ctx context.Context) (*Sluice, error) {
 		sh.StartBatcher(ctx)
 	}
 
-	return &Sluice{cfg: b.cfg, shield: sh, engine: eng, sk: b.sk, contract: b.contract, metrics: metrics}, nil
+	s := &Sluice{cfg: b.cfg, shield: sh, engine: eng, sk: b.sk, contract: b.contract, metrics: metrics}
+
+	if b.cfg.DLQAutoProcess {
+		s.startDLQProcessor()
+	}
+
+	return s, nil
 }
 
 func (b *Builder) validate() error {
@@ -211,6 +229,10 @@ func (s *Sluice) Write(ctx context.Context, correlationKey string, payload []byt
 func (s *Sluice) DrainAndClose(ctx context.Context) error {
 	if !s.closed.CompareAndSwap(false, true) {
 		return nil
+	}
+	if s.dlqCancel != nil {
+		s.dlqCancel()
+		<-s.dlqDone
 	}
 	// Stop the batcher first so all in-flight writes land in Redis before drain.
 	s.shield.StopBatcher()
@@ -297,6 +319,50 @@ func (s *Sluice) ProcessDLQ(ctx context.Context, strategy DLQStrategy, opts ...D
 		Succeeded: result.Succeeded,
 		Failed:    result.Failed,
 	}, nil
+}
+
+func (s *Sluice) startDLQProcessor() {
+	interval := s.cfg.DLQProcessInterval
+	if interval <= 0 {
+		interval = 30 * time.Second
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	s.dlqCancel = cancel
+	s.dlqDone = make(chan struct{})
+
+	go func() {
+		defer close(s.dlqDone)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if s.closed.Load() {
+					return
+				}
+				result, err := s.ProcessDLQ(ctx, s.cfg.DLQProcessStrategy)
+				if err != nil {
+					slog.Warn("sluice: DLQ auto-process failed",
+						"namespace", s.cfg.Namespace,
+						"error", err,
+					)
+					continue
+				}
+				if result.Processed > 0 {
+					slog.Info("sluice: DLQ auto-processed",
+						"namespace", s.cfg.Namespace,
+						"processed", result.Processed,
+						"succeeded", result.Succeeded,
+						"failed", result.Failed,
+					)
+				}
+			}
+		}
+	}()
 }
 
 func (s *Sluice) degradedWrite(ctx context.Context, correlationKey string, payload []byte) error {
