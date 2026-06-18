@@ -430,7 +430,7 @@ sequenceDiagram
 
 ## Dead-letter queue (DLQ)
 
-When a `BulkWrite` fails with a non-retryable error (e.g. duplicate-key violation on a unique index), the offending keys are moved to a per-band dead-letter sorted set rather than dropped or retried indefinitely.
+When a flush cycle encounters a non-retryable error (e.g. a `WriteContract` violation, a duplicate-key collision on a unique index, or a schema enforcement failure), the offending keys are moved to a per-band dead-letter sorted set rather than dropped silently or retried indefinitely.
 
 ```
 sl:{namespace}:dlq:{band}          — dead-letter sorted set (score = failure timestamp)
@@ -439,11 +439,11 @@ sl:{namespace}:payload:{corrKey}   — payload hash, TTL extended to 7 days for 
 
 ### Processing DLQ records
 
-Call `ProcessDLQ` from a cron job, admin endpoint, or CLI tool:
+Call `ProcessDLQ` with a recovery strategy. The call is context-aware — pass a timeout or a cancellable context derived from your application root:
 
 ```go
-result, err := s.ProcessDLQ(ctx, sluice.DLQIgnore)   // drain and discard
-result, err := s.ProcessDLQ(ctx, sluice.DLQUpsert)   // retry as upsert (force-overwrite)
+result, err := s.ProcessDLQ(ctx, sluice.DLQIgnore)    // drain and discard
+result, err := s.ProcessDLQ(ctx, sluice.DLQUpsert)    // retry as upsert (force-overwrite)
 result, err := s.ProcessDLQ(ctx, sluice.DLQReInsert)  // mutate key and re-enqueue to normal queue
 ```
 
@@ -451,9 +451,9 @@ result, err := s.ProcessDLQ(ctx, sluice.DLQReInsert)  // mutate key and re-enque
 
 | Strategy | Behaviour |
 |---|---|
-| `DLQIgnore` | Logs each record and removes it from the DLQ. Use when the failure is expected and the record can be discarded. |
-| `DLQUpsert` | Re-attempts the write with `Upsert: true`, overwriting any conflicting document. Use for duplicate-key collisions where last-write-wins is acceptable. |
-| `DLQReInsert` | Mutates the correlation key (appends a timestamp suffix by default) and re-enqueues to the normal dirty queue. Use to preserve both the original and the new document. |
+| `DLQIgnore` | Logs each record and removes it from the DLQ. Use when the failure is expected and the record can be safely discarded. |
+| `DLQUpsert` | Re-runs the `WriteContract` and re-attempts the write with `Upsert: true`, overwriting any conflicting document. The write contract executes again — use this together with a **payload healing** pattern (see below) to correct bad records before they land. |
+| `DLQReInsert` | Mutates the correlation key (appends a timestamp suffix by default) and re-enqueues to the normal dirty queue. Use to preserve both the original and the new document side-by-side. |
 
 ### Options
 
@@ -483,12 +483,50 @@ type DLQResult struct {
 }
 ```
 
+### Payload healing pattern
+
+Because `DLQUpsert` re-executes the `WriteContract`, you can correct quarantined payloads at recovery time without touching the DLQ data itself. Toggle a healing flag in your contract before calling `ProcessDLQ`:
+
+```go
+var healBadRecords atomic.Bool
+
+// WriteContract: applied on every write AND on DLQ re-processing
+contract := func(crn string, raw []byte) (*sluice.WriteModel, error) {
+    var p NudgePayload
+    json.Unmarshal(raw, &p)
+
+    if p.Channel == "REJECT" {
+        if healBadRecords.Load() {
+            p.Channel = "email" // correct the offending field at recovery time
+        } else {
+            return nil, fmt.Errorf("contract violation: invalid channel on %s", crn)
+        }
+    }
+
+    return &sluice.WriteModel{
+        Filter: bson.D{{Key: "_id", Value: crn}},
+        Update: bson.D{{Key: "$set", Value: p}},
+        Upsert: true,
+    }, nil
+}
+
+// ... normal ingest runs here; bad records land in DLQ ...
+
+// Recovery phase: flip the flag, then drain
+healBadRecords.Store(true)
+result, err := s.ProcessDLQ(ctx, sluice.DLQUpsert,
+    sluice.WithDLQBatchSize(100),
+    sluice.WithDLQLogger(slog.Default()),
+)
+// result.Succeeded == number of healed records written to DocumentDB
+```
+
 ```mermaid
 flowchart TD
     DLQ[("sl:ns:dlq:band — dead-letter set")]
     ST{"Strategy"}
     IGN["Log + CommitDLQKeys\n(remove from DLQ)"]
-    UPS["BulkWrite with Upsert=true\nthen CommitDLQKeys"]
+    UPS["Re-run WriteContract\nBulkWrite Upsert=true\nthen CommitDLQKeys"]
     REI["Mutate key → Write to dirty queue\nthen CommitDLQKeys"]
 
     DLQ --> ST
@@ -501,6 +539,14 @@ flowchart TD
     style UPS fill:#FAEEDA,stroke:#BA7517,color:#633806
     style REI fill:#E8EAF6,stroke:#3949AB,color:#1A237E
 ```
+
+### Scheduling DLQ processing
+
+Two reference examples show how to wire `ProcessDLQ` into a real service:
+
+**`examples/ticker_dlq/main.go`** — minimal inline scheduler using `time.Ticker`. No extra dependencies. Suitable for single-instance services or CLI tooling where the DLQ run should happen at a fixed cadence inside the same process.
+
+**`examples/asynq_dlq/main.go`** — production-grade distributed scheduler using [hibiken/asynq](https://github.com/hibiken/asynq). The DLQ task is registered as a cron entry (default: every 2 minutes) and executed by an Asynq worker. Supports multiple replicas, task deduplication via Redis, and structured logging through the `asynqLogger` bridge. The `healBadRecords` atomic flag is toggled before immediate task enqueue to demonstrate end-to-end payload correction without cron lag.
 
 ---
 
@@ -540,9 +586,20 @@ make check                  # pre-commit: tidy + vet + lint + unit tests
 ```bash
 make docker-up              # start all services
 
+# Minimal quickstart — basic write + flush
 MONGO_URI=mongodb://localhost:27017 \
 REDIS_ADDR=localhost:6379 \
 go run ./examples/nudge/main.go
+
+# DLQ validation — inline ticker scheduler (no extra deps)
+MONGO_URI=mongodb://localhost:27017 \
+REDIS_ADDR=localhost:6379 \
+go run ./examples/ticker_dlq/main.go
+
+# DLQ validation — distributed Asynq cron scheduler
+MONGO_URI=mongodb://localhost:27017 \
+REDIS_ADDR=localhost:6379 \
+go run ./examples/asynq_dlq/main.go
 
 make docker-down
 ```
