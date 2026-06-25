@@ -7,13 +7,57 @@ services:
       - "6379:6379"
     command: redis-server --maxmemory 512mb --maxmemory-policy allkeys-lru
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: [ "CMD", "redis-cli", "ping" ]
       interval: 5s
       timeout: 3s
       retries: 10
     networks:
       - sluice
-
+  redis-secured:
+    image: redis:7-alpine
+    container_name: sluice-redis-secured
+    restart: always
+    ports:
+      - '7379:7379'
+      - '7380:7380'
+    command: >
+      redis-server
+      --appendonly yes
+      --maxmemory 512mb
+      --maxmemory-policy allkeys-lru
+      --requirepass redispassword
+      --timeout 300
+      --tcp-keepalive 60
+      --tcp-backlog 511
+      --maxclients 10000
+      --save 900 1
+      --save 300 10
+      --save 60 10000
+      --port 7379
+      --tls-port 7380
+      --tls-cert-file /tls/redis.crt
+      --tls-key-file /tls/redis.key
+      --tls-ca-cert-file /tls/ca.crt
+      --tls-auth-clients no
+    volumes:
+      - redis_data:/data
+      - ./redis/tls:/tls:ro
+    environment:
+      - REDIS_PASSWORD=redispassword
+    healthcheck:
+      test: [ "CMD", "redis-cli", "--tls", "--insecure", "-a", "redispassword", "ping", '-p', '7380' ]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    networks:
+      - sluice
+    deploy:
+      resources:
+        limits:
+          memory: 768M
+        reservations:
+          memory: 512M
   mongodb:
     image: mongo:7.0
     container_name: sluice_mongo
@@ -22,7 +66,7 @@ services:
     environment:
       MONGO_INITDB_DATABASE: sluice_integration
     healthcheck:
-      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping').ok", "--quiet"]
+      test: [ "CMD", "mongosh", "--eval", "db.adminCommand('ping').ok", "--quiet" ]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -36,7 +80,7 @@ services:
       ZOOKEEPER_CLIENT_PORT: 2181
       ZOOKEEPER_TICK_TIME: 2000
     healthcheck:
-      test: ["CMD", "nc", "-z", "localhost", "2181"]
+      test: [ "CMD", "nc", "-z", "localhost", "2181" ]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -62,7 +106,7 @@ services:
       KAFKA_DEFAULT_REPLICATION_FACTOR: 1
       KAFKA_LOG_RETENTION_HOURS: 1
     healthcheck:
-      test: ["CMD-SHELL", "kafka-topics --bootstrap-server localhost:9092 --list && kafka-broker-api-versions --bootstrap-server localhost:9092 > /dev/null 2>&1"]
+      test: [ "CMD-SHELL", "kafka-topics --bootstrap-server localhost:9092 --list && kafka-broker-api-versions --bootstrap-server localhost:9092 > /dev/null 2>&1" ]
       interval: 10s
       timeout: 10s
       retries: 15
@@ -80,13 +124,16 @@ services:
       DEFAULT_REGION: us-east-1
       EAGER_SERVICE_LOADING: 1
     healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:4566/_localstack/health"]
+      test: [ "CMD", "curl", "-sf", "http://localhost:4566/_localstack/health" ]
       interval: 5s
       timeout: 5s
       retries: 20
     networks:
       - sluice
-
 networks:
   sluice:
     driver: bridge
+volumes:
+  redis_data:
+    driver: local
+    name: sluice-redis-data

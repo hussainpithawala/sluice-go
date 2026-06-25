@@ -4,6 +4,7 @@ package shield
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"hash/fnv"
 	"log/slog"
@@ -22,13 +23,52 @@ type FlushRecord struct {
 
 // RedisConfig holds Redis connectivity parameters.
 type RedisConfig struct {
-	Addrs        []string
-	Password     string
-	DB           int
-	DialTimeout  time.Duration
-	ReadTimeout  time.Duration
+	// Network type to use, either tcp or unix.
+	// Default is tcp.
+	Network string
+
+	// Redis server address in "host:port" format.
+	Addrs []string
+
+	// Username to authenticate the current connection when Redis ACLs are used.
+	// See: https://redis.io/commands/auth.
+	Username string
+
+	// Password to authenticate the current connection.
+	// See: https://redis.io/commands/auth.
+	Password string
+
+	// Redis DB to select after connecting to a server.
+	// See: https://redis.io/commands/select.
+	DB int
+
+	// Dial timeout for establishing new connections.
+	// Default is 5 seconds.
+	DialTimeout time.Duration
+
+	// Timeout for socket reads.
+	// If timeout is reached, read commands will fail with a timeout error
+	// instead of blocking.
+	//
+	// Use value -1 for no timeout and 0 for default.
+	// Default is 3 seconds.
+	ReadTimeout time.Duration
+
+	// Timeout for socket writes.
+	// If timeout is reached, write commands will fail with a timeout error
+	// instead of blocking.
+	//
+	// Use value -1 for no timeout and 0 for default.
+	// Default is ReadTimout.
 	WriteTimeout time.Duration
-	PoolSize     int
+
+	// Maximum number of socket connections.
+	// Default is 10 connections per every CPU as reported by runtime.NumCPU.
+	PoolSize int
+
+	// TLS Config used to connect to a server.
+	// TLS will be negotiated only if this field is set.
+	TLSConfig *tls.Config
 }
 
 // VolumeSignaler is called by the batcher after flushing a batch to signal
@@ -80,13 +120,13 @@ func New(cfg RedisConfig, namespace string, bandCount int, keyTTL time.Duration)
 		client = redis.NewClient(&redis.Options{
 			Addr: cfg.Addrs[0], Password: cfg.Password, DB: cfg.DB,
 			DialTimeout: cfg.DialTimeout, ReadTimeout: cfg.ReadTimeout,
-			WriteTimeout: cfg.WriteTimeout, PoolSize: cfg.PoolSize,
+			WriteTimeout: cfg.WriteTimeout, PoolSize: cfg.PoolSize, TLSConfig: cfg.TLSConfig,
 		})
 	} else {
 		client = redis.NewClusterClient(&redis.ClusterOptions{
 			Addrs: cfg.Addrs, Password: cfg.Password,
 			DialTimeout: cfg.DialTimeout, ReadTimeout: cfg.ReadTimeout,
-			WriteTimeout: cfg.WriteTimeout, PoolSize: cfg.PoolSize,
+			WriteTimeout: cfg.WriteTimeout, PoolSize: cfg.PoolSize, TLSConfig: cfg.TLSConfig,
 		})
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.DialTimeout)
