@@ -151,15 +151,23 @@ func main() {
 
 	// Create TLS config
 	tlsConfig := &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		RootCAs:      caCertPool,
-		MinVersion:   tls.VersionTLS12,
-		ServerName:   "localhost",
+		Certificates:       []tls.Certificate{cert},
+		RootCAs:            caCertPool,
+		MinVersion:         tls.VersionTLS12,
+		ServerName:         "localhost",
+		InsecureSkipVerify: true,
 	}
 
-	redisAddr := getEnv("REDIS_ADDR", "localhost:6379")
+	redisAddr := getEnv("REDIS_ADDR", "localhost:7380")
 	sl, err := sluice.New("nudge_inventory").
-		WithRedis(sluice.RedisConfig{Addrs: []string{redisAddr}, PoolSize: 30, DialTimeout: 5 * time.Second, ReadTimeout: 3 * time.Second, WriteTimeout: 3 * time.Second, TLSConfig: tlsConfig}).
+		WithRedis(sluice.RedisConfig{
+			Addrs:        []string{redisAddr},
+			PoolSize:     30,
+			DialTimeout:  5 * time.Second,
+			ReadTimeout:  3 * time.Second,
+			WriteTimeout: 3 * time.Second,
+			Password:     "redispassword",
+			TLSConfig:    tlsConfig}).
 		WithSink(sk).WithWriteContract(nudgeWriteContract).
 		WithFlushWindow(250 * time.Millisecond).WithMaxBatchSize(1000).
 		WithBandCount(16).WithKeyTTL(30 * time.Second).WithDegradedModeDirect(true).
@@ -176,6 +184,7 @@ func main() {
 		}).Build(ctx)
 	if err != nil {
 		log.Error("failed to build sluice", "err", err)
+		return
 	}
 	log.Info("sluice ready", "redis", redisAddr, "flush_window", "250ms", "bands", 16)
 

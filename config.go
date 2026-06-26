@@ -91,6 +91,7 @@ func (c RedisConfig) toInternal() shield.RedisConfig {
 		Addrs: c.Addrs, Password: c.Password, DB: c.DB,
 		DialTimeout: c.DialTimeout, ReadTimeout: c.ReadTimeout,
 		WriteTimeout: c.WriteTimeout, PoolSize: c.PoolSize,
+		TLSConfig: c.TLSConfig,
 	}
 }
 
