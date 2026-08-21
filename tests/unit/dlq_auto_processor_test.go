@@ -11,6 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	sluice "github.com/hussainpithawala/sluice-go"
+	"github.com/hussainpithawala/sluice-go/internal/shield"
 	"github.com/hussainpithawala/sluice-go/sink/docdb"
 )
 
@@ -91,7 +92,7 @@ func TestWithDLQAutoProcess_ProcessesDLQRecords(t *testing.T) {
 		require.NoError(t, sl.Write(ctx, fmt.Sprintf("bad_%d", i), mustPayload(t, "v")))
 	}
 
-	dlqKey := fmt.Sprintf("sl:%s:dlq:0", ns)
+	dlqKey := shield.DLQKey(ns, 0)
 
 	// Wait for bad keys to land in DLQ.
 	require.Eventually(t, func() bool {
@@ -211,7 +212,7 @@ func TestWithDLQAutoProcess_DoesNotProcessWhenDLQEmpty(t *testing.T) {
 	time.Sleep(250 * time.Millisecond)
 
 	// DLQ should remain empty.
-	dlqKey := fmt.Sprintf("sl:%s:dlq:0", ns)
+	dlqKey := shield.DLQKey(ns, 0)
 	n, err := rc.ZCard(ctx, dlqKey).Result()
 	require.NoError(t, err)
 	assert.Equal(t, int64(0), n)

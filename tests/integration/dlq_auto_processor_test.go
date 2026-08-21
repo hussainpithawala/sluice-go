@@ -5,6 +5,7 @@ package integration_test
 import (
 	"context"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -13,6 +14,7 @@ import (
 	"go.mongodb.org/mongo-driver/bson"
 
 	sluice "github.com/hussainpithawala/sluice-go"
+	"github.com/hussainpithawala/sluice-go/internal/shield"
 	"github.com/hussainpithawala/sluice-go/sink/docdb"
 )
 
@@ -44,10 +46,10 @@ func TestDLQAutoProcess_DrainsDLQAutomatically(t *testing.T) {
 		WithRedis(sluice.RedisConfig{Addrs: []string{redisAddr()}, PoolSize: 20}).
 		WithSink(sk).
 		WithWriteContract(selectiveContract).
-		WithFlushWindow(100 * time.Millisecond).
+		WithFlushWindow(100*time.Millisecond).
 		WithMaxBatchSize(500).
 		WithBandCount(1).
-		WithKeyTTL(30 * time.Second).
+		WithKeyTTL(30*time.Second).
 		WithDLQAutoProcess(200*time.Millisecond, sluice.DLQIgnore).
 		Build(ctx)
 	require.NoError(t, err)
@@ -65,7 +67,7 @@ func TestDLQAutoProcess_DrainsDLQAutomatically(t *testing.T) {
 		require.NoError(t, sl.Write(ctx, fmt.Sprintf("bad_%d", i), makePayload("nm_bad")))
 	}
 
-	dlqKey := fmt.Sprintf("sl:%s:dlq:0", ns)
+	dlqKey := shield.DLQKey(ns, 0)
 
 	// Wait for bad keys to land in DLQ.
 	require.Eventually(t, func() bool {
@@ -113,10 +115,10 @@ func TestDLQAutoProcess_UpsertStrategyWritesToMongo(t *testing.T) {
 		WithRedis(sluice.RedisConfig{Addrs: []string{redisAddr()}, PoolSize: 20}).
 		WithSink(sk).
 		WithWriteContract(transientContract).
-		WithFlushWindow(100 * time.Millisecond).
+		WithFlushWindow(100*time.Millisecond).
 		WithMaxBatchSize(500).
 		WithBandCount(1).
-		WithKeyTTL(30 * time.Second).
+		WithKeyTTL(30*time.Second).
 		WithDLQAutoProcess(200*time.Millisecond, sluice.DLQUpsert).
 		Build(ctx)
 	require.NoError(t, err)
@@ -131,7 +133,7 @@ func TestDLQAutoProcess_UpsertStrategyWritesToMongo(t *testing.T) {
 		require.NoError(t, sl.Write(ctx, fmt.Sprintf("bad_%d", i), makePayload("nm_upsert")))
 	}
 
-	dlqKey := fmt.Sprintf("sl:%s:dlq:0", ns)
+	dlqKey := shield.DLQKey(ns, 0)
 
 	// Wait for bad keys to land in DLQ.
 	require.Eventually(t, func() bool {
@@ -171,10 +173,10 @@ func TestDLQAutoProcess_StopsCleanlyOnShutdown(t *testing.T) {
 		WithRedis(sluice.RedisConfig{Addrs: []string{redisAddr()}, PoolSize: 20}).
 		WithSink(sk).
 		WithWriteContract(inventoryContract).
-		WithFlushWindow(100 * time.Millisecond).
+		WithFlushWindow(100*time.Millisecond).
 		WithMaxBatchSize(500).
 		WithBandCount(1).
-		WithKeyTTL(30 * time.Second).
+		WithKeyTTL(30*time.Second).
 		WithDLQAutoProcess(100*time.Millisecond, sluice.DLQUpsert).
 		Build(ctx)
 	require.NoError(t, err)
@@ -198,6 +200,35 @@ func TestDLQAutoProcess_StopsCleanlyOnShutdown(t *testing.T) {
 	}
 }
 
+// dlqProcessCounter counts records seen by the DLQ auto-processor. It exists
+// so tests can assert that processing HAPPENED rather than trying to catch the
+// DLQ sorted set at a nonzero depth — the auto-processor drains on its own
+// ticker, so any poll for a transient depth is inherently racy.
+type dlqProcessCounter struct {
+	mu        sync.Mutex
+	processed int
+}
+
+func (c *dlqProcessCounter) RecordDLQProcess(_, _ string, processed, _, _ int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.processed += processed
+}
+
+func (c *dlqProcessCounter) total() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.processed
+}
+
+func (c *dlqProcessCounter) RecordWrite(string)                                    {}
+func (c *dlqProcessCounter) RecordDegradedWrite(string, error)                     {}
+func (c *dlqProcessCounter) RecordRedisOp(string, string, time.Duration, error)    {}
+func (c *dlqProcessCounter) RecordFlush(string, string, int, time.Duration, error) {}
+func (c *dlqProcessCounter) RecordDirtyQueueDepth(string, string, int)             {}
+func (c *dlqProcessCounter) RecordContractError(string, string, error)             {}
+func (c *dlqProcessCounter) RecordDeadLetter(string, string, int)                  {}
+
 // TestDLQAutoProcess_ContinuesAfterProcessingError verifies that the
 // auto-processor doesn't stop if an individual DLQ processing cycle fails.
 func TestDLQAutoProcess_ContinuesAfterProcessingError(t *testing.T) {
@@ -220,14 +251,17 @@ func TestDLQAutoProcess_ContinuesAfterProcessingError(t *testing.T) {
 		return inventoryContract(key, payload)
 	}
 
+	counter := &dlqProcessCounter{}
+
 	sl, err := sluice.New(ns).
 		WithRedis(sluice.RedisConfig{Addrs: []string{redisAddr()}, PoolSize: 20}).
 		WithSink(sk).
 		WithWriteContract(permanentReject).
-		WithFlushWindow(100 * time.Millisecond).
+		WithMetrics(counter).
+		WithFlushWindow(100*time.Millisecond).
 		WithMaxBatchSize(500).
 		WithBandCount(1).
-		WithKeyTTL(30 * time.Second).
+		WithKeyTTL(30*time.Second).
 		WithDLQAutoProcess(150*time.Millisecond, sluice.DLQIgnore).
 		Build(ctx)
 	require.NoError(t, err)
@@ -242,15 +276,18 @@ func TestDLQAutoProcess_ContinuesAfterProcessingError(t *testing.T) {
 		require.NoError(t, sl.Write(ctx, fmt.Sprintf("bad_%d", i), makePayload("nm_fail")))
 	}
 
-	dlqKey := fmt.Sprintf("sl:%s:dlq:0", ns)
+	dlqKey := shield.DLQKey(ns, 0)
 
-	// Wait for them to reach DLQ.
+	// Assert on the processor's own accounting, not on DLQ depth. The
+	// auto-processor drains on a 150ms ticker while the flush window is 100ms,
+	// so a poll for "DLQ currently holds 2 records" can legitimately never
+	// observe a nonzero depth even when both records went through — the
+	// records land and are drained between two polls. Counting processed
+	// records is race-free: it only ever increases, so a poll cannot miss it.
 	require.Eventually(t, func() bool {
-		n, _ := rc.ZCard(ctx, dlqKey).Result()
-		return n >= 2
-	}, 5*time.Second, 50*time.Millisecond)
+		return counter.total() >= 2
+	}, 5*time.Second, 50*time.Millisecond, "first batch should be processed out of the DLQ")
 
-	// DLQIgnore strategy will discard them, so DLQ should eventually drain.
 	require.Eventually(t, func() bool {
 		n, _ := rc.ZCard(ctx, dlqKey).Result()
 		return n == 0
@@ -261,15 +298,14 @@ func TestDLQAutoProcess_ContinuesAfterProcessingError(t *testing.T) {
 		require.NoError(t, sl.Write(ctx, fmt.Sprintf("bad_%d", i), makePayload("nm_fail2")))
 	}
 
-	// Wait for new bad keys to land in DLQ first.
+	// The point of the test: a further cycle runs after the first one, so the
+	// cumulative count climbs past the first batch's 2.
 	require.Eventually(t, func() bool {
-		n, _ := rc.ZCard(ctx, dlqKey).Result()
-		return n >= 2
-	}, 5*time.Second, 50*time.Millisecond, "second batch should reach DLQ")
+		return counter.total() >= 4
+	}, 5*time.Second, 50*time.Millisecond, "second batch should also be processed — processor is still alive")
 
-	// These should also be drained by the still-running processor.
 	require.Eventually(t, func() bool {
 		n, _ := rc.ZCard(ctx, dlqKey).Result()
 		return n == 0
-	}, 5*time.Second, 100*time.Millisecond, "second batch should also be drained — processor is still alive")
+	}, 5*time.Second, 100*time.Millisecond, "second batch should also be drained")
 }

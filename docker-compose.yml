@@ -1,5 +1,8 @@
 services:
 
+  # --- existing single-node Redis services, kept as-is for any tests that
+  #     still target them. NOT used by verify_bands.sh or cluster-mode
+  #     testing below — point those at valkey-node-0..3 instead. ---
   redis:
     image: redis:7.2-alpine
     container_name: sluice_redis
@@ -13,6 +16,7 @@ services:
       retries: 10
     networks:
       - sluice
+
   redis-secured:
     image: redis:7-alpine
     container_name: sluice-redis-secured
@@ -58,6 +62,165 @@ services:
           memory: 768M
         reservations:
           memory: 512M
+
+  # --- 4-shard Valkey cluster for band/shard distribution testing ---
+  #
+  # NOTE ON SERVICE NAMES vs PORTS: the services are 0-indexed and the ports
+  # are not. valkey-node-0 listens on 7001, node-1 on 7002, node-2 on 7003,
+  # node-3 on 7004. Connect clients to localhost:7001-7004.
+  #
+  # WHY ALL FOUR NODES SHARE ONE NETWORK NAMESPACE
+  #
+  # A cluster client does not keep talking to the address you gave it. It
+  # bootstraps with CLUSTER SLOTS/SHARDS and then dials the addresses the
+  # cluster *advertises* for every subsequent command. Left to itself, each
+  # node advertises its docker bridge IP (172.18.x.x), which is unroutable
+  # from the macOS/Windows host — so go-redis hangs until DialTimeout and the
+  # library reports "shield: ping: context deadline exceeded" even though
+  # valkey-cli against localhost works fine.
+  #
+  # --cluster-announce-ip 127.0.0.1 fixes what the host sees, but on its own
+  # it breaks cluster gossip: inside node-0's own namespace, 127.0.0.1:7002 is
+  # nothing. Hence network_mode: "service:valkey-node-0" on nodes 1-3 — all
+  # four servers share a single namespace, so 127.0.0.1:7001-7004 resolves
+  # both from inside every container AND from the host, which is the only
+  # address set that satisfies gossip and external clients simultaneously.
+  #
+  # Consequences of the shared namespace, so they aren't surprising later:
+  #   - ALL FOUR host port mappings live on valkey-node-0. Nodes 1-3 must not
+  #     declare `ports:` or `networks:` — compose rejects either alongside
+  #     network_mode, and node-0's network membership already covers them.
+  #   - Nodes 1-3 have no DNS names of their own on the sluice network. Refer
+  #     to them as 127.0.0.1:<port>, never as sluice_valkey_cluster_1.
+  #   - Bus ports (17001-17004) intentionally stay unpublished; they are only
+  #     used node-to-node inside the shared namespace.
+  #
+  # This stack is plain (non-TLS). Hash-tag slot ownership — what
+  # scripts/verify_bands.sh checks — is unaffected by TLS. To exercise TLS
+  # end-to-end, mirror redis-secured's --tls-* flags onto each node below
+  # using the same ./redis/tls bundle; left undone rather than guessed.
+  valkey-node-0:
+    image: valkey/valkey:9-alpine
+    container_name: sluice_valkey_cluster_0
+    command: >
+      valkey-server
+      --port 7001
+      --cluster-enabled yes
+      --cluster-config-file nodes-0.conf
+      --cluster-node-timeout 5000
+      --cluster-announce-ip 127.0.0.1
+      --cluster-announce-port 7001
+      --cluster-announce-bus-port 17001
+      --appendonly no
+      --protected-mode no
+    # Every shard's host mapping is published here — see note above.
+    ports:
+      - "7001:7001"
+      - "7002:7002"
+      - "7003:7003"
+      - "7004:7004"
+    healthcheck:
+      test: ["CMD", "valkey-cli", "-p", "7001", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+    networks:
+      - sluice
+
+  valkey-node-1:
+    image: valkey/valkey:9-alpine
+    container_name: sluice_valkey_cluster_1
+    network_mode: "service:valkey-node-0"
+    command: >
+      valkey-server
+      --port 7002
+      --cluster-enabled yes
+      --cluster-config-file nodes-1.conf
+      --cluster-node-timeout 5000
+      --cluster-announce-ip 127.0.0.1
+      --cluster-announce-port 7002
+      --cluster-announce-bus-port 17002
+      --appendonly no
+      --protected-mode no
+    healthcheck:
+      test: ["CMD", "valkey-cli", "-p", "7002", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  valkey-node-2:
+    image: valkey/valkey:9-alpine
+    container_name: sluice_valkey_cluster_2
+    network_mode: "service:valkey-node-0"
+    command: >
+      valkey-server
+      --port 7003
+      --cluster-enabled yes
+      --cluster-config-file nodes-2.conf
+      --cluster-node-timeout 5000
+      --cluster-announce-ip 127.0.0.1
+      --cluster-announce-port 7003
+      --cluster-announce-bus-port 17003
+      --appendonly no
+      --protected-mode no
+    healthcheck:
+      test: ["CMD", "valkey-cli", "-p", "7003", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  valkey-node-3:
+    image: valkey/valkey:9-alpine
+    container_name: sluice_valkey_cluster_3
+    network_mode: "service:valkey-node-0"
+    command: >
+      valkey-server
+      --port 7004
+      --cluster-enabled yes
+      --cluster-config-file nodes-3.conf
+      --cluster-node-timeout 5000
+      --cluster-announce-ip 127.0.0.1
+      --cluster-announce-port 7004
+      --cluster-announce-bus-port 17004
+      --appendonly no
+      --protected-mode no
+    healthcheck:
+      test: ["CMD", "valkey-cli", "-p", "7004", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  # Forms the cluster once all four servers are healthy. Joins the same shared
+  # namespace so that the addresses it hands to --cluster create are the same
+  # 127.0.0.1:<port> pairs the nodes announce — creating with container
+  # hostnames instead would re-introduce unroutable advertised addresses.
+  # Idempotent enough in practice: re-running against an already-formed
+  # cluster exits non-zero with "not empty", which is harmless.
+  valkey-cluster-init:
+    image: valkey/valkey:9-alpine
+    container_name: sluice_valkey_cluster_init
+    network_mode: "service:valkey-node-0"
+    restart: "no"
+    depends_on:
+      valkey-node-0:
+        condition: service_healthy
+      valkey-node-1:
+        condition: service_healthy
+      valkey-node-2:
+        condition: service_healthy
+      valkey-node-3:
+        condition: service_healthy
+    entrypoint: >
+      sh -c "
+      echo yes | valkey-cli --cluster create
+      127.0.0.1:7001
+      127.0.0.1:7002
+      127.0.0.1:7003
+      127.0.0.1:7004
+      --cluster-replicas 0
+      "
+
+  # --- sink: DocumentDB stand-in ---
   mongodb:
     image: mongo:7.0
     container_name: sluice_mongo
@@ -73,6 +236,7 @@ services:
     networks:
       - sluice
 
+  # --- source: Kafka tap ---
   zookeeper:
     image: confluentinc/cp-zookeeper:7.6.0
     container_name: sluice_zookeeper
@@ -114,6 +278,7 @@ services:
     networks:
       - sluice
 
+  # --- dead-letter sink (SQS via LocalStack) ---
   localstack:
     image: localstack/localstack:3.3
     container_name: sluice_localstack
@@ -130,10 +295,32 @@ services:
       retries: 20
     networks:
       - sluice
+
 networks:
   sluice:
     driver: bridge
+
 volumes:
   redis_data:
     driver: local
     name: sluice-redis-data
+
+# ============================================================================
+# NOT WIRED UP — application-level config still needed, not guessed here:
+#
+#   - Kafka topic name(s) sluice actually taps from. AUTO_CREATE_TOPICS is on,
+#     so a topic will be created on first produce/consume, but if your app
+#     expects a specific partition count/config beyond the KAFKA_NUM_PARTITIONS
+#     default (16), you'll want an explicit `kafka-topics --create` step.
+#   - Mongo collection/index setup matching whatever BulkWrite expects
+#     downstream of DrainBand — MONGO_INITDB_DATABASE creates the DB but not
+#     your actual collections/indexes/shard-key equivalent.
+#   - The SQS queue MoveToDeadLetter writes to isn't created by LocalStack
+#     automatically — needs an `awslocal sqs create-queue` step (via CLI or
+#     an init container) with the queue name your Go config expects.
+#
+# Didn't fabricate these since getting a topic/collection/queue name wrong
+# would make the test harness silently not exercise the real path. Fill
+# these in against your actual Shield/BulkWrite config before treating this
+# as a working end-to-end test.
+# ============================================================================

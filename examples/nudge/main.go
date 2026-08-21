@@ -1,9 +1,26 @@
 // Package main demonstrates a production-grade nudge inventory consumer
 // using sluice as the write buffer between Kafka/SQS and DocumentDB.
 //
-// Run:
+// Run against a single-node / CMD Redis (unchanged behavior):
 //
-//	MONGO_URI=mongodb://localhost:27017 REDIS_ADDR=localhost:6379 \
+//	MONGO_URI=mongodb://localhost:27017 REDIS_ADDRS=localhost:6379 \
+//	go run ./examples/nudge/main.go
+//
+// Run against the local 4-shard Valkey cluster (CME) from docker-compose.yml.
+// Note the ports are 7001-7004 (valkey-node-0 listens on 7001, node-1 on 7002,
+// and so on — the service names are 0-indexed, the ports are not):
+//
+//	MONGO_URI=mongodb://localhost:27017 \
+//	REDIS_ADDRS=localhost:7001,localhost:7002,localhost:7003,localhost:7004 \
+//	REDIS_CLUSTER_MODE=true \
+//	go run ./examples/nudge/main.go
+//
+// Run against a real AWS ElastiCache CME cluster (single config endpoint —
+// still requires REDIS_CLUSTER_MODE=true explicitly; address count alone
+// no longer determines client type, see shield.RedisConfig.ClusterMode):
+//
+//	REDIS_ADDRS=my-cluster.xxxxx.clustercfg.use1.cache.amazonaws.com:6379 \
+//	REDIS_CLUSTER_MODE=true \
 //	go run ./examples/nudge/main.go
 package main
 
@@ -14,6 +31,8 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -117,8 +136,26 @@ func simulatedConsumer(ctx context.Context, workerID int, sl *sluice.Sluice, log
 	}
 }
 
+const bandCount = 16
+
 func main() {
 	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	if err := run(log); err != nil {
+		log.Error("fatal", "err", err)
+		os.Exit(1)
+	}
+}
+
+// run holds the real body of the example. main() is kept to just the
+// os.Exit(1) so that every defer registered below still runs on the way out —
+// calling os.Exit inline after a defer would skip it (and trips the
+// exitAfterDefer linter).
+//
+// The error returns here are load-bearing, not decoration: an earlier version
+// logged setup failures and fell through, which left sl == nil and produced a
+// nil-pointer panic inside Sluice.Write on the first event from every worker
+// goroutine. Any setup step that fails must abort.
+func run(log *slog.Logger) (err error) {
 	log.Info("sluice nudge example", "version", version, "commit", commit, "built", buildDate)
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -126,16 +163,42 @@ func main() {
 	mongoURI := getEnv("MONGO_URI", "mongodb://localhost:27017")
 	sk, err := docdb.New(ctx, docdb.Config{URI: mongoURI, Database: "adroll", Collection: "nudge_inventory", MaxPoolSize: 100, MinPoolSize: 10})
 	if err != nil {
-		log.Error("failed to connect to MongoDB", "err", err)
+		return fmt.Errorf("connect to MongoDB at %s: %w", mongoURI, err)
 	}
 	log.Info("connected to MongoDB", "uri", mongoURI)
 
-	redisAddr := getEnv("REDIS_ADDR", "localhost:6379")
+	// REDIS_ADDRS: comma-separated. One address = one node (CMD) OR one
+	// cluster config endpoint (CME) — address count alone can't tell these
+	// apart, which is exactly the bug this rewrite fixes. REDIS_CLUSTER_MODE
+	// is the actual switch; set it explicitly rather than relying on
+	// how many addresses happen to be listed.
+	redisAddrsRaw := getEnv("REDIS_ADDRS", "localhost:7001,localhost:7002,localhost:7003,localhost:7004")
+	redisAddrs := strings.Split(redisAddrsRaw, ",")
+	for i := range redisAddrs {
+		redisAddrs[i] = strings.TrimSpace(redisAddrs[i])
+	}
+	// Deliberately fatal rather than defaulting on a parse error. The whole
+	// point of ClusterMode being explicit is that guessing it wrong fails in a
+	// confusing way later (MOVED redirects a standalone client won't follow),
+	// so a typo here must not silently resolve to a guess.
+	clusterModeRaw := getEnv("REDIS_CLUSTER_MODE", "true")
+	clusterMode, err := strconv.ParseBool(clusterModeRaw)
+	if err != nil {
+		return fmt.Errorf("invalid REDIS_CLUSTER_MODE %q, expected true/false: %w", clusterModeRaw, err)
+	}
+
 	sl, err := sluice.New("nudge_inventory").
-		WithRedis(sluice.RedisConfig{Addrs: []string{redisAddr}, PoolSize: 30, DialTimeout: 5 * time.Second, ReadTimeout: 3 * time.Second, WriteTimeout: 3 * time.Second}).
+		WithRedis(sluice.RedisConfig{
+			Addrs:        redisAddrs,
+			ClusterMode:  clusterMode,
+			PoolSize:     30,
+			DialTimeout:  5 * time.Second,
+			ReadTimeout:  3 * time.Second,
+			WriteTimeout: 3 * time.Second,
+		}).
 		WithSink(sk).WithWriteContract(nudgeWriteContract).
 		WithFlushWindow(250 * time.Millisecond).WithMaxBatchSize(1000).
-		WithBandCount(16).WithKeyTTL(30 * time.Second).WithDegradedModeDirect(true).
+		WithBandCount(bandCount).WithKeyTTL(30 * time.Second).WithDegradedModeDirect(true).
 		WithMetrics(&logMetrics{log: log}).
 		OnFlush(func(crns []string, result *sluice.BulkWriteResult, err error) {
 			if err != nil {
@@ -148,16 +211,30 @@ func main() {
 			log.Debug("flush complete", "crns", len(crns), "upserted", result.UpsertedCount, "modified", result.ModifiedCount)
 		}).Build(ctx)
 	if err != nil {
-		log.Error("failed to build sluice", "err", err)
+		// Build did not take ownership of the sink, so close it here. On the
+		// success path DrainAndClose closes the sink for us — doing both would
+		// double-close.
+		closeCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if cerr := sk.Close(closeCtx); cerr != nil {
+			log.Warn("closing mongo sink after failed build", "err", cerr)
+		}
+		return fmt.Errorf("build sluice (redis_addrs=%v cluster_mode=%t): %w", redisAddrs, clusterMode, err)
 	}
-	log.Info("sluice ready", "redis", redisAddr, "flush_window", "250ms", "bands", 16)
+	log.Info("sluice ready", "redis_addrs", redisAddrs, "cluster_mode", clusterMode, "flush_window", "250ms", "bands", bandCount)
 
 	defer func() {
 		log.Info("draining sluice...")
 		shutCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		if err := sl.DrainAndClose(shutCtx); err != nil {
-			log.Error("drain error", "err", err)
+		if derr := sl.DrainAndClose(shutCtx); derr != nil {
+			log.Error("drain error", "err", derr)
+			// Surface a drain failure as the run's exit status, but never
+			// clobber an earlier, more proximate error.
+			if err == nil {
+				err = fmt.Errorf("drain and close: %w", derr)
+			}
+			return
 		}
 		log.Info("sluice drained and closed")
 	}()
@@ -193,6 +270,7 @@ func main() {
 	total := written.Load()
 	elapsed := time.Since(start)
 	log.Info("final summary", "total_events", total, "elapsed", elapsed.Round(time.Second), "avg_rate", fmt.Sprintf("%.0f events/sec", float64(total)/elapsed.Seconds()))
+	return nil
 }
 
 func getEnv(key, def string) string {
