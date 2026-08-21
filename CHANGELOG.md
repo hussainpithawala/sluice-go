@@ -5,6 +5,27 @@ All notable changes to **sluice** will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+
+## [1.0.2] - 2026-08-21
+### Added
+- **Explicit Cluster Mode Support**: Introduced `ClusterMode` boolean field to `RedisConfig` across root and `shield` packages to explicitly select between standalone (`redis.Client`) and cluster-aware (`redis.ClusterClient`) go-redis clients.
+- **Valkey Cluster Testbed**: Added a 4-shard Valkey 9 cluster environment (`valkey-node-0..3` on ports 7001–7004) and initialization service (`valkey-cluster-init`) to `docker-compose.yml` for testing band/shard distribution.
+- **Verification Script**: Added `scripts/verify_bands.sh` to check and validate whether sluice band hash-tags map to distinct master shards in Redis/Valkey clusters.
+- **Exported Key Utilities**: Exported `BandForKey`, `PayloadKey`, `DirtyKey`, and `DLQKey` in `internal/shield` as single sources of truth for on-wire key formatting and testing assertions.
+
+### Changed
+- **Redis Key Naming Strategy**: Updated payload key formatting to include `{band}` hash tags (`sl:<namespace>:payload:{<band>}:<correlationKey>`). This ensures payload hashes and dirty/DLQ sorted sets co-locate on the same Redis cluster slot, preventing cross-slot errors in cluster mode.
+- **Config Address & Credentials Plumbing**:
+  - Updated `RedisConfig` address field (`Addrs`) to accept multiple endpoints without forcing cluster mode inference.
+  - Fixed `toInternal()` in `config.go` to properly forward `Network`, `ClusterMode`, and `Username` parameters to `shield.RedisConfig`.
+- **Example Runner Refactoring**: Updated `examples/nudge/main.go` to support cluster configuration via environment variables (`REDIS_ADDRS`, `REDIS_CLUSTER_MODE`), improved shutdown lifecycle error handling, and robust argument validation.
+
+### Fixed
+- **ACL Authentication Silent Fallback**: Fixed an issue in `shield.New()` where `Username` was previously dropped during config conversion, causing connections to fallback silently to the `default` user.
+- **Cross-Slot Execution in Lua Scripts**: Resolved potential `CROSSSLOT` script execution errors by strictly enforcing band hash tag co-location on all related keys in `atomicWriteLua`.
+- **Flaky Integration Tests**: Fixed race conditions in DLQ auto-processor integration tests (`tests/integration/dlq_auto_processor_test.go`) by adding `dlqProcessCounter` metrics tracking instead of polling transient Redis sorted-set depths.
+- **Namespace Validation**: Added upfront validation in `shield.New()` to reject namespaces containing `{` or `}` characters that would conflict with Redis Cluster hash tag parsing.
+
 ---
 ## [1.0.1] - 2026-06-05
 
