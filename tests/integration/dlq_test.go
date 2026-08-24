@@ -14,6 +14,7 @@ import (
 	"go.mongodb.org/mongo-driver/bson"
 
 	sluice "github.com/hussainpithawala/sluice-go"
+	"github.com/hussainpithawala/sluice-go/internal/shield"
 	"github.com/hussainpithawala/sluice-go/sink/docdb"
 )
 
@@ -99,7 +100,7 @@ func seedDLQ(t *testing.T, sl *sluice.Sluice, rc *redis.Client, ns string, badCo
 	}
 
 	// Wait for bad keys to land in the DLQ.
-	dlqKey := fmt.Sprintf("sl:%s:dlq:0", ns)
+	dlqKey := shield.DLQKey(ns, 0)
 	require.Eventually(t, func() bool {
 		n, _ := rc.ZCard(ctx, dlqKey).Result()
 		return n >= int64(badCount)
@@ -129,14 +130,14 @@ func TestProcessDLQ_Ignore(t *testing.T) {
 	assert.Equal(t, 0, result.Failed)
 
 	// DLQ should be empty now.
-	dlqKey := fmt.Sprintf("sl:%s:dlq:0", ns)
+	dlqKey := shield.DLQKey(ns, 0)
 	n, err := rc.ZCard(ctx, dlqKey).Result()
 	require.NoError(t, err)
 	assert.Equal(t, int64(0), n, "DLQ should be empty after Ignore")
 
 	// Payload hashes for bad keys should be deleted.
 	for _, k := range badKeys {
-		exists, _ := rc.Exists(ctx, fmt.Sprintf("sl:%s:payload:%s", ns, k)).Result()
+		exists, _ := rc.Exists(ctx, shield.PayloadKey(ns, 0, k)).Result()
 		assert.Equal(t, int64(0), exists, "payload hash for %s should be deleted", k)
 	}
 }
@@ -220,7 +221,7 @@ func TestProcessDLQ_Upsert(t *testing.T) {
 	assert.Equal(t, 0, result.Failed)
 
 	// DLQ should be empty.
-	dlqKey := fmt.Sprintf("sl:%s:dlq:0", ns)
+	dlqKey := shield.DLQKey(ns, 0)
 	n, err := rc.ZCard(ctx, dlqKey).Result()
 	require.NoError(t, err)
 	assert.Equal(t, int64(0), n, "DLQ should be empty after Upsert")
@@ -313,7 +314,7 @@ func TestProcessDLQ_ReInsert(t *testing.T) {
 	assert.Equal(t, 0, result.Failed)
 
 	// DLQ should be empty.
-	dlqKey := fmt.Sprintf("sl:%s:dlq:0", ns)
+	dlqKey := shield.DLQKey(ns, 0)
 	n, err := rc.ZCard(ctx, dlqKey).Result()
 	require.NoError(t, err)
 	assert.Equal(t, int64(0), n, "DLQ should be empty after ReInsert")

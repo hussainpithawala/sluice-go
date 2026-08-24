@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -25,10 +26,33 @@ type FlushRecord struct {
 type RedisConfig struct {
 	// Network type to use, either tcp or unix.
 	// Default is tcp.
+	//
+	// Ignored when ClusterMode is true: go-redis ClusterOptions has no
+	// Network field, since a unix socket cannot reach a multi-node cluster.
 	Network string
 
-	// Redis server address in "host:port" format.
+	// Redis server address(es) in "host:port" format.
+	//
+	// For cluster-mode-enabled deployments (including AWS ElastiCache CME),
+	// this is typically a single cluster CONFIGURATION ENDPOINT — NOT
+	// multiple node addresses. Address count alone cannot distinguish
+	// "one node, standalone" from "one config endpoint, cluster" — see
+	// ClusterMode below, which is the actual switch.
 	Addrs []string
+
+	// ClusterMode explicitly selects a cluster-aware client (go-redis
+	// ClusterClient) when true, or a standalone client when false.
+	//
+	// This MUST be set explicitly — it is intentionally not inferred from
+	// len(Addrs), because a cluster-mode-enabled deployment (e.g. AWS
+	// ElastiCache CME) is commonly configured with a SINGLE address (the
+	// cluster configuration endpoint), which previously caused this package
+	// to silently build a standalone client against what is actually a
+	// multi-shard cluster. Get this wrong and every command that lands on
+	// a slot outside the one node you happen to hit will fail once the
+	// cluster redirects it (MOVED) — a standalone client doesn't follow
+	// those redirects.
+	ClusterMode bool
 
 	// Username to authenticate the current connection when Redis ACLs are used.
 	// See: https://redis.io/commands/auth.
@@ -40,6 +64,8 @@ type RedisConfig struct {
 
 	// Redis DB to select after connecting to a server.
 	// See: https://redis.io/commands/select.
+	// NOTE: cluster-mode-enabled clusters only support DB 0. Setting this
+	// nonzero with ClusterMode=true will fail at connection/command time.
 	DB int
 
 	// Dial timeout for establishing new connections.
@@ -105,6 +131,12 @@ type Shield struct {
 // atomicWriteLua atomically stores payload + marks the key dirty in one round-trip.
 // KEYS[1]=payload hash  KEYS[2]=dirty sorted set
 // ARGV[1]=payload  ARGV[2]=score(ms)  ARGV[3]=corrKey  ARGV[4]=ttl(s)
+//
+// CLUSTER MODE: KEYS[1] and KEYS[2] MUST hash to the same slot, or this
+// script fails with CROSSSLOT the moment it runs against a cluster-enabled
+// node. payloadKey() and dirtyKeyForBand() below both embed a {band} hash
+// tag for exactly this reason — do not change either key format without
+// preserving a shared tag between them.
 const atomicWriteLua = `
 redis.call('HSET', KEYS[1], 'p', ARGV[1], 'ts', ARGV[2])
 redis.call('EXPIRE', KEYS[1], tonumber(ARGV[4]))
@@ -114,17 +146,43 @@ return 1
 
 // New initialises the Redis client and validates connectivity.
 func New(cfg RedisConfig, namespace string, bandCount int, keyTTL time.Duration) (*Shield, error) {
+	if strings.ContainsAny(namespace, "{}") {
+		// A '{' anywhere in namespace would hijack Redis Cluster's hash-tag
+		// parsing (only the substring between the FIRST '{' and the next '}'
+		// in a key is hashed), silently breaking the {band} co-location
+		// atomicWriteLua depends on. Reject up front rather than let this
+		// surface as an intermittent CROSSSLOT error later.
+		return nil, fmt.Errorf("sluice/shield: namespace %q must not contain '{' or '}' — "+
+			"this would interfere with cluster hash-tag routing", namespace)
+	}
+
 	applyDefaults(&cfg)
+	if len(cfg.Addrs) == 0 {
+		return nil, fmt.Errorf("sluice/shield: at least one address is required")
+	}
+
 	var client redis.UniversalClient
-	if len(cfg.Addrs) == 1 {
-		client = redis.NewClient(&redis.Options{
-			Addr: cfg.Addrs[0], Password: cfg.Password, DB: cfg.DB,
+	if cfg.ClusterMode {
+		if cfg.DB != 0 {
+			// Cluster-mode-enabled deployments only expose DB 0. Silently
+			// ignoring a nonzero DB here would look like it took effect.
+			return nil, fmt.Errorf("sluice/shield: DB must be 0 in cluster mode, got %d", cfg.DB)
+		}
+		// Username must be passed explicitly: go-redis only sends the two-arg
+		// AUTH <user> <pass> form when Username is set. Omitting it sends
+		// AUTH <pass>, which authenticates as the "default" ACL user and
+		// silently ignores the configured user — this works by accident on
+		// deployments that don't enforce per-user ACLs, and fails confusingly
+		// on ElastiCache RBAC, which does.
+		client = redis.NewClusterClient(&redis.ClusterOptions{
+			Addrs: cfg.Addrs, Username: cfg.Username, Password: cfg.Password,
 			DialTimeout: cfg.DialTimeout, ReadTimeout: cfg.ReadTimeout,
 			WriteTimeout: cfg.WriteTimeout, PoolSize: cfg.PoolSize, TLSConfig: cfg.TLSConfig,
 		})
 	} else {
-		client = redis.NewClusterClient(&redis.ClusterOptions{
-			Addrs: cfg.Addrs, Password: cfg.Password,
+		client = redis.NewClient(&redis.Options{
+			Network: cfg.Network, Addr: cfg.Addrs[0],
+			Username: cfg.Username, Password: cfg.Password, DB: cfg.DB,
 			DialTimeout: cfg.DialTimeout, ReadTimeout: cfg.ReadTimeout,
 			WriteTimeout: cfg.WriteTimeout, PoolSize: cfg.PoolSize, TLSConfig: cfg.TLSConfig,
 		})
@@ -137,7 +195,13 @@ func New(cfg RedisConfig, namespace string, bandCount int, keyTTL time.Duration)
 	}
 	// Pre-load the write script so the batcher can use EVALSHA in pipelines,
 	// avoiding sending the full script text on every pipelined batch flush.
-	// For cluster clients, go-redis broadcasts SCRIPT LOAD to all nodes.
+	// For cluster clients, go-redis broadcasts SCRIPT LOAD to all nodes —
+	// this is what makes EVALSHA safe to call against any shard immediately
+	// after New() returns, without a NOSCRIPT race on shards added later
+	// (e.g. mid-resharding). If you reshard this cluster in the future,
+	// re-verify that newly added shards receive the script — go-redis
+	// broadcasts to the topology known at ScriptLoad time, not to nodes
+	// that join afterward.
 	sha, err := client.ScriptLoad(ctx, atomicWriteLua).Result()
 	if err != nil {
 		_ = client.Close()
@@ -206,7 +270,13 @@ func (s *Shield) DrainBand(ctx context.Context, band, maxBatch int) ([]FlushReco
 		hashKeys[i] = s.payloadKey(corrKeys[i])
 	}
 
-	// Pipeline all HMGET calls — one network round-trip for the entire batch.
+	// Pipeline all HMGET calls. NOTE: this is "one network round-trip" only
+	// under cluster-mode-disabled. Under CME, if hashKeys for this band span
+	// multiple shards — they won't, since payloadKey now shares this band's
+	// hash tag, so every key here is guaranteed on ONE shard — a cluster-aware
+	// client would otherwise silently split this into N per-shard pipelines.
+	// Keeping payloadKey band-tagged is what preserves the single-round-trip
+	// property this comment originally assumed.
 	pipe := s.client.Pipeline()
 	cmds := make([]*redis.SliceCmd, len(hashKeys))
 	for i, hk := range hashKeys {
@@ -278,8 +348,8 @@ func (s *Shield) CommitKeys(ctx context.Context, band int, corrKeys []string) er
 // (ErrCodeDuplicateKey / MongoDB code 11000). Calling this for transient errors
 // would incorrectly suppress legitimate retries.
 //
-// Dead-letter key: sl:{namespace}:dlq:{band}
-// Payload key:     sl:{namespace}:payload:{corrKey}   (TTL extended to dlqTTL)
+// Dead-letter key: sl:{namespace}:dlq:{band}   (band is also the hash tag)
+// Payload key:     sl:{namespace}:payload:{band}:corrKey   (TTL extended to dlqTTL)
 func (s *Shield) MoveToDeadLetter(ctx context.Context, band int, corrKeys []string, reason string) error {
 	if len(corrKeys) == 0 {
 		return nil
@@ -289,6 +359,20 @@ func (s *Shield) MoveToDeadLetter(ctx context.Context, band int, corrKeys []stri
 	dirtyKey := s.dirtyKeyForBand(band)
 	dlqKey := s.dlqKey(band)
 
+	// NOTE: this pipeline mixes keys tagged {band} (dirtyKey, dlqKey, and
+	// every payloadKey(ck) below, since payloadKey now embeds BandFor(ck))
+	// with plain pipelined commands rather than a single atomic script.
+	// That's fine for a pipeline (each command executes independently;
+	// pipelining is not the same atomicity guarantee as the Lua script),
+	// but it does mean every key referenced here — dirty set, DLQ set, and
+	// every payload hash — must belong to the SAME band as the caller
+	// passed in. Since payloadKey() derives its tag from BandFor(ck)
+	// internally, this only holds if every ck in corrKeys actually belongs
+	// to `band` — i.e. the caller (engine.go) must never mix correlation
+	// keys from different bands into one MoveToDeadLetter call. Looking at
+	// engine.go's flushBand, this holds today (each call is scoped to one
+	// band's flush cycle) — flagging the invariant so it isn't broken by a
+	// future refactor.
 	pipe := s.client.Pipeline()
 
 	for _, ck := range corrKeys {
@@ -354,7 +438,8 @@ func (s *Shield) DrainDLQ(ctx context.Context, band, maxBatch int) ([]FlushRecor
 		hashKeys[i] = s.payloadKey(corrKeys[i])
 	}
 
-	// Pipeline all HMGET calls — one network round-trip for the entire batch.
+	// Pipeline all HMGET calls — single round-trip per shard; all keys here
+	// share this band's hash tag (see DrainBand note above).
 	pipe := s.client.Pipeline()
 	cmds := make([]*redis.SliceCmd, len(hashKeys))
 	for i, hk := range hashKeys {
@@ -422,11 +507,19 @@ func (s *Shield) BandCount() int { return s.bandCount }
 // Namespace returns the namespace configured for this Shield instance.
 func (s *Shield) Namespace() string { return s.namespace }
 
-// BandFor returns the band index for the given correlation key using FNV-32a.
-func (s *Shield) BandFor(correlationKey string) int {
+// BandForKey returns the band index for correlationKey using FNV-32a.
+// Exported at package level so callers that need to predict where a key lands
+// — chiefly tests building expected key names — hash it exactly the way the
+// Shield does instead of reimplementing it.
+func BandForKey(correlationKey string, bandCount int) int {
 	h := fnv.New32a()
 	_, _ = h.Write([]byte(correlationKey))
-	return int(h.Sum32()) % s.bandCount
+	return int(h.Sum32()) % bandCount
+}
+
+// BandFor returns the band index for the given correlation key using FNV-32a.
+func (s *Shield) BandFor(correlationKey string) int {
+	return BandForKey(correlationKey, s.bandCount)
 }
 
 func (s *Shield) Close() error { return s.client.Close() }
@@ -535,7 +628,18 @@ func (s *Shield) flushBatch(entries []writeEntry) {
 
 	// Use EvalSha (pre-loaded at startup) so the pipeline carries only the
 	// 40-byte SHA rather than the full Lua script text on every flush.
-	// Each key's HSET+EXPIRE+ZADD remains atomic inside the Lua execution.
+	// Each key's HSET+EXPIRE+ZADD remains atomic inside the Lua execution —
+	// this holds under cluster mode because payloadKey(e.correlationKey) and
+	// dirtyKey(e.correlationKey) now always share e's band hash tag.
+	//
+	// Cluster-mode note: if entries in this batch span multiple bands (which
+	// they typically will), a cluster-aware client transparently splits this
+	// pipeline into per-shard sub-pipelines and executes them in parallel —
+	// this IS the parallelism the migration to CME was for. The "one
+	// round-trip" framing below only holds per-shard, not for the whole
+	// pipeline; the 10s context timeout bounds the slowest shard's
+	// round-trip, not a single network call. Re-validate this timeout
+	// against real multi-shard latency under load before relying on it.
 	pipe := s.client.Pipeline()
 	ttlSec := int64(s.keyTTL.Seconds())
 
@@ -547,7 +651,8 @@ func (s *Shield) flushBatch(entries []writeEntry) {
 	}
 
 	// Collect the unique bands touched by this batch and append ZCARD for each
-	// into the same pipeline — one round-trip for writes + depth checks combined.
+	// into the same pipeline — one round-trip (per shard) for writes + depth
+	// checks combined.
 	var touchedBands []int
 	if s.volumeSignaler != nil {
 		seen := make(map[int]bool, s.bandCount)
@@ -580,9 +685,40 @@ func (s *Shield) flushBatch(entries []writeEntry) {
 }
 
 // ── Key naming ────────────────────────────────────────────────────────────────
+//
+// CLUSTER HASH-TAG CONTRACT: payloadKey and dirtyKeyForBand MUST share a
+// hash tag for a given band, since atomicWriteLua operates on both keys in
+// one Lua script execution, which Redis Cluster requires to be single-slot.
+// Redis Cluster hashes only the substring between the FIRST '{' and the
+// following '}' in a key — see New()'s namespace validation, which rejects
+// any namespace containing '{' or '}' to prevent it from hijacking this.
+
+// The exported PayloadKey/DirtyKey/DLQKey functions below are the single
+// source of truth for the on-wire key layout. Tests assert against real keys
+// via these rather than hardcoding the format — hardcoded copies silently
+// rotted when the {band} hash tags were introduced, so the assertions kept
+// looking for keys that no longer existed and only failed on a timeout.
+
+// PayloadKey returns the payload hash key for a correlation key in a band.
+// Pattern: sl:<namespace>:payload:{<band>}:<correlationKey>
+func PayloadKey(namespace string, band int, ck string) string {
+	return fmt.Sprintf("sl:%s:payload:{%d}:%s", namespace, band, ck)
+}
+
+// DirtyKey returns the dirty sorted-set key for a band.
+// Pattern: sl:<namespace>:dirty:{<band>}
+func DirtyKey(namespace string, band int) string {
+	return fmt.Sprintf("sl:%s:dirty:{%d}", namespace, band)
+}
+
+// DLQKey returns the dead-letter sorted-set key for a band.
+// Pattern: sl:<namespace>:dlq:{<band>}
+func DLQKey(namespace string, band int) string {
+	return fmt.Sprintf("sl:%s:dlq:{%d}", namespace, band)
+}
 
 func (s *Shield) payloadKey(ck string) string {
-	return fmt.Sprintf("sl:%s:payload:%s", s.namespace, ck)
+	return PayloadKey(s.namespace, s.BandFor(ck), ck)
 }
 
 func (s *Shield) dirtyKey(ck string) string {
@@ -590,16 +726,18 @@ func (s *Shield) dirtyKey(ck string) string {
 }
 
 func (s *Shield) dirtyKeyForBand(band int) string {
-	return fmt.Sprintf("sl:%s:dirty:%d", s.namespace, band)
+	return DirtyKey(s.namespace, band)
 }
 
 // dlqKey returns the dead-letter sorted set key for a band.
-// Pattern: sl:{namespace}:dlq:{band}
 func (s *Shield) dlqKey(band int) string {
-	return fmt.Sprintf("sl:%s:dlq:%d", s.namespace, band)
+	return DLQKey(s.namespace, band)
 }
 
 func applyDefaults(c *RedisConfig) {
+	if c.Network == "" {
+		c.Network = "tcp"
+	}
 	if c.DialTimeout == 0 {
 		c.DialTimeout = 5 * time.Second
 	}

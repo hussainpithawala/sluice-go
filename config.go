@@ -35,14 +35,28 @@ type Config struct {
 }
 
 // RedisConfig holds Redis connectivity parameters.
-// Single Addrs entry = standalone mode. Multiple entries = Cluster mode.
+//
+// ClusterMode selects a cluster-aware client and MUST be set explicitly —
+// it is NOT inferred from len(Addrs). A cluster-mode-enabled deployment
+// (e.g. AWS ElastiCache CME) is commonly reached via a SINGLE configuration
+// endpoint address, which is indistinguishable from a single standalone
+// node by address count alone. Get this wrong and commands routed to a
+// slot outside whichever node you happen to hit will fail once the cluster
+// issues a MOVED redirect that a standalone client doesn't follow.
 type RedisConfig struct {
 	// Network type to use, either tcp or unix.
 	// Default is tcp.
 	Network string
 
-	// Redis server address in "host:port" format.
+	// Redis server address(es) in "host:port" format. For cluster mode,
+	// typically a single cluster configuration endpoint is sufficient —
+	// go-redis discovers the full shard topology from it. See ClusterMode.
 	Addrs []string
+
+	// ClusterMode selects a cluster-aware client (go-redis ClusterClient)
+	// when true, or a standalone client when false. Required — does not
+	// default based on Addrs. See type-level doc above for why.
+	ClusterMode bool
 
 	// Username to authenticate the current connection when Redis ACLs are used.
 	// See: https://redis.io/commands/auth.
@@ -54,6 +68,7 @@ type RedisConfig struct {
 
 	// Redis DB to select after connecting to a server.
 	// See: https://redis.io/commands/select.
+	// NOTE: cluster-mode-enabled clusters only support DB 0.
 	DB int
 
 	// Dial timeout for establishing new connections.
@@ -86,12 +101,25 @@ type RedisConfig struct {
 }
 
 // toInternal converts to internal shield.RedisConfig.
+//
+// Previously this dropped Username and Network entirely — ACL-authenticated
+// connections (Username set, no error surfaced) would silently connect
+// without the username, working only by accident on deployments that don't
+// enforce ACL user matching. Fixed alongside the ClusterMode plumbing since
+// this file was already being touched for that.
 func (c RedisConfig) toInternal() shield.RedisConfig {
 	return shield.RedisConfig{
-		Addrs: c.Addrs, Password: c.Password, DB: c.DB,
-		DialTimeout: c.DialTimeout, ReadTimeout: c.ReadTimeout,
-		WriteTimeout: c.WriteTimeout, PoolSize: c.PoolSize,
-		TLSConfig: c.TLSConfig,
+		Network:      c.Network,
+		Addrs:        c.Addrs,
+		ClusterMode:  c.ClusterMode,
+		Username:     c.Username,
+		Password:     c.Password,
+		DB:           c.DB,
+		DialTimeout:  c.DialTimeout,
+		ReadTimeout:  c.ReadTimeout,
+		WriteTimeout: c.WriteTimeout,
+		PoolSize:     c.PoolSize,
+		TLSConfig:    c.TLSConfig,
 	}
 }
 

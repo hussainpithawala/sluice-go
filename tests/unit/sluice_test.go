@@ -14,6 +14,7 @@ import (
 	"go.mongodb.org/mongo-driver/bson"
 
 	sluice "github.com/hussainpithawala/sluice-go"
+	"github.com/hussainpithawala/sluice-go/internal/shield"
 	"github.com/hussainpithawala/sluice-go/sink/docdb"
 )
 
@@ -258,7 +259,7 @@ func TestFlush_TwoPhaseCommit_DirtySetEmptied(t *testing.T) {
 	require.Eventually(t, func() bool {
 		total := int64(0)
 		for band := 0; band < 2; band++ {
-			n, _ := rc.ZCard(ctx, fmt.Sprintf("sl:%s:dirty:%d", ns, band)).Result()
+			n, _ := rc.ZCard(ctx, shield.DirtyKey(ns, band)).Result()
 			total += n
 		}
 		return total == 0
@@ -307,7 +308,7 @@ func TestContractError_MovesToDeadLetter(t *testing.T) {
 	require.NoError(t, sl.Write(ctx, "bad_1", mustPayload(t, "nope")))
 	require.NoError(t, sl.Write(ctx, "bad_2", mustPayload(t, "nope")))
 
-	dlqKey := fmt.Sprintf("sl:%s:dlq:0", ns)
+	dlqKey := shield.DLQKey(ns, 0)
 
 	// Bad keys should appear in the DLQ.
 	require.Eventually(t, func() bool {
@@ -317,13 +318,13 @@ func TestContractError_MovesToDeadLetter(t *testing.T) {
 
 	// Bad keys should NOT remain in the dirty set.
 	require.Eventually(t, func() bool {
-		dirtyKey := fmt.Sprintf("sl:%s:dirty:0", ns)
+		dirtyKey := shield.DirtyKey(ns, 0)
 		n, _ := rc.ZCard(ctx, dirtyKey).Result()
 		return n == 0
 	}, 3*time.Second, 20*time.Millisecond, "dirty set should be empty after flush")
 
 	// Verify DLQ payload hash is annotated with reason.
-	vals, err := rc.HGetAll(ctx, fmt.Sprintf("sl:%s:payload:bad_1", ns)).Result()
+	vals, err := rc.HGetAll(ctx, shield.PayloadKey(ns, 0, "bad_1")).Result()
 	require.NoError(t, err)
 	assert.Equal(t, "contract_violation", vals["dlq_reason"])
 	assert.NotEmpty(t, vals["dlq_at"])
@@ -471,7 +472,7 @@ func TestWrite_BatchedMode(t *testing.T) {
 	// After DrainAndClose the dirty sets should be empty (engine drained them).
 	totalDirty := int64(0)
 	for band := 0; band < 4; band++ {
-		n, _ := rc.ZCard(ctx, fmt.Sprintf("sl:%s:dirty:%d", ns, band)).Result()
+		n, _ := rc.ZCard(ctx, shield.DirtyKey(ns, band)).Result()
 		totalDirty += n
 	}
 	assert.Equal(t, int64(0), totalDirty, "all dirty keys should be committed after drain")
@@ -520,7 +521,7 @@ func TestWrite_BatchedMode_FlushesToMongo(t *testing.T) {
 	require.Eventually(t, func() bool {
 		total := int64(0)
 		for band := 0; band < 2; band++ {
-			c, _ := rc.ZCard(ctx, fmt.Sprintf("sl:%s:dirty:%d", ns, band)).Result()
+			c, _ := rc.ZCard(ctx, shield.DirtyKey(ns, band)).Result()
 			total += c
 		}
 		return total == 0
