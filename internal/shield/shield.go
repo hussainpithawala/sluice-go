@@ -22,6 +22,14 @@ type FlushRecord struct {
 	ReceivedAt     time.Time
 }
 
+// WriteOptions configures optional behaviors for a single write operation.
+type WriteOptions struct {
+	ForceHot     bool
+	ContentHash  string
+	DedupEnabled bool
+	IndexesJSON  string
+}
+
 // RedisConfig holds Redis connectivity parameters.
 type RedisConfig struct {
 	// Network type to use, either tcp or unix.
@@ -114,6 +122,7 @@ type Shield struct {
 	namespace      string
 	bandCount      int
 	keyTTL         time.Duration
+	activityWindow time.Duration
 	dlqTTL         time.Duration // how long dead-letter payload hashes are kept
 	writeScript    *redis.Script
 	writeScriptSHA string // pre-loaded SHA; used by flushBatch to avoid sending script text each time
@@ -128,24 +137,63 @@ type Shield struct {
 	batchCtx       context.Context // parent context; cancellation stops the batcher
 }
 
-// atomicWriteLua atomically stores payload + marks the key dirty in one round-trip.
-// KEYS[1]=payload hash  KEYS[2]=dirty sorted set
-// ARGV[1]=payload  ARGV[2]=score(ms)  ARGV[3]=corrKey  ARGV[4]=ttl(s)
-//
-// CLUSTER MODE: KEYS[1] and KEYS[2] MUST hash to the same slot, or this
-// script fails with CROSSSLOT the moment it runs against a cluster-enabled
-// node. payloadKey() and dirtyKeyForBand() below both embed a {band} hash
-// tag for exactly this reason — do not change either key format without
-// preserving a shared tag between them.
 const atomicWriteLua = `
-redis.call('HSET', KEYS[1], 'p', ARGV[1], 'ts', ARGV[2])
-redis.call('EXPIRE', KEYS[1], tonumber(ARGV[4]))
-redis.call('ZADD', KEYS[2], ARGV[2], ARGV[3])
+local payloadKey = KEYS[1]
+local dirtyKey = KEYS[2]
+local payload = ARGV[1]
+local score = ARGV[2]
+local corrKey = ARGV[3]
+local ttl = tonumber(ARGV[4])
+local activityWindow = tonumber(ARGV[5])
+local indexJson = ARGV[6]
+local namespace = ARGV[7]
+local band = tonumber(ARGV[8])
+local contentHash = ARGV[9]
+local dedupEnabled = tonumber(ARGV[10])
+local forceHot = tonumber(ARGV[11])
+
+local currentTtl = ttl
+local isHot = redis.call('EXISTS', payloadKey)
+if isHot == 1 or forceHot == 1 then
+    currentTtl = activityWindow
+end
+
+if dedupEnabled == 1 and contentHash and contentHash ~= '' then
+    local existingHash = redis.call('HGET', payloadKey, 'h')
+    if existingHash == contentHash then
+        redis.call('EXPIRE', payloadKey, currentTtl)
+        return 2 -- 2 indicates deduplicated, no dirty queue update needed
+    end
+end
+
+redis.call('HSET', payloadKey, 'p', payload, 'ts', score)
+if contentHash and contentHash ~= '' then
+    redis.call('HSET', payloadKey, 'h', contentHash)
+end
+redis.call('EXPIRE', payloadKey, currentTtl)
+redis.call('ZADD', dirtyKey, score, corrKey)
+
+if indexJson and indexJson ~= '' and indexJson ~= 'null' then
+    local ok, indexes = pcall(cjson.decode, indexJson)
+    if ok and type(indexes) == "table" then
+        for field, val in pairs(indexes) do
+            if type(val) == "string" then
+                local eqKey = string.format('sl:%s:idx:{%d}:%s:%s', namespace, band, field, val)
+                redis.call('SADD', eqKey, corrKey)
+                redis.call('EXPIRE', eqKey, currentTtl)
+            elseif type(val) == "number" then
+                local ridxKey = string.format('sl:%s:ridx:{%d}:%s', namespace, band, field)
+                redis.call('ZADD', ridxKey, val, corrKey)
+                redis.call('EXPIRE', ridxKey, currentTtl)
+            end
+        end
+    end
+end
 return 1
 `
 
 // New initialises the Redis client and validates connectivity.
-func New(cfg RedisConfig, namespace string, bandCount int, keyTTL time.Duration) (*Shield, error) {
+func New(cfg RedisConfig, namespace string, bandCount int, keyTTL time.Duration, activityWindow time.Duration) (*Shield, error) {
 	if strings.ContainsAny(namespace, "{}") {
 		// A '{' anywhere in namespace would hijack Redis Cluster's hash-tag
 		// parsing (only the substring between the FIRST '{' and the next '}'
@@ -212,6 +260,7 @@ func New(cfg RedisConfig, namespace string, bandCount int, keyTTL time.Duration)
 		namespace:      namespace,
 		bandCount:      bandCount,
 		keyTTL:         keyTTL,
+		activityWindow: activityWindow,
 		dlqTTL:         7 * 24 * time.Hour, // dead-letter payloads kept 7 days
 		writeScript:    redis.NewScript(atomicWriteLua),
 		writeScriptSHA: sha,
@@ -221,19 +270,83 @@ func New(cfg RedisConfig, namespace string, bandCount int, keyTTL time.Duration)
 // Write atomically stores payload and marks the correlation key dirty.
 // When batching is enabled, the write is buffered and pipelined to Redis
 // by the background batcher goroutine. Returns nil immediately in that case.
-func (s *Shield) Write(ctx context.Context, correlationKey string, payload []byte) error {
-	if s.batchCh != nil {
-		s.batchCh <- writeEntry{
-			correlationKey: correlationKey,
-			payload:        payload,
-			ts:             float64(time.Now().UnixMilli()),
-		}
-		return nil
+func (s *Shield) Write(ctx context.Context, correlationKey string, payload []byte, opts WriteOptions) (int, error) {
+	band := s.BandFor(correlationKey)
+	forceHotInt := 0
+	if opts.ForceHot {
+		forceHotInt = 1
 	}
-	return s.writeScript.Run(ctx, s.client,
-		[]string{s.payloadKey(correlationKey), s.dirtyKey(correlationKey)},
-		payload, float64(time.Now().UnixMilli()), correlationKey, int64(s.keyTTL.Seconds()),
-	).Err()
+	dedupInt := 0
+	if opts.DedupEnabled {
+		dedupInt = 1
+	}
+
+	res, err := s.writeScript.Run(ctx, s.client,
+		[]string{s.payloadKey(correlationKey), s.dirtyKeyForBand(band)},
+		payload, float64(time.Now().UnixMilli()), correlationKey,
+		int64(s.keyTTL.Seconds()), int64(s.activityWindow.Seconds()),
+		opts.IndexesJSON, s.namespace, band,
+		opts.ContentHash, dedupInt, forceHotInt,
+	).Int()
+
+	return res, err
+}
+
+// SetNX implements exactly-once delivery via SETNX EX.
+func (s *Shield) SetNX(ctx context.Context, key string, value interface{}, expiration time.Duration) (bool, error) {
+	return s.client.SetNX(ctx, key, value, expiration).Result()
+}
+
+// HotLoad forces a payload into the journal with ActivityWindow TTL.
+func (s *Shield) HotLoad(ctx context.Context, correlationKey string, payload []byte) error {
+	_, err := s.Write(ctx, correlationKey, payload, WriteOptions{ForceHot: true})
+	return err
+}
+
+// Read fetches the payload from Redis. Returns (payload, isHot, error).
+func (s *Shield) Read(ctx context.Context, correlationKey string) ([]byte, bool, error) {
+	key := s.payloadKey(correlationKey)
+	val, err := s.client.HGet(ctx, key, "p").Result()
+	if err == redis.Nil {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+
+	// Fire-and-forget TTL refresh to keep it hot
+	go func() {
+		bgCtx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+		defer cancel()
+		_ = s.client.Expire(bgCtx, key, s.activityWindow).Err()
+	}()
+
+	return []byte(val), true, nil
+}
+
+// ZRangeWithScores fetches the oldest scores in a dirty set for pre-eviction checks.
+func (s *Shield) ZRangeWithScores(ctx context.Context, band int, start, stop int64) ([]redis.Z, error) {
+	return s.client.ZRangeWithScores(ctx, s.dirtyKeyForBand(band), start, stop).Result()
+}
+
+// SInter performs a safe SET intersection within a single band (Cluster-safe).
+func (s *Shield) SInter(ctx context.Context, keys ...string) ([]string, error) {
+	return s.client.SInter(ctx, keys...).Result()
+}
+
+// ZScore fetches the score of a member in a range index.
+func (s *Shield) ZScore(ctx context.Context, key, member string) (float64, error) {
+	return s.client.ZScore(ctx, key, member).Result()
+}
+
+// IndexKey returns the equality SET key for a field/value pair in a specific band.
+func IndexKey(namespace string, band int, field, value string) string {
+	return fmt.Sprintf("sl:%s:idx:{%d}:%s:%s", namespace, band, field, value)
+}
+
+// RangeIndexKey returns the range ZSET key for a field in a specific band.
+func RangeIndexKey(namespace string, band int, field string) string {
+	return fmt.Sprintf("sl:%s:ridx:{%d}:%s", namespace, band, field)
 }
 
 // DrainBand reads up to maxBatch dirty keys and returns their payloads as
@@ -620,6 +733,31 @@ func (s *Shield) runBatcher() {
 			}
 		}
 	}
+}
+
+// RefreshHotTTL extends the ActivityWindow TTL on successfully flushed hot CRNs.
+// This ensures active users remain in the fast-path journal for subsequent Read() calls.
+func (s *Shield) RefreshHotTTL(ctx context.Context, band int, corrKeys []string) error {
+	if len(corrKeys) == 0 {
+		return nil
+	}
+	pipe := s.client.Pipeline()
+	for _, ck := range corrKeys {
+		pipe.Expire(ctx, s.payloadKey(ck), s.activityWindow)
+	}
+	_, err := pipe.Exec(ctx)
+	return err
+}
+
+// OldestDirtyScore returns the score (timestamp) of the oldest item in a band's
+// dirty sorted set. Returns 0 if the set is empty. Used by the engine's
+// pre-eviction flusher to force a flush before Redis TTL expires the payload.
+func (s *Shield) OldestDirtyScore(ctx context.Context, band int) (float64, error) {
+	res, err := s.client.ZRangeWithScores(ctx, s.dirtyKeyForBand(band), 0, 0).Result()
+	if err != nil || len(res) == 0 {
+		return 0, err
+	}
+	return res[0].Score, nil
 }
 
 func (s *Shield) flushBatch(entries []writeEntry) {

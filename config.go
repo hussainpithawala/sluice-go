@@ -8,17 +8,33 @@ import (
 	"github.com/hussainpithawala/sluice-go/internal/shield"
 )
 
+// ReadContract loads the current payload for a correlation key from the
+// backing sink/document store. Used by HotLoad() and cold Read() fallback.
+type ReadContract func(correlationKey string) ([]byte, error)
+
+// IndexContract extracts secondary-index fields from a payload.
+//
+// string values      -> equality SET index
+// int/int64/float64  -> range ZSET index
+// time.Time          -> range ZSET index using Unix milliseconds
+type IndexContract func(correlationKey string, payload []byte) (map[string]interface{}, error)
+
 // Config holds every tunable for the library.
 // Construct via the Builder — do not instantiate directly.
 type Config struct {
 	Namespace          string
 	BandCount          int
 	FlushWindow        time.Duration
-	MaxBatchSize       int
 	KeyTTL             time.Duration
-	DegradedModeDirect bool
+	ActivityWindow     time.Duration // TTL for hot CRN sessions (default 4h)
+	MaxBatchSize       int
 	Redis              RedisConfig
+	DegradedModeDirect bool
+	HotAwareFlush      bool // Extend TTL on successful commit
 	Metrics            MetricsRecorder
+
+	ContentDedup   bool          // Enable xxHash64 payload deduplication
+	IdempotencyTTL time.Duration // TTL for WriteIdempotent keys
 
 	// BatchedWrites enables pipelined Redis writes. When true, Write() calls
 	// are buffered in memory and flushed to Redis in a single pipeline,
@@ -32,6 +48,9 @@ type Config struct {
 	DLQAutoProcess     bool
 	DLQProcessInterval time.Duration // ticker interval; default 30s
 	DLQProcessStrategy DLQStrategy   // strategy for auto-processing; default DLQUpsert
+
+	ReadContract  ReadContract
+	IndexContract IndexContract
 }
 
 // RedisConfig holds Redis connectivity parameters.
@@ -126,10 +145,15 @@ func (c RedisConfig) toInternal() shield.RedisConfig {
 // toInternal converts to internal engine.Config.
 func (c Config) toInternal() engine.Config {
 	return engine.Config{
-		Namespace:    c.Namespace,
-		BandCount:    c.BandCount,
-		FlushWindow:  c.FlushWindow,
-		MaxBatchSize: c.MaxBatchSize,
+		Namespace:      c.Namespace,
+		BandCount:      c.BandCount,
+		FlushWindow:    c.FlushWindow,
+		MaxBatchSize:   c.MaxBatchSize,
+		KeyTTL:         c.KeyTTL,
+		ActivityWindow: c.ActivityWindow,
+		HotAwareFlush:  c.HotAwareFlush,
+		ReadContract:   engine.ReadContract(c.ReadContract),
+		IndexContract:  engine.IndexContract(c.IndexContract),
 	}
 }
 
@@ -140,6 +164,19 @@ func defaultConfig(namespace string) Config {
 		FlushWindow:        250 * time.Millisecond,
 		MaxBatchSize:       1000,
 		KeyTTL:             30 * time.Second,
+		ActivityWindow:     4 * time.Hour,
+		IdempotencyTTL:     4 * time.Hour,
 		DegradedModeDirect: true,
+		HotAwareFlush:      true,
+		ReadContract:       nil,
+		IndexContract:      nil,
 	}
 }
+
+// Builder methods for new fields
+func (b *Builder) WithActivityWindow(d time.Duration) *Builder { b.cfg.ActivityWindow = d; return b }
+func (b *Builder) WithHotAwareFlush(v bool) *Builder           { b.cfg.HotAwareFlush = v; return b }
+func (b *Builder) WithContentDedup(v bool) *Builder            { b.cfg.ContentDedup = v; return b }
+func (b *Builder) WithIdempotencyTTL(d time.Duration) *Builder { b.cfg.IdempotencyTTL = d; return b }
+func (b *Builder) WithReadContract(rc ReadContract) *Builder   { b.cfg.ReadContract = rc; return b }
+func (b *Builder) WithIndexContract(ic IndexContract) *Builder { b.cfg.IndexContract = ic; return b }

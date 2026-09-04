@@ -20,16 +20,19 @@ package sluice
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sync/atomic"
 	"time"
 
 	"log/slog"
 
+	"github.com/cespare/xxhash/v2"
 	"github.com/hussainpithawala/sluice-go/internal/dlq"
 	"github.com/hussainpithawala/sluice-go/internal/engine"
 	"github.com/hussainpithawala/sluice-go/internal/shield"
 	"github.com/hussainpithawala/sluice-go/sink"
+	"github.com/redis/go-redis/v9"
 )
 
 // Sluice is the main entry point. Safe for concurrent use.
@@ -52,6 +55,18 @@ type Builder struct {
 	sk       sink.FlushSink
 	contract WriteContract
 	callback OnFlushCallback
+}
+
+// Query types
+type Query struct {
+	Equality map[string]string
+	RangeMin map[string]float64
+	RangeMax map[string]float64
+}
+
+type QueryResult struct {
+	CorrelationKey string
+	Payload        []byte
 }
 
 // New returns a Builder initialised with production-safe defaults.
@@ -105,7 +120,7 @@ func (b *Builder) Build(ctx context.Context) (*Sluice, error) {
 	if err := b.sk.Ping(ctx); err != nil {
 		return nil, fmt.Errorf("sluice: sink ping failed: %w", err)
 	}
-	sh, err := shield.New(b.cfg.Redis.toInternal(), b.cfg.Namespace, b.cfg.BandCount, b.cfg.KeyTTL)
+	sh, err := shield.New(b.cfg.Redis.toInternal(), b.cfg.Namespace, b.cfg.BandCount, b.cfg.KeyTTL, b.cfg.ActivityWindow)
 	if err != nil {
 		return nil, err
 	}
@@ -186,13 +201,68 @@ func (b *Builder) validate() error {
 	return nil
 }
 
+// IsHot checks if a correlation key is currently in the hot Redis set.
+func (s *Sluice) IsHot(ctx context.Context, correlationKey string) (bool, error) {
+	if s.closed.Load() {
+		return false, ErrLibraryClosed
+	}
+	t := time.Now()
+	// We can just try to Read it, or add an Exists method to shield.
+	// For simplicity, shield.Read returns isHot flag.
+	_, isHot, err := s.shield.Read(ctx, correlationKey)
+	s.metrics.RecordRedisOp(s.cfg.Namespace, "is_hot", time.Since(t), err)
+	return isHot, err
+}
+
+// HotLoad activates a correlation-key once the read operation is performed, loading it from the sink into the journal.
+func (s *Sluice) HotLoad(ctx context.Context, correlationKey string) ([]byte, error) {
+	if s.closed.Load() {
+		return nil, ErrLibraryClosed
+	}
+	if s.cfg.ReadContract == nil {
+		return nil, ErrMissingReadContract
+	}
+
+	t := time.Now()
+	payload, err := s.cfg.ReadContract(correlationKey)
+	s.metrics.RecordWarmUp(s.cfg.Namespace, time.Since(t), err)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := s.shield.HotLoad(ctx, correlationKey, payload); err != nil {
+		return nil, err
+	}
+	return payload, nil
+}
+
+// Read returns current state from the journal, falling back to ReadContract if cold.
+func (s *Sluice) Read(ctx context.Context, correlationKey string) ([]byte, error) {
+	if s.closed.Load() {
+		return nil, ErrLibraryClosed
+	}
+
+	t := time.Now()
+	payload, isHot, err := s.shield.Read(ctx, correlationKey)
+	s.metrics.RecordRead(s.cfg.Namespace, time.Since(t), isHot, err)
+
+	if err == nil && payload != nil {
+		return payload, nil
+	}
+
+	if s.cfg.ReadContract != nil {
+		return s.cfg.ReadContract(correlationKey)
+	}
+	return nil, ErrRecordNotFound
+}
+
 // Write buffers payload under correlationKey in Redis and returns immediately.
 // The document store is never touched during Write().
 // Safe for concurrent use from any number of goroutines.
 //
 // When batched writes are enabled, the payload is enqueued to an in-memory
 // buffer and pipelined to Redis by a background goroutine. Volume signaling
-// is handled by the batcher after each pipeline flush.
+// is handled by the batcher after each pipeline flush. Automatically detects IsHot state.
 func (s *Sluice) Write(ctx context.Context, correlationKey string, payload []byte) error {
 	if s.closed.Load() {
 		return ErrLibraryClosed
@@ -200,20 +270,51 @@ func (s *Sluice) Write(ctx context.Context, correlationKey string, payload []byt
 	if correlationKey == "" {
 		return ErrEmptyCorrelationKey
 	}
+
+	opts := shield.WriteOptions{}
+
+	// 1. Content Deduplication (xxHash64)
+	if s.cfg.ContentDedup {
+		opts.ContentHash = fmt.Sprintf("%d", xxhash.Sum64(payload))
+		opts.DedupEnabled = true
+	}
+
+	// 2. Index Contract
+	if s.cfg.IndexContract != nil {
+		indexes, err := s.cfg.IndexContract(correlationKey, payload)
+		if err == nil && len(indexes) > 0 {
+			// Convert time.Time to float64 (Unix ms) for Lua cjson compatibility
+			clean := make(map[string]interface{}, len(indexes))
+			for k, v := range indexes {
+				if t, ok := v.(time.Time); ok {
+					clean[k] = float64(t.UnixMilli())
+				} else {
+					clean[k] = v
+				}
+			}
+			if b, err := json.Marshal(clean); err == nil {
+				opts.IndexesJSON = string(b)
+			}
+		}
+	}
+
 	t := time.Now()
-	err := s.shield.Write(ctx, correlationKey, payload)
+	res, err := s.shield.Write(ctx, correlationKey, payload, opts)
 	s.metrics.RecordRedisOp(s.cfg.Namespace, "write", time.Since(t), err)
+
 	if err != nil {
 		if s.cfg.DegradedModeDirect {
 			return s.degradedWrite(ctx, correlationKey, payload)
 		}
 		return fmt.Errorf("%w: %v", ErrRedisUnavailable, err)
 	}
-	s.metrics.RecordWrite(s.cfg.Namespace)
 
-	// In batched mode the batcher goroutine handles volume signaling after
-	// each pipeline flush. Skip the per-write depth check.
-	if !s.cfg.BatchedWrites {
+	if res == 1 {
+		s.metrics.RecordWrite(s.cfg.Namespace)
+	}
+	// If res == 2, it was deduplicated; skip volume signaling
+
+	if !s.cfg.BatchedWrites && res == 1 {
 		band := s.shield.BandFor(correlationKey)
 		if depth, depthErr := s.shield.DirtyQueueDepth(ctx, band); depthErr == nil {
 			if int(depth) >= s.cfg.MaxBatchSize {
@@ -222,6 +323,84 @@ func (s *Sluice) Write(ctx context.Context, correlationKey string, payload []byt
 		}
 	}
 	return nil
+}
+
+// WriteIdempotent ensures exactly-once delivery using SETNX EX.
+func (s *Sluice) WriteIdempotent(ctx context.Context, correlationKey string, payload []byte, idempotencyKey string) error {
+	if s.closed.Load() {
+		return ErrLibraryClosed
+	}
+	if correlationKey == "" || idempotencyKey == "" {
+		return ErrEmptyCorrelationKey
+	}
+
+	// Idempotency key shares the {band} hash tag for Cluster Mode safety
+	idemKey := fmt.Sprintf("sl:%s:idem:{%d}:%s", s.cfg.Namespace, s.shield.BandFor(correlationKey), idempotencyKey)
+
+	ok, err := s.shield.SetNX(ctx, idemKey, "1", s.cfg.IdempotencyTTL)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return ErrDuplicateIdempotencyKey
+	}
+
+	return s.Write(ctx, correlationKey, payload)
+}
+
+// Query performs compound queries safely across bands using in-process SET intersection.
+func (s *Sluice) Query(ctx context.Context, q Query) ([]QueryResult, error) {
+	if s.closed.Load() {
+		return nil, ErrLibraryClosed
+	}
+	if len(q.Equality) == 0 {
+		return nil, fmt.Errorf("sluice: at least one equality filter is required")
+	}
+
+	var results []QueryResult
+
+	// Iterate per band to ensure CROSSSLOT safety (all keys in SINTER share {band} tag)
+	for band := 0; band < s.cfg.BandCount; band++ {
+		var eqKeys []string
+		for field, val := range q.Equality {
+			eqKeys = append(eqKeys, shield.IndexKey(s.cfg.Namespace, band, field, val))
+		}
+
+		candidates, err := s.shield.SInter(ctx, eqKeys...)
+		if err != nil && err != redis.Nil {
+			return nil, err
+		}
+
+		for _, ck := range candidates {
+			valid := true
+			// Check RangeMin
+			for field, min := range q.RangeMin {
+				score, err := s.shield.ZScore(ctx, shield.RangeIndexKey(s.cfg.Namespace, band, field), ck)
+				if err != nil || score < min {
+					valid = false
+					break
+				}
+			}
+			// Check RangeMax
+			if valid {
+				for field, max := range q.RangeMax {
+					score, err := s.shield.ZScore(ctx, shield.RangeIndexKey(s.cfg.Namespace, band, field), ck)
+					if err != nil || score > max {
+						valid = false
+						break
+					}
+				}
+			}
+
+			if valid {
+				payload, _, _ := s.shield.Read(ctx, ck)
+				if payload != nil {
+					results = append(results, QueryResult{CorrelationKey: ck, Payload: payload})
+				}
+			}
+		}
+	}
+	return results, nil
 }
 
 // DrainAndClose flushes all remaining dirty keys, stops band goroutines,

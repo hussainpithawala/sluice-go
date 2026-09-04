@@ -12,4 +12,8 @@ var (
 	ErrMissingSink         = errors.New("sluice: sink is required — call WithSink()")
 	ErrMissingContract     = errors.New("sluice: write contract is required — call WithWriteContract()")
 	ErrMissingRedis        = errors.New("sluice: redis config is required — call WithRedis()")
+
+	ErrDuplicateIdempotencyKey = errors.New("sluice: idempotency key already processed")
+	ErrMissingReadContract     = errors.New("sluice: ReadContract is required for HotLoad/Read")
+	ErrRecordNotFound          = errors.New("sluice: record not found in journal or sink")
 )
