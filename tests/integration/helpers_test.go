@@ -24,16 +24,18 @@ func sqsEndpoint() string { return getEnv("SQS_ENDPOINT", "http://localhost:4566
 func kafkaBroker() string { return getEnv("KAFKA_BROKER", "localhost:9092") }
 
 func getEnv(key, def string) string {
-	if v := os.Getenv(key); v != "" { return v }
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
 	return def
 }
 
 type inventoryPayload struct {
-	NudgeMasterID string    `json:"nudge_master_id"`
-	Channel       string    `json:"channel"`
-	Priority      int       `json:"priority"`
-	CampaignID    string    `json:"campaign_id"`
-	UpdatedAt     time.Time `json:"updated_at"`
+	NudgeMasterID string    `json:"nudge_master_id" bson:"nudge_master_id"`
+	Channel       string    `json:"channel" bson:"channel"`
+	Priority      int       `json:"priority" bson:"priority"`
+	CampaignID    string    `json:"campaign_id" bson:"campaign_id"`
+	UpdatedAt     time.Time `json:"updated_at" bson:"updated_at"`
 }
 
 func inventoryContract(key string, payload []byte) (*sluice.WriteModel, error) {
@@ -75,7 +77,8 @@ func buildIntegrationSluice(t *testing.T, namespace string) (*sluice.Sluice, *do
 	require.NoError(t, err)
 	t.Cleanup(func() {
 		shutCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		defer cancel(); _ = sl.DrainAndClose(shutCtx)
+		defer cancel()
+		_ = sl.DrainAndClose(shutCtx)
 	})
 	return sl, sk
 }
@@ -99,4 +102,75 @@ func waitForCount(t *testing.T, coll *mongo.Collection, filter interface{}, expe
 	t.Helper()
 	require.Eventually(t, func() bool { return countDocs(t, coll, filter) >= expected },
 		timeout, 100*time.Millisecond, "expected %d docs in MongoDB within %s", expected, timeout)
+}
+
+// inventoryReadContract fetches the current state from MongoDB to warm up the Redis journal.
+func inventoryReadContract(namespace string) sluice.ReadContract {
+	return func(correlationKey string) ([]byte, error) {
+		ctx := context.Background()
+		client, err := mongo.Connect(ctx, options.Client().ApplyURI(mongoURI()))
+		if err != nil {
+			return nil, err
+		}
+		defer client.Disconnect(ctx)
+
+		coll := client.Database("sluice_integration").Collection(namespace)
+		var result inventoryPayload
+		err = coll.FindOne(ctx, bson.M{"_id": correlationKey}).Decode(&result)
+		if err != nil {
+			if err == mongo.ErrNoDocuments {
+				return nil, sluice.ErrRecordNotFound
+			}
+			return nil, err
+		}
+		return json.Marshal(result)
+	}
+}
+
+// inventoryIndexContract extracts secondary index fields for Redis SET/ZSET indexing.
+func inventoryIndexContract(_ string, payload []byte) (map[string]interface{}, error) {
+	var p inventoryPayload
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return nil, err
+	}
+	return map[string]interface{}{
+		"channel":    p.Channel,                        // Equality index (SET)
+		"priority":   float64(p.Priority),              // Range index (ZSET)
+		"updated_at": float64(p.UpdatedAt.UnixMilli()), // Range index (ZSET)
+	}, nil
+}
+
+// buildHotIntegrationSluice creates a sluice instance configured with Hot/Cold regime,
+// indexing, content deduplication, and a short activity window for fast test execution.
+func buildHotIntegrationSluice(t *testing.T, namespace string) (*sluice.Sluice, *docdb.Sink) {
+	t.Helper()
+	ctx := context.Background()
+	sk, err := docdb.New(ctx, docdb.Config{
+		URI: mongoURI(), Database: "sluice_integration", Collection: namespace,
+		MaxPoolSize: 50, MinPoolSize: 5,
+	})
+	require.NoError(t, err)
+
+	sl, err := sluice.New(namespace).
+		WithRedis(sluice.RedisConfig{Addrs: []string{redisAddr()}, PoolSize: 20}).
+		WithSink(sk).
+		WithWriteContract(inventoryContract).
+		WithReadContract(inventoryReadContract(namespace)).
+		WithIndexContract(inventoryIndexContract).
+		WithContentDedup(true).
+		WithActivityWindow(1 * time.Minute). // Short TTL for testing
+		WithHotAwareFlush(true).
+		WithFlushWindow(200 * time.Millisecond).
+		WithMaxBatchSize(500).
+		WithBandCount(4).
+		WithKeyTTL(30 * time.Second).
+		Build(ctx)
+	require.NoError(t, err)
+
+	t.Cleanup(func() {
+		shutCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		_ = sl.DrainAndClose(shutCtx)
+	})
+	return sl, sk
 }
