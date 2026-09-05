@@ -21,10 +21,6 @@ type Config struct {
 	KeyTTL         time.Duration // In-flight dirty key TTL
 	ActivityWindow time.Duration // Hot CRN session TTL
 	HotAwareFlush  bool          // Extend TTL on successful commit
-
-	// Optional contracts passed through from public config.
-	ReadContract  ReadContract
-	IndexContract IndexContract
 }
 
 // MetricsRecorder is the subset of telemetry methods the engine needs.

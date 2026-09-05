@@ -6,6 +6,7 @@ var (
 	ErrLibraryClosed       = errors.New("sluice: library is closed")
 	ErrRedisUnavailable    = errors.New("sluice: redis unavailable")
 	ErrSinkUnavailable     = errors.New("sluice: sink unavailable")
+	ErrMissingSource       = errors.New("sluice: source unavailable")
 	ErrContractViolation   = errors.New("sluice: write contract returned error")
 	ErrEmptyCorrelationKey = errors.New("sluice: correlation key must not be empty")
 	ErrMissingNamespace    = errors.New("sluice: namespace is required")

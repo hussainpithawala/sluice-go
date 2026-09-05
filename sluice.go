@@ -20,6 +20,7 @@ package sluice
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync/atomic"
 	"time"
@@ -31,6 +32,7 @@ import (
 	"github.com/hussainpithawala/sluice-go/internal/engine"
 	"github.com/hussainpithawala/sluice-go/internal/shield"
 	"github.com/hussainpithawala/sluice-go/sink"
+	"github.com/hussainpithawala/sluice-go/source"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -41,6 +43,7 @@ type Sluice struct {
 	shield    *shield.Shield
 	engine    *engine.Engine
 	sk        sink.FlushSink
+	src       source.Source
 	contract  WriteContract
 	metrics   MetricsRecorder
 	closed    atomic.Bool
@@ -52,20 +55,9 @@ type Sluice struct {
 type Builder struct {
 	cfg      Config
 	sk       sink.FlushSink
+	src      source.Source
 	contract WriteContract
 	callback OnFlushCallback
-}
-
-// Query types
-type Query struct {
-	Equality map[string]string
-	RangeMin map[string]float64
-	RangeMax map[string]float64
-}
-
-type QueryResult struct {
-	CorrelationKey string
-	Payload        []byte
 }
 
 // New returns a Builder initialised with production-safe defaults.
@@ -74,8 +66,19 @@ func New(namespace string) *Builder {
 	return &Builder{cfg: defaultConfig(namespace)}
 }
 
-func (b *Builder) WithRedis(rc RedisConfig) *Builder           { b.cfg.Redis = rc; return b }
-func (b *Builder) WithSink(s sink.FlushSink) *Builder          { b.sk = s; return b }
+func (b *Builder) WithRedis(rc RedisConfig) *Builder  { b.cfg.Redis = rc; return b }
+func (b *Builder) WithSink(s sink.FlushSink) *Builder { b.sk = s; return b }
+
+// WithSource sets the read-side persistence backend (e.g., source/docdb.Source).
+// Required if WithReadContract is used.
+func (b *Builder) WithSource(s source.Source) *Builder { b.src = s; return b }
+
+// WithReadContract sets the domain function that translates a correlation key
+// into a datastore-agnostic ReadModel for the Source to execute.
+func (b *Builder) WithReadContract(rc ReadContract) *Builder { b.cfg.ReadContract = rc; return b }
+
+// WithIndexContract sets the domain function that extracts secondary index fields.
+func (b *Builder) WithIndexContract(ic IndexContract) *Builder { b.cfg.IndexContract = ic; return b }
 func (b *Builder) WithWriteContract(wc WriteContract) *Builder { b.contract = wc; return b }
 func (b *Builder) WithFlushWindow(d time.Duration) *Builder    { b.cfg.FlushWindow = d; return b }
 func (b *Builder) WithMaxBatchSize(n int) *Builder             { b.cfg.MaxBatchSize = n; return b }
@@ -83,7 +86,28 @@ func (b *Builder) WithBandCount(n int) *Builder                { b.cfg.BandCount
 func (b *Builder) WithKeyTTL(d time.Duration) *Builder         { b.cfg.KeyTTL = d; return b }
 func (b *Builder) WithDegradedModeDirect(v bool) *Builder      { b.cfg.DegradedModeDirect = v; return b }
 func (b *Builder) WithMetrics(m MetricsRecorder) *Builder      { b.cfg.Metrics = m; return b }
-func (b *Builder) OnFlush(cb OnFlushCallback) *Builder         { b.callback = cb; return b }
+
+// WithActivityWindow sets the TTL for hot CRN sessions.
+// Active users remain in the Redis journal for this duration. Default is 4 hours.
+func (b *Builder) WithActivityWindow(d time.Duration) *Builder {
+	b.cfg.ActivityWindow = d
+	return b
+}
+
+// WithHotAwareFlush enables post-commit TTL extension. When true, successfully
+// flushed hot CRNs have their ActivityWindow TTL refreshed, keeping them in the journal.
+func (b *Builder) WithHotAwareFlush(v bool) *Builder {
+	b.cfg.HotAwareFlush = v
+	return b
+}
+
+// WithContentDedup enables xxHash64 payload deduplication. Identical payloads
+// will only refresh the Redis TTL and skip redundant dirty-queue insertions.
+func (b *Builder) WithContentDedup(v bool) *Builder {
+	b.cfg.ContentDedup = v
+	return b
+}
+func (b *Builder) OnFlush(cb OnFlushCallback) *Builder { b.callback = cb; return b }
 
 // WithBatchedWrites enables pipelined Redis writes. Instead of one Redis
 // round-trip per Write() call, writes are buffered and flushed in a single
@@ -106,6 +130,11 @@ func (b *Builder) WithDLQAutoProcess(interval time.Duration, strategy DLQStrateg
 	return b
 }
 
+func (b *Builder) WithIdempotencyTTL(d time.Duration) *Builder {
+	b.cfg.IdempotencyTTL = d
+	return b
+}
+
 // Build validates configuration, connects to Redis, pings the sink,
 // starts band goroutines, and returns a ready Sluice instance.
 func (b *Builder) Build(ctx context.Context) (*Sluice, error) {
@@ -119,6 +148,11 @@ func (b *Builder) Build(ctx context.Context) (*Sluice, error) {
 	if err := b.sk.Ping(ctx); err != nil {
 		return nil, fmt.Errorf("sluice: sink ping failed: %w", err)
 	}
+
+	if b.cfg.ReadContract != nil && b.src == nil {
+		return nil, errors.New("sluice: WithSource() is required when WithReadContract() is used")
+	}
+
 	sh, err := shield.New(b.cfg.Redis.toInternal(), b.cfg.Namespace, b.cfg.BandCount, b.cfg.KeyTTL, b.cfg.ActivityWindow)
 	if err != nil {
 		return nil, err
@@ -163,7 +197,7 @@ func (b *Builder) Build(ctx context.Context) (*Sluice, error) {
 		sh.StartBatcher(ctx)
 	}
 
-	s := &Sluice{cfg: b.cfg, shield: sh, engine: eng, sk: b.sk, contract: b.contract, metrics: metrics}
+	s := &Sluice{cfg: b.cfg, shield: sh, engine: eng, sk: b.sk, src: b.src, contract: b.contract, metrics: metrics}
 
 	if b.cfg.DLQAutoProcess {
 		s.startDLQProcessor()
@@ -213,17 +247,88 @@ func (s *Sluice) IsHot(ctx context.Context, correlationKey string) (bool, error)
 	return isHot, err
 }
 
-// HotLoad warms a CRN and sets the hot marker.
+// Read returns current state from the journal.
+// Hot CRN: sub-millisecond Redis read with lazy TTL refresh.
+// Cold CRN: falls back to the configured Source via ReadContract.
+func (s *Sluice) Read(ctx context.Context, correlationKey string) ([]byte, error) {
+	if s.closed.Load() {
+		return nil, ErrLibraryClosed
+	}
+
+	t := time.Now()
+	payload, pttl, err := s.shield.ReadWithTTL(ctx, correlationKey)
+
+	// Hot path: found in Redis journal
+	if err == nil && payload != nil {
+		s.metrics.RecordRead(s.cfg.Namespace, time.Since(t), true, nil)
+
+		// Lazy refresh: if remaining TTL is < 20% of ActivityWindow, refresh it synchronously.
+		threshold := s.cfg.ActivityWindow / 5
+		if pttl > 0 && pttl < threshold {
+			_ = s.shield.SetHotMarker(ctx, correlationKey, s.cfg.ActivityWindow)
+			_ = s.shield.RefreshHotTTL(ctx, s.shield.BandFor(correlationKey), []string{correlationKey})
+		}
+		return payload, nil
+	}
+
+	// Cold path: fallback to the backing datastore via Source
+	if s.cfg.ReadContract != nil && s.src != nil {
+		// 1. Caller defines the datastore-agnostic filter
+		model, modelErr := s.cfg.ReadContract(correlationKey)
+		if modelErr != nil {
+			s.metrics.RecordRead(s.cfg.Namespace, time.Since(t), false, modelErr)
+			return nil, modelErr
+		}
+
+		// 2. Source executes the query and returns raw bytes
+		srcPayload, srcErr := s.src.Read(ctx, *model)
+		s.metrics.RecordRead(s.cfg.Namespace, time.Since(t), false, srcErr)
+
+		if srcErr != nil {
+			// Map internal source error to public sluice sentinel error
+			if errors.Is(srcErr, source.ErrRecordNotFound) {
+				return nil, ErrRecordNotFound
+			}
+			return nil, srcErr
+		}
+		return srcPayload, nil
+	}
+
+	s.metrics.RecordRead(s.cfg.Namespace, time.Since(t), false, ErrRecordNotFound)
+	return nil, ErrRecordNotFound
+}
+
+// HotLoad activates a CRN on user login.
+// Loads the document from the Source into the Redis journal and sets the hot marker.
 func (s *Sluice) HotLoad(ctx context.Context, correlationKey string) ([]byte, error) {
-	if s.cfg.ReadContract == nil {
+	if s.closed.Load() {
+		return nil, ErrLibraryClosed
+	}
+	if s.src == nil || s.cfg.ReadContract == nil {
 		return nil, ErrMissingReadContract
 	}
 
-	payload, err := s.cfg.ReadContract(correlationKey)
+	t := time.Now()
+
+	// 1. Caller defines the filter
+	model, err := s.cfg.ReadContract(correlationKey)
 	if err != nil {
+		s.metrics.RecordWarmUp(s.cfg.Namespace, time.Since(t), err)
 		return nil, err
 	}
 
+	// 2. Source executes the query
+	payload, err := s.src.Read(ctx, *model)
+	s.metrics.RecordWarmUp(s.cfg.Namespace, time.Since(t), err)
+	if err != nil {
+		// Map internal source error to public sluice sentinel error
+		if errors.Is(err, source.ErrRecordNotFound) {
+			return nil, ErrRecordNotFound
+		}
+		return nil, err
+	}
+
+	// 3. Write to Redis journal and set the hot marker
 	if err := s.shield.Write(ctx, correlationKey, payload); err != nil {
 		return nil, err
 	}
@@ -232,30 +337,6 @@ func (s *Sluice) HotLoad(ctx context.Context, correlationKey string) ([]byte, er
 	}
 
 	return payload, nil
-}
-
-// Read implements lazy TTL refresh. No goroutines.
-func (s *Sluice) Read(ctx context.Context, correlationKey string) ([]byte, error) {
-	payload, pttl, err := s.shield.ReadWithTTL(ctx, correlationKey)
-
-	if err == nil && payload != nil {
-		// Lazy refresh: if remaining TTL is < 20% of ActivityWindow, refresh it synchronously.
-		// Dividing a time.Duration by an integer yields a time.Duration.
-		threshold := s.cfg.ActivityWindow / 5
-
-		if pttl > 0 && pttl < threshold {
-			_ = s.shield.SetHotMarker(ctx, correlationKey, s.cfg.ActivityWindow)
-			// Also extend payload TTL
-			_ = s.shield.RefreshHotTTL(ctx, s.shield.BandFor(correlationKey), []string{correlationKey})
-		}
-		return payload, nil
-	}
-
-	// Cold fallback
-	if s.cfg.ReadContract != nil {
-		return s.cfg.ReadContract(correlationKey)
-	}
-	return nil, ErrRecordNotFound
 }
 
 // Write buffers payload under correlationKey in Redis and returns immediately.

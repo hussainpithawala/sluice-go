@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hussainpithawala/sluice-go/source"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.mongodb.org/mongo-driver/bson"
@@ -16,6 +17,7 @@ import (
 	sluice "github.com/hussainpithawala/sluice-go"
 	"github.com/hussainpithawala/sluice-go/internal/shield"
 	"github.com/hussainpithawala/sluice-go/sink/docdb"
+	sourcedocdb "github.com/hussainpithawala/sluice-go/source/docdb"
 )
 
 // ─── Test Payloads & Contracts ───────────────────────────────────────────────
@@ -44,18 +46,11 @@ func hotContract(key string, payload []byte) (*sluice.WriteModel, error) {
 	}, nil
 }
 
-func hotReadContract(coll *mongo.Collection) sluice.ReadContract {
-	return func(key string) ([]byte, error) {
-		ctx := context.Background()
-		var p hotPayload
-		err := coll.FindOne(ctx, bson.M{"_id": key}).Decode(&p)
-		if err != nil {
-			if err == mongo.ErrNoDocuments {
-				return nil, sluice.ErrRecordNotFound
-			}
-			return nil, err
-		}
-		return json.Marshal(p)
+func hotReadContract() sluice.ReadContract {
+	return func(key string) (*source.ReadModel, error) {
+		return &source.ReadModel{
+			Filter: bson.M{"_id": key},
+		}, nil
 	}
 }
 
@@ -103,11 +98,15 @@ func buildHotSluice(t *testing.T, ns string, coll *mongo.Collection) *sluice.Slu
 	})
 	require.NoError(t, err)
 
+	// Initialize the Source using the shared mongo.Client from the Sink
+	src := sourcedocdb.NewSourceWithClient(sk.Client(), testDatabase, coll.Name())
+
 	sl, err := sluice.New(ns).
 		WithRedis(sluice.RedisConfig{Addrs: []string{testRedisAddr}}).
 		WithSink(sk).
+		WithSource(src). // <-- ADD THIS
 		WithWriteContract(hotContract).
-		WithReadContract(hotReadContract(coll)).
+		WithReadContract(hotReadContract()). // <-- UPDATE THIS (no longer needs coll)
 		WithIndexContract(hotIndexContract).
 		WithContentDedup(true).
 		WithActivityWindow(1 * time.Minute).

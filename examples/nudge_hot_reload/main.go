@@ -42,6 +42,7 @@ import (
 
 	sluice "github.com/hussainpithawala/sluice-go"
 	"github.com/hussainpithawala/sluice-go/sink/docdb"
+	"github.com/hussainpithawala/sluice-go/source"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
@@ -88,21 +89,10 @@ func nudgeWriteContract(crn string, rawPayload []byte) (*sluice.WriteModel, erro
 // Used by HotLoad() to warm the Redis journal on user login,
 // and by Read() as a cold-path fallback.
 
-func nudgeReadContract(coll *mongo.Collection) sluice.ReadContract {
-	return func(correlationKey string) ([]byte, error) {
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		defer cancel()
-
-		var p NudgeInventoryPayload
-		err := coll.FindOne(ctx, bson.M{"_id": correlationKey}).Decode(&p)
-		if err != nil {
-			if err == mongo.ErrNoDocuments {
-				return nil, sluice.ErrRecordNotFound
-			}
-			return nil, fmt.Errorf("read contract: lookup %s: %w", correlationKey, err)
-		}
-		return json.Marshal(p)
-	}
+func nudgeReadContract(crn string) (*source.ReadModel, error) {
+	return &source.ReadModel{
+		Filter: bson.M{"_id": crn},
+	}, nil
 }
 
 // ─── IndexContract ───────────────────────────────────────────────────────────
@@ -346,6 +336,7 @@ func run(log *slog.Logger) (err error) {
 		URI: mongoURI, Database: "adroll", Collection: "nudge_inventory",
 		MaxPoolSize: 100, MinPoolSize: 10,
 	})
+
 	if err != nil {
 		return fmt.Errorf("connect to MongoDB at %s: %w", mongoURI, err)
 	}
@@ -357,7 +348,6 @@ func run(log *slog.Logger) (err error) {
 		return fmt.Errorf("connect read client: %w", err)
 	}
 	defer func() { _ = readClient.Disconnect(context.Background()) }()
-	readCollection := readClient.Database("adroll").Collection("nudge_inventory")
 
 	// ── Redis config ───────────────────────────────────────────────────────
 	redisAddrsRaw := getEnv("REDIS_ADDRS", "localhost:7001,localhost:7002,localhost:7003,localhost:7004")
@@ -384,8 +374,8 @@ func run(log *slog.Logger) (err error) {
 		}).
 		WithSink(sk).
 		WithWriteContract(nudgeWriteContract).
-		WithReadContract(nudgeReadContract(readCollection)). // ← ReadContract for HotLoad/Read
-		WithIndexContract(nudgeIndexContract).               // ← IndexContract for Query
+		WithReadContract(nudgeReadContract).   // ← ReadContract for HotLoad/Read
+		WithIndexContract(nudgeIndexContract). // ← IndexContract for Query
 		WithFlushWindow(250 * time.Millisecond).
 		WithMaxBatchSize(1000).
 		WithBandCount(bandCount).

@@ -12,6 +12,8 @@ import (
 
 	sluice "github.com/hussainpithawala/sluice-go"
 	"github.com/hussainpithawala/sluice-go/sink/docdb"
+	"github.com/hussainpithawala/sluice-go/source"
+	sourcedocdb "github.com/hussainpithawala/sluice-go/source/docdb"
 	"github.com/stretchr/testify/require"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
@@ -104,29 +106,33 @@ func waitForCount(t *testing.T, coll *mongo.Collection, filter interface{}, expe
 		timeout, 100*time.Millisecond, "expected %d docs in MongoDB within %s", expected, timeout)
 }
 
-// buildHotIntegrationSluice creates a sluice instance configured with Hot/Cold regime,
-// indexing, content deduplication, and a short activity window for fast test execution.
 func buildHotIntegrationSluice(t *testing.T, namespace string) (*sluice.Sluice, *docdb.Sink) {
 	t.Helper()
 	ctx := context.Background()
+
+	// Clean Redis to ensure test isolation
+	rc := dlqRedisClient(t) // or redisClient(t) depending on your helper name
+	cleanRedisKeys(t, rc, namespace)
+
 	sk, err := docdb.New(ctx, docdb.Config{
 		URI: mongoURI(), Database: "sluice_integration", Collection: namespace,
 		MaxPoolSize: 50, MinPoolSize: 5,
 	})
 	require.NoError(t, err)
 
-	// FIX: Instantiate the collection to pass to the ReadContract closure
-	coll := mongoCollection(t, namespace)
+	// Initialize the Source using the shared mongo.Client from the Sink
+	src := sourcedocdb.NewSourceWithClient(sk.Client(), "sluice_integration", namespace)
 
 	sl, err := sluice.New(namespace).
 		WithRedis(sluice.RedisConfig{Addrs: []string{redisAddr()}, PoolSize: 20}).
 		WithSink(sk).
+		WithSource(src). // <-- Inject Source
 		WithWriteContract(inventoryContract).
-		WithReadContract(inventoryReadContract(coll)). // Shared connection pool!
+		WithReadContract(inventoryReadContract()). // <-- No longer needs arguments
 		WithIndexContract(inventoryIndexContract).
 		WithContentDedup(true).
-		WithActivityWindow(1 * time.Minute). // Short TTL for testing
-		WithIdempotencyTTL(1 * time.Minute).
+		WithActivityWindow(1 * time.Minute).
+		WithIdempotencyTTL(1 * time.Minute). // <-- Now compiles
 		WithHotAwareFlush(true).
 		WithFlushWindow(200 * time.Millisecond).
 		WithMaxBatchSize(500).
@@ -143,22 +149,12 @@ func buildHotIntegrationSluice(t *testing.T, namespace string) (*sluice.Sluice, 
 	return sl, sk
 }
 
-// inventoryReadContract fetches the current state from MongoDB to warm up the Redis journal.
-// It captures the shared *mongo.Collection to avoid opening a new connection per read.
-func inventoryReadContract(coll *mongo.Collection) sluice.ReadContract {
-	return func(correlationKey string) ([]byte, error) {
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		defer cancel()
-
-		var result inventoryPayload
-		err := coll.FindOne(ctx, bson.M{"_id": correlationKey}).Decode(&result)
-		if err != nil {
-			if err == mongo.ErrNoDocuments {
-				return nil, sluice.ErrRecordNotFound
-			}
-			return nil, fmt.Errorf("read contract: lookup %s: %w", correlationKey, err)
-		}
-		return json.Marshal(result)
+// inventoryReadContract returns the datastore-agnostic filter for the Source.
+func inventoryReadContract() sluice.ReadContract {
+	return func(correlationKey string) (*source.ReadModel, error) {
+		return &source.ReadModel{
+			Filter: bson.M{"_id": correlationKey},
+		}, nil
 	}
 }
 
