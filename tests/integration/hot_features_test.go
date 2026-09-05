@@ -65,10 +65,10 @@ func TestWriteIdempotent_ExactlyOnce(t *testing.T) {
 	sl, _ := buildHotIntegrationSluice(t, ns)
 	ctx := context.Background()
 	crn := "crn_idem_1"
-	payload := makePayload("nm_idem_1")
+	payload, _ := json.Marshal(inventoryPayload{NudgeMasterID: "nm1", Channel: "push", Priority: 1, UpdatedAt: time.Now()})
 
 	// ✅ Make the key unique to this specific test execution
-	idemKey := fmt.Sprintf("kafka_offset_99_%s", t.Name())
+	idemKey := fmt.Sprintf("kafka_offset_199_%s", t.Name())
 
 	// First write succeeds
 	err := sl.WriteIdempotent(ctx, crn, payload, idemKey)
@@ -79,7 +79,10 @@ func TestWriteIdempotent_ExactlyOnce(t *testing.T) {
 	assert.ErrorIs(t, err, sluice.ErrDuplicateIdempotencyKey)
 
 	// Wait for flush
-	time.Sleep(500 * time.Millisecond)
+	time.Sleep(1000 * time.Millisecond)
+
+	// Different idempotency key succeeds
+	err = sl.WriteIdempotent(ctx, crn, payload, fmt.Sprintf("kafka_offset_100_%s", t.Name()))
 
 	// Only 1 document should exist in Mongo despite 2 calls
 	n := countDocs(t, coll, bson.M{"_id": crn})

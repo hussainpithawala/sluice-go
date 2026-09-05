@@ -3,6 +3,7 @@ package unit_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"testing"
 	"time"
 
@@ -174,13 +175,12 @@ func TestWriteIdempotent_ExactlyOnce(t *testing.T) {
 	rc := redisClient(t)
 	ctx := context.Background()
 	cleanRedisKeys(t, rc, ns)
-	t.Cleanup(func() { cleanRedisKeys(t, rc, ns) })
 
 	coll := mongoCollectionForHotTest(t, "idem_docs")
 	sl := buildHotSluice(t, ns, coll)
 	crn := "crn_idem_1"
 	payload := mustHotPayload(t, "idem_val", "sms", 1)
-	idemKey := "kafka_offset_99"
+	idemKey := fmt.Sprintf("kafka_offset_199_%s", t.Name())
 
 	// First write succeeds.
 	err := sl.WriteIdempotent(ctx, crn, payload, idemKey)

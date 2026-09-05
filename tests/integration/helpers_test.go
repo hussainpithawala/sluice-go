@@ -104,24 +104,59 @@ func waitForCount(t *testing.T, coll *mongo.Collection, filter interface{}, expe
 		timeout, 100*time.Millisecond, "expected %d docs in MongoDB within %s", expected, timeout)
 }
 
-// inventoryReadContract fetches the current state from MongoDB to warm up the Redis journal.
-func inventoryReadContract(namespace string) sluice.ReadContract {
-	return func(correlationKey string) ([]byte, error) {
-		ctx := context.Background()
-		client, err := mongo.Connect(ctx, options.Client().ApplyURI(mongoURI()))
-		if err != nil {
-			return nil, err
-		}
-		defer client.Disconnect(ctx)
+// buildHotIntegrationSluice creates a sluice instance configured with Hot/Cold regime,
+// indexing, content deduplication, and a short activity window for fast test execution.
+func buildHotIntegrationSluice(t *testing.T, namespace string) (*sluice.Sluice, *docdb.Sink) {
+	t.Helper()
+	ctx := context.Background()
+	sk, err := docdb.New(ctx, docdb.Config{
+		URI: mongoURI(), Database: "sluice_integration", Collection: namespace,
+		MaxPoolSize: 50, MinPoolSize: 5,
+	})
+	require.NoError(t, err)
 
-		coll := client.Database("sluice_integration").Collection(namespace)
+	// FIX: Instantiate the collection to pass to the ReadContract closure
+	coll := mongoCollection(t, namespace)
+
+	sl, err := sluice.New(namespace).
+		WithRedis(sluice.RedisConfig{Addrs: []string{redisAddr()}, PoolSize: 20}).
+		WithSink(sk).
+		WithWriteContract(inventoryContract).
+		WithReadContract(inventoryReadContract(coll)). // Shared connection pool!
+		WithIndexContract(inventoryIndexContract).
+		WithContentDedup(true).
+		WithActivityWindow(1 * time.Minute). // Short TTL for testing
+		WithIdempotencyTTL(1 * time.Minute).
+		WithHotAwareFlush(true).
+		WithFlushWindow(200 * time.Millisecond).
+		WithMaxBatchSize(500).
+		WithBandCount(4).
+		WithKeyTTL(30 * time.Second).
+		Build(ctx)
+	require.NoError(t, err)
+
+	t.Cleanup(func() {
+		shutCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		_ = sl.DrainAndClose(shutCtx)
+	})
+	return sl, sk
+}
+
+// inventoryReadContract fetches the current state from MongoDB to warm up the Redis journal.
+// It captures the shared *mongo.Collection to avoid opening a new connection per read.
+func inventoryReadContract(coll *mongo.Collection) sluice.ReadContract {
+	return func(correlationKey string) ([]byte, error) {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+
 		var result inventoryPayload
-		err = coll.FindOne(ctx, bson.M{"_id": correlationKey}).Decode(&result)
+		err := coll.FindOne(ctx, bson.M{"_id": correlationKey}).Decode(&result)
 		if err != nil {
 			if err == mongo.ErrNoDocuments {
 				return nil, sluice.ErrRecordNotFound
 			}
-			return nil, err
+			return nil, fmt.Errorf("read contract: lookup %s: %w", correlationKey, err)
 		}
 		return json.Marshal(result)
 	}
@@ -138,39 +173,4 @@ func inventoryIndexContract(_ string, payload []byte) (map[string]interface{}, e
 		"priority":   float64(p.Priority),              // Range index (ZSET)
 		"updated_at": float64(p.UpdatedAt.UnixMilli()), // Range index (ZSET)
 	}, nil
-}
-
-// buildHotIntegrationSluice creates a sluice instance configured with Hot/Cold regime,
-// indexing, content deduplication, and a short activity window for fast test execution.
-func buildHotIntegrationSluice(t *testing.T, namespace string) (*sluice.Sluice, *docdb.Sink) {
-	t.Helper()
-	ctx := context.Background()
-	sk, err := docdb.New(ctx, docdb.Config{
-		URI: mongoURI(), Database: "sluice_integration", Collection: namespace,
-		MaxPoolSize: 50, MinPoolSize: 5,
-	})
-	require.NoError(t, err)
-
-	sl, err := sluice.New(namespace).
-		WithRedis(sluice.RedisConfig{Addrs: []string{redisAddr()}, PoolSize: 20}).
-		WithSink(sk).
-		WithWriteContract(inventoryContract).
-		WithReadContract(inventoryReadContract(namespace)).
-		WithIndexContract(inventoryIndexContract).
-		WithContentDedup(true).
-		WithActivityWindow(1 * time.Minute). // Short TTL for testing
-		WithHotAwareFlush(true).
-		WithFlushWindow(200 * time.Millisecond).
-		WithMaxBatchSize(500).
-		WithBandCount(4).
-		WithKeyTTL(30 * time.Second).
-		Build(ctx)
-	require.NoError(t, err)
-
-	t.Cleanup(func() {
-		shutCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		defer cancel()
-		_ = sl.DrainAndClose(shutCtx)
-	})
-	return sl, sk
 }

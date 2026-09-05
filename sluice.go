@@ -20,7 +20,6 @@ package sluice
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"sync/atomic"
 	"time"
@@ -214,42 +213,45 @@ func (s *Sluice) IsHot(ctx context.Context, correlationKey string) (bool, error)
 	return isHot, err
 }
 
-// HotLoad activates a correlation-key once the read operation is performed, loading it from the sink into the journal.
+// HotLoad warms a CRN and sets the hot marker.
 func (s *Sluice) HotLoad(ctx context.Context, correlationKey string) ([]byte, error) {
-	if s.closed.Load() {
-		return nil, ErrLibraryClosed
-	}
 	if s.cfg.ReadContract == nil {
 		return nil, ErrMissingReadContract
 	}
 
-	t := time.Now()
 	payload, err := s.cfg.ReadContract(correlationKey)
-	s.metrics.RecordWarmUp(s.cfg.Namespace, time.Since(t), err)
 	if err != nil {
 		return nil, err
 	}
 
-	if err := s.shield.HotLoad(ctx, correlationKey, payload); err != nil {
+	if err := s.shield.Write(ctx, correlationKey, payload); err != nil {
 		return nil, err
 	}
+	if err := s.shield.SetHotMarker(ctx, correlationKey, s.cfg.ActivityWindow); err != nil {
+		return nil, err
+	}
+
 	return payload, nil
 }
 
-// Read returns current state from the journal, falling back to ReadContract if cold.
+// Read implements lazy TTL refresh. No goroutines.
 func (s *Sluice) Read(ctx context.Context, correlationKey string) ([]byte, error) {
-	if s.closed.Load() {
-		return nil, ErrLibraryClosed
-	}
-
-	t := time.Now()
-	payload, isHot, err := s.shield.Read(ctx, correlationKey)
-	s.metrics.RecordRead(s.cfg.Namespace, time.Since(t), isHot, err)
+	payload, pttl, err := s.shield.ReadWithTTL(ctx, correlationKey)
 
 	if err == nil && payload != nil {
+		// Lazy refresh: if remaining TTL is < 20% of ActivityWindow, refresh it synchronously.
+		// Dividing a time.Duration by an integer yields a time.Duration.
+		threshold := s.cfg.ActivityWindow / 5
+
+		if pttl > 0 && pttl < threshold {
+			_ = s.shield.SetHotMarker(ctx, correlationKey, s.cfg.ActivityWindow)
+			// Also extend payload TTL
+			_ = s.shield.RefreshHotTTL(ctx, s.shield.BandFor(correlationKey), []string{correlationKey})
+		}
 		return payload, nil
 	}
 
+	// Cold fallback
 	if s.cfg.ReadContract != nil {
 		return s.cfg.ReadContract(correlationKey)
 	}
@@ -260,9 +262,11 @@ func (s *Sluice) Read(ctx context.Context, correlationKey string) ([]byte, error
 // The document store is never touched during Write().
 // Safe for concurrent use from any number of goroutines.
 //
-// When batched writes are enabled, the payload is enqueued to an in-memory
-// buffer and pipelined to Redis by a background goroutine. Volume signaling
-// is handled by the batcher after each pipeline flush. Automatically detects IsHot state.
+// Features orchestrated here:
+//  1. Content Deduplication: Skips dirty-queue insertion if payload hash matches.
+//  2. Index Maintenance: Updates secondary SET/ZSET indexes via pipeline.
+//  3. Hot Regime Signaling: Triggers immediate flush if the CRN is currently hot.
+//  4. Standard Volume Trigger: Falls back to depth-based flush if not hot/batched.
 func (s *Sluice) Write(ctx context.Context, correlationKey string, payload []byte) error {
 	if s.closed.Load() {
 		return ErrLibraryClosed
@@ -271,37 +275,22 @@ func (s *Sluice) Write(ctx context.Context, correlationKey string, payload []byt
 		return ErrEmptyCorrelationKey
 	}
 
-	opts := shield.WriteOptions{}
-
-	// 1. Content Deduplication (xxHash64)
-	if s.cfg.ContentDedup {
-		opts.ContentHash = fmt.Sprintf("%d", xxhash.Sum64(payload))
-		opts.DedupEnabled = true
-	}
-
-	// 2. Index Contract
-	if s.cfg.IndexContract != nil {
-		indexes, err := s.cfg.IndexContract(correlationKey, payload)
-		if err == nil && len(indexes) > 0 {
-			// Convert time.Time to float64 (Unix ms) for Lua cjson compatibility
-			clean := make(map[string]interface{}, len(indexes))
-			for k, v := range indexes {
-				if t, ok := v.(time.Time); ok {
-					clean[k] = float64(t.UnixMilli())
-				} else {
-					clean[k] = v
-				}
-			}
-			if b, err := json.Marshal(clean); err == nil {
-				opts.IndexesJSON = string(b)
-			}
-		}
-	}
-
 	t := time.Now()
-	res, err := s.shield.Write(ctx, correlationKey, payload, opts)
+	var written bool
+	var err error
+
+	// 1. Execute the Redis write (with optional xxHash64 deduplication)
+	if s.cfg.ContentDedup {
+		hash := fmt.Sprintf("%d", xxhash.Sum64(payload))
+		written, err = s.shield.WriteDedup(ctx, correlationKey, payload, hash)
+	} else {
+		written = true
+		err = s.shield.Write(ctx, correlationKey, payload)
+	}
+
 	s.metrics.RecordRedisOp(s.cfg.Namespace, "write", time.Since(t), err)
 
+	// Handle Redis failures via degraded mode or hard error
 	if err != nil {
 		if s.cfg.DegradedModeDirect {
 			return s.degradedWrite(ctx, correlationKey, payload)
@@ -309,19 +298,45 @@ func (s *Sluice) Write(ctx context.Context, correlationKey string, payload []byt
 		return fmt.Errorf("%w: %v", ErrRedisUnavailable, err)
 	}
 
-	if res == 1 {
+	// Only proceed with indexing and signaling if the record was actually
+	// added to the dirty set (i.e., not short-circuited by deduplication).
+	if written {
 		s.metrics.RecordWrite(s.cfg.Namespace)
-	}
-	// If res == 2, it was deduplicated; skip volume signaling
 
-	if !s.cfg.BatchedWrites && res == 1 {
+		// 2. Index maintenance via pipeline (best-effort, Valkey-safe)
+		if s.cfg.IndexContract != nil {
+			indexes, idxErr := s.cfg.IndexContract(correlationKey, payload)
+			if idxErr == nil && len(indexes) > 0 {
+				// We ignore the error here because index maintenance is eventually
+				// consistent and should not block or fail the primary write path.
+				_ = s.shield.UpdateIndexes(ctx, correlationKey, indexes, s.cfg.ActivityWindow)
+			}
+		}
+
+		// 3. Volume signaling (Hot regime vs Standard depth check)
 		band := s.shield.BandFor(correlationKey)
-		if depth, depthErr := s.shield.DirtyQueueDepth(ctx, band); depthErr == nil {
-			if int(depth) >= s.cfg.MaxBatchSize {
+		signaled := false
+
+		if s.cfg.HotAwareFlush {
+			isHot, hotErr := s.shield.IsHot(ctx, correlationKey)
+			if hotErr == nil && isHot {
+				// Hot CRN: signal immediate flush for sub-ms Read() consistency
 				s.engine.SignalVolume(band)
+				signaled = true
+			}
+		}
+
+		// Standard depth-based volume trigger
+		// (skipped if batched writes are enabled, or if hot regime already signaled)
+		if !signaled && !s.cfg.BatchedWrites {
+			if depth, depthErr := s.shield.DirtyQueueDepth(ctx, band); depthErr == nil {
+				if int(depth) >= s.cfg.MaxBatchSize {
+					s.engine.SignalVolume(band)
+				}
 			}
 		}
 	}
+
 	return nil
 }
 

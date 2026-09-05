@@ -235,7 +235,7 @@ func (p *Processor) handleReInsert(ctx context.Context, band int, records []shie
 
 	for _, rec := range records {
 		newKey := p.cfg.KeyMutator(rec.CorrelationKey)
-		if _, err := p.shield.Write(ctx, newKey, rec.Payload, shield.WriteOptions{}); err != nil {
+		if err := p.shield.Write(ctx, newKey, rec.Payload); err != nil {
 			p.cfg.Logger.Warn("dlq: reinsert write failed",
 				"original_key", rec.CorrelationKey,
 				"new_key", newKey,

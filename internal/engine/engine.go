@@ -322,15 +322,16 @@ func (e *Engine) flushBand(ctx context.Context, band int) error {
 
 	// Commit successful keys — ZREM from dirty set.
 	if len(successKeys) > 0 {
-		if commitErr := e.shield.CommitKeys(ctx, band, successKeys); commitErr != nil {
-			// CommitKeys failure is non-fatal: worst case these keys are
-			// re-flushed on the next cycle. Upsert semantics make that safe.
-			e.metrics.RecordRedisOp(e.cfg.Namespace, "commit_keys", 0, commitErr)
-		} else if e.cfg.HotAwareFlush {
-			// HotAwareFlush: extend the TTL of successfully flushed hot CRNs
-			// so they remain in the journal for fast Read() operations.
-			if refreshErr := e.shield.RefreshHotTTL(ctx, band, successKeys); refreshErr != nil {
-				e.metrics.RecordRedisOp(e.cfg.Namespace, "refresh_hot_ttl", 0, refreshErr)
+		if commitErr := e.shield.CommitKeys(ctx, band, successKeys); commitErr == nil {
+			if e.cfg.HotAwareFlush {
+				// Refresh payload TTL
+				_ = e.shield.RefreshHotTTL(ctx, band, successKeys)
+				// Refresh hot markers for any keys that are currently hot
+				for _, ck := range successKeys {
+					if isHot, _ := e.shield.IsHot(ctx, ck); isHot {
+						_ = e.shield.SetHotMarker(ctx, ck, e.cfg.ActivityWindow)
+					}
+				}
 			}
 		}
 	}
