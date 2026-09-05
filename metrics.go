@@ -28,11 +28,6 @@ type MetricsRecorder interface {
 
 type noopMetrics struct{}
 
-func (n *noopMetrics) RecordHotSetSize(namespace string, size int) {
-	//TODO implement me
-	panic("implement me")
-}
-
 func (n *noopMetrics) RecordWrite(_ string)                                            {}
 func (n *noopMetrics) RecordDegradedWrite(_ string, _ error)                           {}
 func (n *noopMetrics) RecordRedisOp(_ string, _ string, _ time.Duration, _ error)      {}
@@ -43,4 +38,5 @@ func (n *noopMetrics) RecordDeadLetter(_ string, _ string, _ int)               
 func (n *noopMetrics) RecordDLQProcess(_ string, _ string, _ int, _ int, _ int)        {}
 func (n *noopMetrics) RecordWarmUp(_ string, _ time.Duration, _ error)                 {}
 func (n *noopMetrics) RecordRead(_ string, _ time.Duration, _ bool, _ error)           {}
-func (n *noopMetrics) RecordHotSize(string, _ int)                                     {}
+func (n *noopMetrics) RecordHotSize(_ string, _ int)                                   {}
+func (n *noopMetrics) RecordHotSetSize(_ string, _ int)                                {}

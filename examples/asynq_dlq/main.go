@@ -153,6 +153,18 @@ func (h *DLQTaskHandler) ProcessTask(ctx context.Context, t *asynq.Task) error {
 // logMetrics registers trace counters.
 type logMetrics struct{ log *slog.Logger }
 
+func (m *logMetrics) RecordWarmUp(namespace string, duration time.Duration, err error) {
+	m.log.Info("warm-up", "ns", namespace, "duration", duration.Milliseconds(), "error", err)
+}
+
+func (m *logMetrics) RecordRead(namespace string, duration time.Duration, isHot bool, err error) {
+	m.log.Info("read", "ns", namespace, "duration", duration.Milliseconds(), "isHot", isHot, "error", err)
+}
+
+func (m *logMetrics) RecordHotSetSize(namespace string, size int) {
+	m.log.Info("hot-set-size", "ns", namespace, "size", size)
+}
+
 func (m *logMetrics) RecordWrite(_ string) {}
 func (m *logMetrics) RecordDegradedWrite(ns string, err error) {
 	m.log.Warn("degraded write", "ns", ns, "err", err)
