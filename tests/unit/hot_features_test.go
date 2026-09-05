@@ -137,34 +137,34 @@ func TestHotLoadAndRead_Regime(t *testing.T) {
 
 	coll := mongoCollectionForHotTest(t, "hot_regime_docs")
 	sl := buildHotSluice(t, ns, coll)
-	crn := "crn_hot_1"
+	correlationKey := "correlationKey_hot_1"
 	payload := mustHotPayload(t, "val1", "push", 5)
 
 	// 1. IsHot should be false initially.
-	isHot, err := sl.IsHot(ctx, crn)
+	isHot, err := sl.IsHot(ctx, correlationKey)
 	require.NoError(t, err)
 	assert.False(t, isHot)
 
 	// 2. Read before HotLoad should fall back to ReadContract (returns ErrRecordNotFound).
-	_, err = sl.Read(ctx, crn)
+	_, err = sl.Read(ctx, correlationKey)
 	assert.ErrorIs(t, err, sluice.ErrRecordNotFound)
 
 	// 3. Write and wait for the flush to Mongo.
-	require.NoError(t, sl.Write(ctx, crn, payload))
+	require.NoError(t, sl.Write(ctx, correlationKey, payload))
 	time.Sleep(200 * time.Millisecond)
 
-	// 4. HotLoad warms up the CRN from Mongo into Redis.
-	hotData, err := sl.HotLoad(ctx, crn)
+	// 4. HotLoad warms up the correlation_key from Mongo into Redis.
+	hotData, err := sl.HotLoad(ctx, correlationKey)
 	require.NoError(t, err)
 	assert.NotEmpty(t, hotData)
 
 	// 5. IsHot should now be true.
-	isHot, err = sl.IsHot(ctx, crn)
+	isHot, err = sl.IsHot(ctx, correlationKey)
 	require.NoError(t, err)
 	assert.True(t, isHot)
 
 	// 6. Read should hit Redis directly.
-	readPayload, err := sl.Read(ctx, crn)
+	readPayload, err := sl.Read(ctx, correlationKey)
 	require.NoError(t, err)
 	assert.Equal(t, hotData, readPayload)
 }
@@ -177,20 +177,20 @@ func TestWriteIdempotent_ExactlyOnce(t *testing.T) {
 
 	coll := mongoCollectionForHotTest(t, "idem_docs")
 	sl := buildHotSluice(t, ns, coll)
-	crn := "crn_idem_1"
+	correlationKey := "correlationKey_idem_1"
 	payload := mustHotPayload(t, "idem_val", "sms", 1)
 	idemKey := fmt.Sprintf("kafka_offset_199_%s", t.Name())
 
 	// First write succeeds.
-	err := sl.WriteIdempotent(ctx, crn, payload, idemKey)
+	err := sl.WriteIdempotent(ctx, correlationKey, payload, idemKey)
 	require.NoError(t, err)
 
 	// Second write with the same idempotency key is rejected.
-	err = sl.WriteIdempotent(ctx, crn, payload, idemKey)
+	err = sl.WriteIdempotent(ctx, correlationKey, payload, idemKey)
 	assert.ErrorIs(t, err, sluice.ErrDuplicateIdempotencyKey)
 
 	// A different idempotency key succeeds.
-	err = sl.WriteIdempotent(ctx, crn, payload, "kafka_offset_100")
+	err = sl.WriteIdempotent(ctx, correlationKey, payload, "kafka_offset_100")
 	require.NoError(t, err)
 }
 
@@ -203,17 +203,17 @@ func TestContentDedup_SkipsRedundantWrites(t *testing.T) {
 
 	coll := mongoCollectionForHotTest(t, "dedup_docs")
 	sl := buildHotSluice(t, ns, coll)
-	crn := "crn_dedup_1"
+	correlationKey := "correlationKey_dedup_1"
 	payload := mustHotPayload(t, "dedup_val", "email", 2)
 
 	// First write.
-	require.NoError(t, sl.Write(ctx, crn, payload))
+	require.NoError(t, sl.Write(ctx, correlationKey, payload))
 
 	// Wait briefly, then write the exact same payload again.
 	// Because ContentDedup is enabled, the xxHash64 fingerprint matches,
 	// the Lua script returns 2, and the key is not added to the dirty queue again.
 	time.Sleep(50 * time.Millisecond)
-	require.NoError(t, sl.Write(ctx, crn, payload))
+	require.NoError(t, sl.Write(ctx, correlationKey, payload))
 
 	// Check the dirty queue depth across all bands. It should be at most 1
 	// (or 0 if already flushed). It must not be 2.
@@ -240,9 +240,9 @@ func TestQuery_CompoundIndexes(t *testing.T) {
 	p2 := mustHotPayload(t, "v2", "sms", 5)
 	p3 := mustHotPayload(t, "v3", "push", 3)
 
-	require.NoError(t, sl.Write(ctx, "crn_q1", p1))
-	require.NoError(t, sl.Write(ctx, "crn_q2", p2))
-	require.NoError(t, sl.Write(ctx, "crn_q3", p3))
+	require.NoError(t, sl.Write(ctx, "correlationKey_q1", p1))
+	require.NoError(t, sl.Write(ctx, "correlationKey_q2", p2))
+	require.NoError(t, sl.Write(ctx, "correlationKey_q3", p3))
 
 	// Wait for the flush cycle to process indexes and persist to MongoDB.
 	time.Sleep(300 * time.Millisecond)
@@ -254,7 +254,7 @@ func TestQuery_CompoundIndexes(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	// Should find crn_q3 (priority 3) but not crn_q1 (priority 1).
+	// Should find correlationKey_q3 (priority 3) but not correlationKey_q1 (priority 1).
 	assert.Len(t, results, 1)
-	assert.Equal(t, "crn_q3", results[0].CorrelationKey)
+	assert.Equal(t, "correlationKey_q3", results[0].CorrelationKey)
 }

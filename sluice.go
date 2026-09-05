@@ -62,7 +62,7 @@ func (b *Builder) WithKeyTTL(d time.Duration) *Builder         { b.cfg.KeyTTL = 
 func (b *Builder) WithDegradedModeDirect(v bool) *Builder      { b.cfg.DegradedModeDirect = v; return b }
 func (b *Builder) WithMetrics(m MetricsRecorder) *Builder      { b.cfg.Metrics = m; return b }
 
-// WithActivityWindow sets the TTL for hot CRN sessions.
+// WithActivityWindow sets the TTL for hot correlation_key sessions.
 // Active users remain in the Redis journal for this duration. Default is 4 hours.
 func (b *Builder) WithActivityWindow(d time.Duration) *Builder {
 	b.cfg.ActivityWindow = d
@@ -70,7 +70,7 @@ func (b *Builder) WithActivityWindow(d time.Duration) *Builder {
 }
 
 // WithHotAwareFlush enables post-commit TTL extension. When true, successfully
-// flushed hot CRNs have their ActivityWindow TTL refreshed, keeping them in the journal.
+// flushed hot correlation_keys have their ActivityWindow TTL refreshed, keeping them in the journal.
 func (b *Builder) WithHotAwareFlush(v bool) *Builder {
 	b.cfg.HotAwareFlush = v
 	return b
@@ -150,8 +150,8 @@ func (b *Builder) Build(ctx context.Context) (*Sluice, error) {
 		}
 	}
 	// Wrap contract to convert public WriteModel to sink.WriteModel
-	wrappedContract := func(crn string, payload []byte) (*sink.WriteModel, error) {
-		wm, err := b.contract(crn, payload)
+	wrappedContract := func(correlationKey string, payload []byte) (*sink.WriteModel, error) {
+		wm, err := b.contract(correlationKey, payload)
 		if err != nil {
 			return nil, err
 		}
@@ -223,8 +223,8 @@ func (s *Sluice) IsHot(ctx context.Context, correlationKey string) (bool, error)
 }
 
 // Read returns current state from the journal.
-// Hot CRN: sub-millisecond Redis read with lazy TTL refresh.
-// Cold CRN: falls back to the configured Source via ReadContract.
+// Hot correlation_key: sub-millisecond Redis read with lazy TTL refresh.
+// Cold correlation_key: falls back to the configured Source via ReadContract.
 func (s *Sluice) Read(ctx context.Context, correlationKey string) ([]byte, error) {
 	if s.closed.Load() {
 		return nil, ErrLibraryClosed
@@ -273,7 +273,7 @@ func (s *Sluice) Read(ctx context.Context, correlationKey string) ([]byte, error
 	return nil, ErrRecordNotFound
 }
 
-// HotLoad activates a CRN on user login.
+// HotLoad activates a correlation_key on user login.
 // Loads the document from the Source into the Redis journal and sets the hot marker.
 func (s *Sluice) HotLoad(ctx context.Context, correlationKey string) ([]byte, error) {
 	if s.closed.Load() {
@@ -321,7 +321,7 @@ func (s *Sluice) HotLoad(ctx context.Context, correlationKey string) ([]byte, er
 // Features orchestrated here:
 //  1. Content Deduplication: Skips dirty-queue insertion if payload hash matches.
 //  2. Index Maintenance: Updates secondary SET/ZSET indexes via pipeline.
-//  3. Hot Regime Signaling: Triggers immediate flush if the CRN is currently hot.
+//  3. Hot Regime Signaling: Triggers immediate flush if the correlation_key is currently hot.
 //  4. Standard Volume Trigger: Falls back to depth-based flush if not hot/batched.
 func (s *Sluice) Write(ctx context.Context, correlationKey string, payload []byte) error {
 	if s.closed.Load() {
@@ -376,7 +376,7 @@ func (s *Sluice) Write(ctx context.Context, correlationKey string, payload []byt
 		if s.cfg.HotAwareFlush {
 			isHot, hotErr := s.shield.IsHot(ctx, correlationKey)
 			if hotErr == nil && isHot {
-				// Hot CRN: signal immediate flush for sub-ms Read() consistency
+				// Hot correlation_key: signal immediate flush for sub-ms Read() consistency
 				s.engine.SignalVolume(band)
 				signaled = true
 			}
@@ -532,8 +532,8 @@ func (s *Sluice) ProcessDLQ(ctx context.Context, strategy DLQStrategy, opts ...D
 	}
 
 	// Wrap the public WriteContract to produce sink.WriteModel.
-	wrappedContract := func(crn string, payload []byte) (*sink.WriteModel, error) {
-		wm, err := s.contract(crn, payload)
+	wrappedContract := func(correlationKey string, payload []byte) (*sink.WriteModel, error) {
+		wm, err := s.contract(correlationKey, payload)
 		if err != nil {
 			return nil, err
 		}

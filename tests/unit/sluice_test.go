@@ -91,7 +91,7 @@ func TestWrite_UniqueKeys(t *testing.T) {
 	const n = 500
 	sl, _ := buildSluice(t)
 	for i := 0; i < n; i++ {
-		key := fmt.Sprintf("crn_%06d", i)
+		key := fmt.Sprintf("correlationKey_%06d", i)
 		require.NoError(t, sl.Write(context.Background(), key, mustPayload(t, key)))
 	}
 }
@@ -99,7 +99,7 @@ func TestWrite_UniqueKeys(t *testing.T) {
 func TestWrite_DeduplicatesSameKey(t *testing.T) {
 	sl, _ := buildSluice(t)
 	for i := 0; i < 50; i++ {
-		require.NoError(t, sl.Write(context.Background(), "crn_same", mustPayload(t, fmt.Sprintf("v%d", i))))
+		require.NoError(t, sl.Write(context.Background(), "correlationKey_same", mustPayload(t, fmt.Sprintf("v%d", i))))
 	}
 }
 
@@ -112,7 +112,7 @@ func TestWrite_ConcurrentSafety(t *testing.T) {
 		go func(gID int) {
 			defer wg.Done()
 			for i := 0; i < writesEach; i++ {
-				_ = sl.Write(context.Background(), fmt.Sprintf("crn_g%d_i%d", gID, i), mustPayload(t, "v"))
+				_ = sl.Write(context.Background(), fmt.Sprintf("correlationKey_g%d_i%d", gID, i), mustPayload(t, "v"))
 			}
 		}(g)
 	}

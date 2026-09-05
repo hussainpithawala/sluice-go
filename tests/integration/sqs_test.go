@@ -22,8 +22,8 @@ import (
 )
 
 type sqsEvent struct {
-	CRN           string `json:"crn"`
-	NudgeMasterID string `json:"nudge_master_id"`
+	correlation_key string `json:"correlationKey"`
+	NudgeMasterID   string `json:"nudge_master_id"`
 }
 
 func newLocalStackSQS(t *testing.T) *sqs.Client {
@@ -58,8 +58,8 @@ func publishSQSMessages(t *testing.T, client *sqs.Client, queueURL string, n int
 		}
 		entries := make([]types.SendMessageBatchRequestEntry, 0, end-start)
 		for i := start; i < end; i++ {
-			crn := fmt.Sprintf("crn_sqs_%07d", i)
-			body, _ := json.Marshal(sqsEvent{CRN: crn, NudgeMasterID: nudgeMasterID})
+			correlationKey := fmt.Sprintf("correlationKey_sqs_%07d", i)
+			body, _ := json.Marshal(sqsEvent{correlation_key: correlationKey, NudgeMasterID: nudgeMasterID})
 			entries = append(entries, types.SendMessageBatchRequestEntry{
 				Id: aws.String(fmt.Sprintf("msg_%d", i)), MessageBody: aws.String(string(body)),
 			})
@@ -96,7 +96,7 @@ func runSQSConsumer(ctx context.Context, t *testing.T, client *sqs.Client, queue
 			if err := json.Unmarshal([]byte(*msg.Body), &evt); err != nil {
 				continue
 			}
-			if writeErr := sl.Write(ctx, evt.CRN, makePayload(evt.NudgeMasterID)); writeErr == nil {
+			if writeErr := sl.Write(ctx, evt.correlation_key, makePayload(evt.NudgeMasterID)); writeErr == nil {
 				processed.Add(1)
 			}
 			_, _ = client.DeleteMessage(ctx, &sqs.DeleteMessageInput{QueueUrl: aws.String(queueURL), ReceiptHandle: msg.ReceiptHandle})

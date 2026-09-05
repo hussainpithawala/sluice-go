@@ -19,7 +19,7 @@ type Config struct {
 	FlushWindow    time.Duration
 	MaxBatchSize   int
 	KeyTTL         time.Duration // In-flight dirty key TTL
-	ActivityWindow time.Duration // Hot CRN session TTL
+	ActivityWindow time.Duration // Hot correlation_key session TTL
 	HotAwareFlush  bool          // Extend TTL on successful commit
 }
 
@@ -39,7 +39,7 @@ type MetricsRecorder interface {
 type WriteContract func(correlationKey string, payload []byte) (*sink.WriteModel, error)
 
 // ReadContract loads the current payload for a correlation key from the
-// backing sink/document store. It is used by the hot/cold regime when a CRN
+// backing sink/document store. It is used by the hot/cold regime when a correlation_key
 // is cold and must be warmed into Redis.
 type ReadContract func(correlationKey string) ([]byte, error)
 

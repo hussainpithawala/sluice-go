@@ -756,7 +756,7 @@ func (s *Shield) runBatcher() {
 	}
 }
 
-// RefreshHotTTL extends the ActivityWindow TTL on successfully flushed hot CRNs.
+// RefreshHotTTL extends the ActivityWindow TTL on successfully flushed hot correlation_keys.
 // This ensures active users remain in the fast-path journal for subsequent Read() calls.
 func (s *Shield) RefreshHotTTL(ctx context.Context, band int, corrKeys []string) error {
 	if len(corrKeys) == 0 {

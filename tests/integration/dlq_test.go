@@ -403,10 +403,10 @@ func TestProcessDLQ_AfterClose(t *testing.T) {
 // TestProcessDLQ_ReInsert_DefaultMutator verifies that the default key
 // mutator produces unique keys with a recognizable suffix pattern.
 func TestProcessDLQ_ReInsert_DefaultMutator(t *testing.T) {
-	key1 := sluice.DefaultKeyMutator("crn_123")
-	key2 := sluice.DefaultKeyMutator("crn_123")
+	key1 := sluice.DefaultKeyMutator("correlationKey_123")
+	key2 := sluice.DefaultKeyMutator("correlationKey_123")
 
-	assert.Contains(t, key1, "crn_123_dlq_")
-	assert.Contains(t, key2, "crn_123_dlq_")
+	assert.Contains(t, key1, "correlationKey_123_dlq_")
+	assert.Contains(t, key2, "correlationKey_123_dlq_")
 	assert.NotEqual(t, key1, key2, "default mutator should produce unique keys")
 }

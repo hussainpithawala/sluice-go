@@ -49,7 +49,7 @@ type Config struct {
 	FlushWindow        time.Duration
 	MaxBatchSize       int
 	KeyTTL             time.Duration // In-flight dirty key TTL
-	ActivityWindow     time.Duration // Hot CRN session TTL (default 4h)
+	ActivityWindow     time.Duration // Hot correlation_key session TTL (default 4h)
 	DegradedModeDirect bool
 	HotAwareFlush      bool          // Extend TTL on successful commit
 	ContentDedup       bool          // Enable xxHash64 payload deduplication

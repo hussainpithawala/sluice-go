@@ -65,13 +65,13 @@ type NudgeInventoryPayload struct {
 
 // ─── WriteContract ───────────────────────────────────────────────────────────
 
-func nudgeWriteContract(crn string, rawPayload []byte) (*sluice.WriteModel, error) {
+func nudgeWriteContract(correlationKey string, rawPayload []byte) (*sluice.WriteModel, error) {
 	var p NudgeInventoryPayload
 	if err := json.Unmarshal(rawPayload, &p); err != nil {
-		return nil, fmt.Errorf("nudge contract: invalid payload for CRN %s: %w", crn, err)
+		return nil, fmt.Errorf("nudge contract: invalid payload for correlation_key %s: %w", correlationKey, err)
 	}
 	return &sluice.WriteModel{
-		Filter: bson.D{{Key: "_id", Value: crn}},
+		Filter: bson.D{{Key: "_id", Value: correlationKey}},
 		Update: bson.D{{Key: "$set", Value: bson.D{
 			{Key: "nudge_master_id", Value: p.NudgeMasterID},
 			{Key: "channel", Value: p.Channel},
@@ -85,13 +85,13 @@ func nudgeWriteContract(crn string, rawPayload []byte) (*sluice.WriteModel, erro
 }
 
 // ─── ReadContract ────────────────────────────────────────────────────────────
-// ReadContract loads the current state of a CRN from DocumentDB.
+// ReadContract loads the current state of a correlation_key from DocumentDB.
 // Used by HotLoad() to warm the Redis journal on user login,
 // and by Read() as a cold-path fallback.
 
-func nudgeReadContract(crn string) (*source.ReadModel, error) {
+func nudgeReadContract(correlationKey string) (*source.ReadModel, error) {
 	return &source.ReadModel{
-		Filter: bson.M{"_id": crn},
+		Filter: bson.M{"_id": correlationKey},
 	}, nil
 }
 
@@ -104,10 +104,10 @@ func nudgeReadContract(crn string) (*source.ReadModel, error) {
 //
 // These indexes enable Query() for compound lookups without touching DocumentDB.
 
-func nudgeIndexContract(crn string, payload []byte) (map[string]interface{}, error) {
+func nudgeIndexContract(correlationKey string, payload []byte) (map[string]interface{}, error) {
 	var p NudgeInventoryPayload
 	if err := json.Unmarshal(payload, &p); err != nil {
-		return nil, fmt.Errorf("index contract: invalid payload for CRN %s: %w", crn, err)
+		return nil, fmt.Errorf("index contract: invalid payload for correlation_key %s: %w", correlationKey, err)
 	}
 	return map[string]interface{}{
 		"channel":  p.Channel,                        // equality: SET sl:{ns}:idx:{band}:channel:push
@@ -138,8 +138,8 @@ func (m *logMetrics) RecordDirtyQueueDepth(ns, band string, depth int) {
 		m.log.Warn("dirty queue depth", "ns", ns, "band", band, "depth", depth)
 	}
 }
-func (m *logMetrics) RecordContractError(ns, crn string, err error) {
-	m.log.Error("contract error", "ns", ns, "crn", crn, "err", err)
+func (m *logMetrics) RecordContractError(ns, correlationKey string, err error) {
+	m.log.Error("contract error", "ns", ns, "correlationKey", correlationKey, "err", err)
 }
 func (m *logMetrics) RecordDeadLetter(ns, band string, count int) {
 	m.log.Warn("dead-letter", "ns", ns, "band", band, "count", count)
@@ -175,7 +175,7 @@ func simulatedConsumer(ctx context.Context, workerID int, sl *sluice.Sluice, log
 		case <-ticker.C:
 			for burst := 0; burst < 10; burst++ {
 				seq := written.Add(1)
-				crn := fmt.Sprintf("crn_%09d", (workerID*1_000_000)+int(seq%2_000_000))
+				correlationKey := fmt.Sprintf("correlationKey_%09d", (workerID*1_000_000)+int(seq%2_000_000))
 				payload, _ := json.Marshal(NudgeInventoryPayload{
 					NudgeMasterID: nudgeMasters[seq%int64(len(nudgeMasters))],
 					Channel:       channels[seq%int64(len(channels))],
@@ -184,8 +184,8 @@ func simulatedConsumer(ctx context.Context, workerID int, sl *sluice.Sluice, log
 					ExpiresAt:     time.Now().Add(24 * time.Hour),
 					LastUpdated:   time.Now().UTC(),
 				})
-				if err := sl.Write(ctx, crn, payload); err != nil {
-					log.Error("write error", "crn", crn, "err", err)
+				if err := sl.Write(ctx, correlationKey, payload); err != nil {
+					log.Error("write error", "correlationKey", correlationKey, "err", err)
 				}
 			}
 		}
@@ -193,11 +193,11 @@ func simulatedConsumer(ctx context.Context, workerID int, sl *sluice.Sluice, log
 }
 
 // ─── Hot Regime: Simulated User Sessions ─────────────────────────────────────
-// Demonstrates the full hot CRN lifecycle:
+// Demonstrates the full hot correlation_key lifecycle:
 //   1. User logs in → HotLoad() warms the journal from DocumentDB.
 //   2. User action  → Write() updates the live journal.
 //   3. Sync HTTP    → Read() returns immediately from Redis (sub-ms).
-//   4. Observability → IsHot() confirms the CRN is in the hot set.
+//   4. Observability → IsHot() confirms the correlation_key is in the hot set.
 
 func hotRegimeSimulator(ctx context.Context, sl *sluice.Sluice, log *slog.Logger, wg *sync.WaitGroup) {
 	defer wg.Done()
@@ -211,23 +211,23 @@ func hotRegimeSimulator(ctx context.Context, sl *sluice.Sluice, log *slog.Logger
 			return
 		case <-ticker.C:
 			sessionCount++
-			crn := fmt.Sprintf("crn_hot_%06d", sessionCount)
-			log.Info("── hot regime: simulating user login ──", "crn", crn, "session", sessionCount)
+			correlationKey := fmt.Sprintf("correlationKey_hot_%06d", sessionCount)
+			log.Info("── hot regime: simulating user login ──", "correlationKey", correlationKey, "session", sessionCount)
 
-			// Step 1: Check if CRN is hot before login.
-			isHot, err := sl.IsHot(ctx, crn)
+			// Step 1: Check if correlation_key is hot before login.
+			isHot, err := sl.IsHot(ctx, correlationKey)
 			if err != nil {
-				log.Error("hot regime: IsHot failed", "crn", crn, "err", err)
+				log.Error("hot regime: IsHot failed", "correlationKey", correlationKey, "err", err)
 				continue
 			}
-			log.Info("hot regime: pre-login state", "crn", crn, "is_hot", isHot)
+			log.Info("hot regime: pre-login state", "correlationKey", correlationKey, "is_hot", isHot)
 
 			// Step 2: HotLoad — simulates user login.
 			// Loads collections from DocumentDB into the Redis journal.
-			payload, err := sl.HotLoad(ctx, crn)
+			payload, err := sl.HotLoad(ctx, correlationKey)
 			if err != nil {
-				// Expected for brand-new CRNs that don't exist in DocumentDB yet.
-				log.Info("hot regime: HotLoad (new CRN, writing directly)", "crn", crn, "err", err)
+				// Expected for brand-new correlation_keys that don't exist in DocumentDB yet.
+				log.Info("hot regime: HotLoad (new correlation_key, writing directly)", "correlationKey", correlationKey, "err", err)
 
 				// Write directly for new users (cold → hot transition).
 				newPayload, _ := json.Marshal(NudgeInventoryPayload{
@@ -238,21 +238,21 @@ func hotRegimeSimulator(ctx context.Context, sl *sluice.Sluice, log *slog.Logger
 					ExpiresAt:     time.Now().Add(48 * time.Hour),
 					LastUpdated:   time.Now().UTC(),
 				})
-				if writeErr := sl.Write(ctx, crn, newPayload); writeErr != nil {
-					log.Error("hot regime: Write failed", "crn", crn, "err", writeErr)
+				if writeErr := sl.Write(ctx, correlationKey, newPayload); writeErr != nil {
+					log.Error("hot regime: Write failed", "correlationKey", correlationKey, "err", writeErr)
 				}
 				payload = newPayload
 			} else {
-				log.Info("hot regime: HotLoad success (warmed from DocumentDB)", "crn", crn, "payload_bytes", len(payload))
+				log.Info("hot regime: HotLoad success (warmed from DocumentDB)", "correlationKey", correlationKey, "payload_bytes", len(payload))
 			}
 
-			// Step 3: Confirm CRN is now hot.
-			isHot, err = sl.IsHot(ctx, crn)
+			// Step 3: Confirm correlation_key is now hot.
+			isHot, err = sl.IsHot(ctx, correlationKey)
 			if err != nil {
-				log.Error("hot regime: IsHot after load failed", "crn", crn, "err", err)
+				log.Error("hot regime: IsHot after load failed", "correlationKey", correlationKey, "err", err)
 				continue
 			}
-			log.Info("hot regime: post-login state", "crn", crn, "is_hot", isHot)
+			log.Info("hot regime: post-login state", "correlationKey", correlationKey, "is_hot", isHot)
 
 			// Step 4: User action — update the live journal.
 			// This simulates a banner dismissal or in-app action.
@@ -262,31 +262,31 @@ func hotRegimeSimulator(ctx context.Context, sl *sluice.Sluice, log *slog.Logger
 			current.LastUpdated = time.Now().UTC()
 			updatedPayload, _ := json.Marshal(current)
 
-			if err := sl.Write(ctx, crn, updatedPayload); err != nil {
-				log.Error("hot regime: user action Write failed", "crn", crn, "err", err)
+			if err := sl.Write(ctx, correlationKey, updatedPayload); err != nil {
+				log.Error("hot regime: user action Write failed", "correlationKey", correlationKey, "err", err)
 				continue
 			}
 
 			// Step 5: Sync HTTP response — Read() returns immediately from Redis.
 			// This is the key insight: the app reads from the journal, not DocumentDB.
 			readStart := time.Now()
-			readPayload, err := sl.Read(ctx, crn)
+			readPayload, err := sl.Read(ctx, correlationKey)
 			readLatency := time.Since(readStart)
 			if err != nil {
-				log.Error("hot regime: Read failed", "crn", crn, "err", err)
+				log.Error("hot regime: Read failed", "correlationKey", correlationKey, "err", err)
 				continue
 			}
 
 			var readResult NudgeInventoryPayload
 			_ = json.Unmarshal(readPayload, &readResult)
 			log.Info("hot regime: sync HTTP response served from journal",
-				"crn", crn,
+				"correlationKey", correlationKey,
 				"read_latency_us", readLatency.Microseconds(),
 				"priority", readResult.Priority,
 				"channel", readResult.Channel,
 			)
 
-			// Step 6: Demonstrate Query() — find all hot CRNs with channel=push AND priority >= 3.
+			// Step 6: Demonstrate Query() — find all hot correlation_keys with channel=push AND priority >= 3.
 			if sessionCount%5 == 0 {
 				results, queryErr := sl.Query(ctx, sluice.Query{
 					Equality: map[string]string{"channel": "push"},
@@ -303,7 +303,7 @@ func hotRegimeSimulator(ctx context.Context, sl *sluice.Sluice, log *slog.Logger
 						if i >= 3 {
 							break // only log first 3 matches
 						}
-						log.Info("hot regime: query match", "crn", r.CorrelationKey, "payload_bytes", len(r.Payload))
+						log.Info("hot regime: query match", "correlationKey", r.CorrelationKey, "payload_bytes", len(r.Payload))
 					}
 				}
 			}
@@ -380,20 +380,20 @@ func run(log *slog.Logger) (err error) {
 		WithMaxBatchSize(1000).
 		WithBandCount(bandCount).
 		WithKeyTTL(30 * time.Second).
-		WithActivityWindow(4 * time.Hour). // ← Hot CRN session TTL
+		WithActivityWindow(4 * time.Hour). // ← Hot correlation_key session TTL
 		WithHotAwareFlush(true).           // ← Extend TTL after successful flush
 		WithContentDedup(true).            // ← xxHash64 deduplication
 		WithDegradedModeDirect(true).
 		WithMetrics(&logMetrics{log: log}).
-		OnFlush(func(crns []string, result *sluice.BulkWriteResult, err error) {
+		OnFlush(func(correlation_keys []string, result *sluice.BulkWriteResult, err error) {
 			if err != nil {
-				log.Error("flush failed", "crns", len(crns), "err", err)
+				log.Error("flush failed", "correlation_keys", len(correlation_keys), "err", err)
 				return
 			}
 			for _, se := range result.Errors {
-				log.Warn("partial write failure", "crn", se.CorrelationKey, "err", se.Err)
+				log.Warn("partial write failure", "correlationKey", se.CorrelationKey, "err", se.Err)
 			}
-			log.Debug("flush complete", "crns", len(crns), "upserted", result.UpsertedCount, "modified", result.ModifiedCount)
+			log.Debug("flush complete", "correlation_keys", len(correlation_keys), "upserted", result.UpsertedCount, "modified", result.ModifiedCount)
 		}).
 		Build(ctx)
 	if err != nil {

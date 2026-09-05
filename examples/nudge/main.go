@@ -58,13 +58,13 @@ type NudgeInventoryPayload struct {
 	LastUpdated   time.Time `json:"last_updated"`
 }
 
-func nudgeWriteContract(crn string, rawPayload []byte) (*sluice.WriteModel, error) {
+func nudgeWriteContract(correlationKey string, rawPayload []byte) (*sluice.WriteModel, error) {
 	var p NudgeInventoryPayload
 	if err := json.Unmarshal(rawPayload, &p); err != nil {
-		return nil, fmt.Errorf("nudge contract: invalid payload for CRN %s: %w", crn, err)
+		return nil, fmt.Errorf("nudge contract: invalid payload for correlation_key %s: %w", correlationKey, err)
 	}
 	return &sluice.WriteModel{
-		Filter: bson.D{{Key: "_id", Value: crn}},
+		Filter: bson.D{{Key: "_id", Value: correlationKey}},
 		Update: bson.D{{Key: "$set", Value: bson.D{
 			{Key: "nudge_master_id", Value: p.NudgeMasterID},
 			{Key: "channel", Value: p.Channel},
@@ -108,8 +108,8 @@ func (m *logMetrics) RecordDirtyQueueDepth(ns, band string, depth int) {
 		m.log.Warn("dirty queue depth", "ns", ns, "band", band, "depth", depth)
 	}
 }
-func (m *logMetrics) RecordContractError(ns, crn string, err error) {
-	m.log.Error("contract error", "ns", ns, "crn", crn, "err", err)
+func (m *logMetrics) RecordContractError(ns, correlationKey string, err error) {
+	m.log.Error("contract error", "ns", ns, "correlationKey", correlationKey, "err", err)
 }
 func (m *logMetrics) RecordDeadLetter(ns, band string, count int) {
 	m.log.Warn("dead-letter", "ns", ns, "band", band, "count", count)
@@ -131,7 +131,7 @@ func simulatedConsumer(ctx context.Context, workerID int, sl *sluice.Sluice, log
 		case <-ticker.C:
 			for burst := 0; burst < 10; burst++ {
 				seq := written.Add(1)
-				crn := fmt.Sprintf("crn_%09d", (workerID*1_000_000)+int(seq%2_000_000))
+				correlationKey := fmt.Sprintf("correlationKey_%09d", (workerID*1_000_000)+int(seq%2_000_000))
 				payload, _ := json.Marshal(NudgeInventoryPayload{
 					NudgeMasterID: nudgeMasters[seq%int64(len(nudgeMasters))],
 					Channel:       channels[seq%int64(len(channels))],
@@ -140,8 +140,8 @@ func simulatedConsumer(ctx context.Context, workerID int, sl *sluice.Sluice, log
 					ExpiresAt:     time.Now().Add(24 * time.Hour),
 					LastUpdated:   time.Now().UTC(),
 				})
-				if err := sl.Write(ctx, crn, payload); err != nil {
-					log.Error("write error", "crn", crn, "err", err)
+				if err := sl.Write(ctx, correlationKey, payload); err != nil {
+					log.Error("write error", "correlationKey", correlationKey, "err", err)
 				}
 			}
 		}
@@ -212,15 +212,15 @@ func run(log *slog.Logger) (err error) {
 		WithFlushWindow(250 * time.Millisecond).WithMaxBatchSize(1000).
 		WithBandCount(bandCount).WithKeyTTL(30 * time.Second).WithDegradedModeDirect(true).
 		WithMetrics(&logMetrics{log: log}).
-		OnFlush(func(crns []string, result *sluice.BulkWriteResult, err error) {
+		OnFlush(func(correlation_keys []string, result *sluice.BulkWriteResult, err error) {
 			if err != nil {
-				log.Error("flush failed", "crns", len(crns), "err", err)
+				log.Error("flush failed", "correlation_keys", len(correlation_keys), "err", err)
 				return
 			}
 			for _, se := range result.Errors {
-				log.Warn("partial write failure", "crn", se.CorrelationKey, "err", se.Err)
+				log.Warn("partial write failure", "correlationKey", se.CorrelationKey, "err", se.Err)
 			}
-			log.Debug("flush complete", "crns", len(crns), "upserted", result.UpsertedCount, "modified", result.ModifiedCount)
+			log.Debug("flush complete", "correlation_keys", len(correlation_keys), "upserted", result.UpsertedCount, "modified", result.ModifiedCount)
 		}).Build(ctx)
 	if err != nil {
 		// Build did not take ownership of the sink, so close it here. On the

@@ -18,9 +18,9 @@ import (
 )
 
 type kafkaEvent struct {
-	CRN           string `json:"crn"`
-	NudgeMasterID string `json:"nudge_master_id"`
-	SequenceNo    int    `json:"seq"`
+	correlation_key string `json:"correlationKey"`
+	NudgeMasterID   string `json:"nudge_master_id"`
+	SequenceNo      int    `json:"seq"`
 }
 
 /*
@@ -97,9 +97,9 @@ func publishKafkaMessages(t *testing.T, w *kafka.Writer, n int, nudgeMasterID st
 	ctx := context.Background()
 	msgs := make([]kafka.Message, 0, n)
 	for i := 0; i < n; i++ {
-		crn := fmt.Sprintf("crn_kafka_%07d", i)
-		body, _ := json.Marshal(kafkaEvent{CRN: crn, NudgeMasterID: nudgeMasterID, SequenceNo: i})
-		msgs = append(msgs, kafka.Message{Key: []byte(crn), Value: body})
+		correlationKey := fmt.Sprintf("correlationKey_kafka_%07d", i)
+		body, _ := json.Marshal(kafkaEvent{correlation_key: correlationKey, NudgeMasterID: nudgeMasterID, SequenceNo: i})
+		msgs = append(msgs, kafka.Message{Key: []byte(correlationKey), Value: body})
 	}
 	for start := 0; start < len(msgs); start += 200 {
 		end := start + 200
@@ -128,7 +128,7 @@ func runKafkaConsumer(ctx context.Context, t *testing.T, reader *kafka.Reader,
 			_ = reader.CommitMessages(ctx, msg)
 			continue
 		}
-		if writeErr := sl.Write(ctx, evt.CRN, makePayload(evt.NudgeMasterID)); writeErr == nil {
+		if writeErr := sl.Write(ctx, evt.correlation_key, makePayload(evt.NudgeMasterID)); writeErr == nil {
 			processed.Add(1)
 		}
 		_ = reader.CommitMessages(ctx, msg)

@@ -47,8 +47,8 @@ Background goroutines drain the journal in configurable windows and assemble eff
 ```mermaid
 flowchart TD
     SQS(["SQS Queue"])
-    KAF(["Kafka Topics — partitioned by CRN hash"])
-    CON["Consumer Workers — stateless, CRN-hash routed"]
+    KAF(["Kafka Topics — partitioned by correlation_key hash"])
+    CON["Consumer Workers — stateless, correlation_key-hash routed"]
     RED[("Redis Cluster — Velocity Shield")]
     ENG["Batch Flusher Engine — 16 bands, 250ms window"]
     DB[("AWS DocumentDB — Long-Term Store")]
@@ -104,30 +104,30 @@ giving natural ordering and a staleness bound equal to `FlushWindow`.
 
 ## The coalescing mechanism
 
-Because `ZADD` on an existing member only updates the score, multiple events for the same CRN
+Because `ZADD` on an existing member only updates the score, multiple events for the same correlation_key
 collapse to **one dirty-set entry**. The `HSET` keeps the latest payload.
 
 ```mermaid
 flowchart LR
     subgraph IN ["Events arriving (100K/sec)"]
-        E1["crn_001 event 1"]
-        E2["crn_002 event 1"]
-        E3["crn_001 event 2"]
-        E4["crn_003 event 1"]
-        E5["crn_001 event 3"]
-        E6["crn_002 event 2"]
+        E1["correlationKey_001 event 1"]
+        E2["correlationKey_002 event 1"]
+        E3["correlationKey_001 event 2"]
+        E4["correlationKey_003 event 1"]
+        E5["correlationKey_001 event 3"]
+        E6["correlationKey_002 event 2"]
     end
 
     subgraph RDS ["Redis dirty set after 250ms"]
-        D1["crn_001 — score = latest ts"]
-        D2["crn_002 — score = latest ts"]
-        D3["crn_003 — score = ts"]
+        D1["correlationKey_001 — score = latest ts"]
+        D2["correlationKey_002 — score = latest ts"]
+        D3["correlationKey_003 — score = ts"]
     end
 
     subgraph BW ["DocumentDB BulkWrite — 1 call"]
-        B1[upsert crn_001]
-        B2[upsert crn_002]
-        B3[upsert crn_003]
+        B1[upsert correlationKey_001]
+        B2[upsert correlationKey_002]
+        B3[upsert correlationKey_003]
     end
 
     E1 --> D1
@@ -180,15 +180,15 @@ sequenceDiagram
     participant D as DocumentDB
 
     E->>R: ZRANGEBYSCORE dirty:band LIMIT 0 1000
-    R-->>E: crn_001, crn_002, crn_003 ...
+    R-->>E: correlationKey_001, correlationKey_002, correlationKey_003 ...
 
     E->>R: pipeline HMGET payload for each key
     R-->>E: payload_001, payload_002, payload_003 ...
 
-    E->>D: BulkWrite — upsert crn_001, upsert crn_002, upsert crn_003
+    E->>D: BulkWrite — upsert correlationKey_001, upsert correlationKey_002, upsert correlationKey_003
     D-->>E: upsertedCount 3
 
-    E->>R: ZREM dirty:band crn_001 crn_002 crn_003
+    E->>R: ZREM dirty:band correlationKey_001 correlationKey_002 correlationKey_003
     R-->>E: 3
 
     Note over E,R: ZREM happens AFTER confirmed BulkWrite.
@@ -235,7 +235,7 @@ flowchart TD
 |---|---|
 | Sustained ingest | 10K events/sec |
 | Peak spike | 100K events/sec |
-| Unique CRNs at peak (wide-breadth) | ~80–90K/sec |
+| Unique correlation_keys at peak (wide-breadth) | ~80–90K/sec |
 | Redis resident keys (transit buffer) | ~25K at peak |
 | DocumentDB BulkWrite calls/sec | ~100–130 |
 | I/O reduction vs individual writes | **~1,000x** |
@@ -250,7 +250,7 @@ flowchart TD
 flowchart TD
     subgraph Ingest ["Ingest layer"]
         SQS([SQS Queue])
-        KAF(["Kafka Topics — 16 partitions by CRN"])
+        KAF(["Kafka Topics — 16 partitions by correlation_key"])
     end
 
     subgraph Consumers ["Consumer layer"]
@@ -261,7 +261,7 @@ flowchart TD
 
     subgraph Library ["sluice library"]
         subgraph Journal ["Redis cluster — write journal"]
-            PH["sl:ns:payload:crn — HSET opaque bytes — TTL 30s"]
+            PH["sl:ns:payload:correlationKey — HSET opaque bytes — TTL 30s"]
             DS["sl:ns:dirty:0..15 — ZSET score=timestamp — 16 band partitions"]
             DLQ["sl:ns:dlq:0..15 — dead-letter ZSET — TTL 7 days"]
         end
@@ -280,7 +280,7 @@ flowchart TD
     end
 
     subgraph Store ["Document store"]
-        DB[("AWS DocumentDB — nudge_inventory — _id = CRN")]
+        DB[("AWS DocumentDB — nudge_inventory — _id = correlation_key")]
     end
 
     SQS --> CW1
@@ -339,11 +339,11 @@ sk, _ := docdb.New(ctx, docdb.DefaultConfig(
     "adroll", "nudge_inventory",
 ))
 
-contract := func(crn string, payload []byte) (*sluice.WriteModel, error) {
+contract := func(correlationKey string, payload []byte) (*sluice.WriteModel, error) {
     var doc map[string]any
     json.Unmarshal(payload, &doc)
     return &sluice.WriteModel{
-        Filter: bson.D{{"_id", crn}},
+        Filter: bson.D{{"_id", correlationKey}},
         Update: bson.D{{"$set", doc}},
         Upsert: true,
     }, nil
@@ -361,7 +361,7 @@ s, _ := sluice.New("nudge_inventory").
 defer s.DrainAndClose(ctx)
 
 // Hot path — DocumentDB is never touched here
-s.Write(ctx, crn, payload)
+s.Write(ctx, correlationKey, payload)
 ```
 
 ---
@@ -491,7 +491,7 @@ Because `DLQUpsert` re-executes the `WriteContract`, you can correct quarantined
 var healBadRecords atomic.Bool
 
 // WriteContract: applied on every write AND on DLQ re-processing
-contract := func(crn string, raw []byte) (*sluice.WriteModel, error) {
+contract := func(correlationKey string, raw []byte) (*sluice.WriteModel, error) {
     var p NudgePayload
     json.Unmarshal(raw, &p)
 
@@ -499,12 +499,12 @@ contract := func(crn string, raw []byte) (*sluice.WriteModel, error) {
         if healBadRecords.Load() {
             p.Channel = "email" // correct the offending field at recovery time
         } else {
-            return nil, fmt.Errorf("contract violation: invalid channel on %s", crn)
+            return nil, fmt.Errorf("contract violation: invalid channel on %s", correlationKey)
         }
     }
 
     return &sluice.WriteModel{
-        Filter: bson.D{{Key: "_id", Value: crn}},
+        Filter: bson.D{{Key: "_id", Value: correlationKey}},
         Update: bson.D{{Key: "$set", Value: p}},
         Upsert: true,
     }, nil
