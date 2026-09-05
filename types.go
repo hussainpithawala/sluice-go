@@ -1,28 +1,99 @@
 package sluice
 
 import (
+	"context"
+	"crypto/tls"
+	"log/slog"
+	"sync/atomic"
 	"time"
 
+	"github.com/hussainpithawala/sluice-go/internal/engine"
+	"github.com/hussainpithawala/sluice-go/internal/shield"
+	"github.com/hussainpithawala/sluice-go/sink"
 	"github.com/hussainpithawala/sluice-go/source"
 )
+
+// ─── Core Structures ─────────────────────────────────────────────────────────
+
+// Sluice is the main entry point. Safe for concurrent use.
+// Construct via New().Build() — never instantiate directly.
+type Sluice struct {
+	cfg       Config
+	shield    *shield.Shield
+	engine    *engine.Engine
+	sk        sink.FlushSink
+	src       source.Source
+	contract  WriteContract
+	metrics   MetricsRecorder
+	closed    atomic.Bool
+	dlqCancel context.CancelFunc
+	dlqDone   chan struct{}
+}
+
+// Builder assembles a Sluice instance with a fluent API.
+type Builder struct {
+	cfg      Config
+	sk       sink.FlushSink
+	src      source.Source
+	contract WriteContract
+	callback OnFlushCallback
+}
+
+// ─── Configuration ───────────────────────────────────────────────────────────
+
+// Config holds every tunable for the library.
+// Construct via the Builder — do not instantiate directly.
+type Config struct {
+	Namespace          string
+	BandCount          int
+	FlushWindow        time.Duration
+	MaxBatchSize       int
+	KeyTTL             time.Duration // In-flight dirty key TTL
+	ActivityWindow     time.Duration // Hot CRN session TTL (default 4h)
+	DegradedModeDirect bool
+	HotAwareFlush      bool          // Extend TTL on successful commit
+	ContentDedup       bool          // Enable xxHash64 payload deduplication
+	IdempotencyTTL     time.Duration // TTL for WriteIdempotent keys
+
+	Redis   RedisConfig
+	Metrics MetricsRecorder
+
+	BatchedWrites    bool
+	WriteBatchSize   int
+	WriteBatchWindow time.Duration
+
+	DLQAutoProcess     bool
+	DLQProcessInterval time.Duration
+	DLQProcessStrategy DLQStrategy
+
+	ReadContract  ReadContract
+	IndexContract IndexContract
+}
+
+// RedisConfig holds Redis connectivity parameters.
+type RedisConfig struct {
+	Network      string
+	Addrs        []string
+	ClusterMode  bool
+	Username     string
+	Password     string
+	DB           int
+	DialTimeout  time.Duration
+	ReadTimeout  time.Duration
+	WriteTimeout time.Duration
+	PoolSize     int
+	TLSConfig    *tls.Config
+}
 
 // ─── Domain Contracts ────────────────────────────────────────────────────────
 
 // WriteContract is the domain function the caller contributes for the write path.
-// Called once per unique correlation key per flush cycle — never on Write().
 type WriteContract func(correlationKey string, payload []byte) (*WriteModel, error)
 
 // ReadContract translates a correlation key into a datastore-agnostic ReadModel.
-// The caller only defines the Filter; the Source executes the query.
-// Used by HotLoad() and cold Read() fallback.
 type ReadContract func(correlationKey string) (*source.ReadModel, error)
 
 // IndexContract extracts secondary index fields from a payload.
-//
-// Suggested value handling:
-//   - string values       -> equality SET index
-//   - int/int64/float64   -> range ZSET index
-//   - time.Time           -> range ZSET index using Unix milliseconds
 type IndexContract func(correlationKey string, payload []byte) (map[string]interface{}, error)
 
 // ─── Write Path Models ───────────────────────────────────────────────────────
@@ -35,18 +106,16 @@ type WriteModel struct {
 }
 
 // FlushRecord is the internal unit that travels through the pipeline.
-// Payload is opaque bytes — the library never interprets it.
 type FlushRecord struct {
 	CorrelationKey string
 	Payload        []byte
 	ReceivedAt     time.Time
 }
 
-// OnFlushCallback is invoked after every BulkWrite attempt — success or failure.
+// OnFlushCallback is invoked after every BulkWrite attempt.
 type OnFlushCallback func(correlationKeys []string, result *BulkWriteResult, err error)
 
 // BulkWriteResult carries the outcome of a sink BulkWrite call.
-// This is a public wrapper around sink.BulkWriteResult to prevent internal package leakage.
 type BulkWriteResult struct {
 	InsertedCount int64
 	MatchedCount  int64
@@ -56,17 +125,13 @@ type BulkWriteResult struct {
 }
 
 // SinkError ties a write failure back to its originating correlation key.
-// Code carries the document-store error code when available (e.g. 11000 for
-// a MongoDB/DocumentDB duplicate-key violation).
 type SinkError struct {
 	CorrelationKey string
 	Code           int
 	Err            error
 }
 
-// ErrCodeDuplicateKey is the MongoDB / AWS DocumentDB error code for a
-// unique-index violation. sluice uses this to distinguish permanent failures
-// (route to dead-letter) from transient ones (leave in dirty set for retry).
+// ErrCodeDuplicateKey is the MongoDB / AWS DocumentDB error code for a unique-index violation.
 const ErrCodeDuplicateKey = 11000
 
 // ─── DLQ Models ──────────────────────────────────────────────────────────────
@@ -82,18 +147,27 @@ const (
 
 // DLQResult carries the outcome of a ProcessDLQ invocation.
 type DLQResult struct {
-	Processed int // total records handled across all bands
-	Succeeded int // successfully committed/re-queued
-	Failed    int // records that failed during DLQ processing
+	Processed int
+	Succeeded int
+	Failed    int
+}
+
+// DLQOption configures the behaviour of ProcessDLQ.
+type DLQOption func(*dlqOptions)
+
+type dlqOptions struct {
+	maxBatchSize int
+	keyMutator   func(string) string
+	logger       *slog.Logger
 }
 
 // ─── Query Models ────────────────────────────────────────────────────────────
 
 // Query defines the parameters for a compound lookup against the Redis journal.
 type Query struct {
-	Equality map[string]string  // Exact matches (SET intersection)
-	RangeMin map[string]float64 // Minimum bounds (ZSET score)
-	RangeMax map[string]float64 // Maximum bounds (ZSET score)
+	Equality map[string]string
+	RangeMin map[string]float64
+	RangeMax map[string]float64
 }
 
 // QueryResult represents a single record returned by a Query operation.

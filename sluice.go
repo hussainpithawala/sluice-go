@@ -22,7 +22,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sync/atomic"
 	"time"
 
 	"log/slog"
@@ -35,30 +34,6 @@ import (
 	"github.com/hussainpithawala/sluice-go/source"
 	"github.com/redis/go-redis/v9"
 )
-
-// Sluice is the main entry point. Safe for concurrent use.
-// Construct via New().Build() — never instantiate directly.
-type Sluice struct {
-	cfg       Config
-	shield    *shield.Shield
-	engine    *engine.Engine
-	sk        sink.FlushSink
-	src       source.Source
-	contract  WriteContract
-	metrics   MetricsRecorder
-	closed    atomic.Bool
-	dlqCancel context.CancelFunc
-	dlqDone   chan struct{}
-}
-
-// Builder assembles a Sluice instance with a fluent API.
-type Builder struct {
-	cfg      Config
-	sk       sink.FlushSink
-	src      source.Source
-	contract WriteContract
-	callback OnFlushCallback
-}
 
 // New returns a Builder initialised with production-safe defaults.
 // namespace isolates all Redis keys for this instance.
@@ -519,15 +494,6 @@ func (s *Sluice) DrainAndClose(ctx context.Context) error {
 }
 
 // ── DLQ Processing ──────────────────────────────────────────────────────────
-
-// DLQOption configures the behaviour of ProcessDLQ.
-type DLQOption func(*dlqOptions)
-
-type dlqOptions struct {
-	maxBatchSize int
-	keyMutator   func(string) string
-	logger       *slog.Logger
-}
 
 // WithDLQBatchSize sets the per-band batch size for DLQ processing.
 func WithDLQBatchSize(n int) DLQOption {
