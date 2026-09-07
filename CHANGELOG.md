@@ -6,6 +6,38 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+- [1.0.7] - 2026-09-07
+### Added
+- Hot/Cold CRN Regimes: Introduced HotLoad(), Read(), and IsHot() for activity-driven TTL management. Active CRNs are pinned in the Redis journal with an extended ActivityWindow TTL (default 4h) for sub-millisecond reads, while inactive CRNs gracefully fall back to the backing Source.
+- Source Abstraction: New source.Source interface and source/docdb implementation. The read path is now fully decoupled from the write path, mirroring the sink.FlushSink pattern. NewSourceWithClient() enables connection pool sharing between sink and source.
+- Queryable Journal: Added IndexContract and Query() API for compound lookups against the Redis journal. Maintains secondary equality (SET) and range (ZSET) indexes, resolved safely in Cluster Mode via band-scoped SINTER and in-process range filtering.
+- Exactly-Once Delivery: Added WriteIdempotent() backed by band-scoped Redis SETNX EX (key: sl:{ns}:idem:{band}:{key}) to safely handle Kafka/SQS message replays without polluting the dirty queue.
+- Content Deduplication: Added WithContentDedup(true) builder option to enable xxHash64 payload fingerprinting via a dedicated Valkey-safe Lua script (atomicDedupWriteLua). Identical payloads only refresh the Redis TTL and skip redundant dirty-set queuing and sink writes.
+- DLQ Auto-Processor: Added WithDLQAutoProcess(interval, strategy) builder option to run a background ticker that periodically drains and processes the Dead Letter Queue using configurable strategies (Ignore, Upsert, ReInsert).
+- Pre-Eviction Flusher: Added a background engine goroutine that monitors OldestDirtyScore() per band and force-flushes before Redis KeyTTL expires the payload, preventing silent data loss during extreme ingest spikes.
+- Hot Marker Keys: Introduced sl:{ns}:hot:{band}:{crn} Redis keys with SET NX EX ActivityWindow semantics. IsHot() is a single EXISTS call; HotLoad() sets this marker alongside the payload write.
+- Metrics Expansion: Added RecordWarmUp, RecordRead, and RecordHotSetSize hooks to the MetricsRecorder interface for comprehensive hot/cold regime observability.
+- ReadWithTTL Pipeline: Added ReadWithTTL() to the shield layer, fetching both payload and remaining TTL in a single Redis pipeline round-trip for lazy TTL refresh decisions.
+
+### Changed
+- ReadContract Signature: Updated ReadContract from func(correlationKey string) ([]byte, error) to func(correlationKey string) (*source.ReadModel, error). The caller now returns a datastore-agnostic filter; the Source executes the query. This eliminates direct mongo.Collection references from domain contracts.
+- Lazy TTL Refresh: Replaced fire-and-forget goroutines in the read path with a synchronous, lazy PTTL threshold check. If remaining TTL falls below 20% of ActivityWindow, the TTL is refreshed inline. This prevents goroutine storms at 100K+ TPS reads.
+- Index Maintenance Pipeline: Shifted secondary index updates out of the atomic Lua script and into a Go-side Redis Pipeline (UpdateIndexes()). This eliminates the cjson dependency and guarantees compatibility with Valkey and OSS Redis forks where cjson is unavailable.
+- Domain Leakage Removal: Removed WriteOptions (containing ForceHot, ContentHash, DedupEnabled, IndexesJSON) from the shield layer. The shield is now strictly infrastructure — hot/cold regime decisions, dedup hashing, and index extraction are orchestrated by the Sluice struct.
+- HotLoad TTL Extension: HotLoad() now extends the payload hash TTL to ActivityWindow and sets the hot marker, rather than relying on the default KeyTTL (30s).
+- Type Consolidation: Centralized all public types, interfaces, and contracts (WriteContract, ReadContract, IndexContract, WriteModel, BulkWriteResult, SinkError, Query, QueryResult, DLQStrategy, DLQResult) into types.go for a cleaner, more discoverable API surface.
+- Error Mapping: Read() and HotLoad() now map an internal source.ErrRecordNotFound to the public sluice.ErrRecordNotFound sentinel, preventing internal package error leakage.
+
+### Fixed
+- Cluster Mode Safety: Secondary index keys (sl:{ns}:idx:{band}:field:value), range index keys (sl:{ns}:ridx:{band}:field), idempotency keys (sl:{ns}:idem:{band}:{key}), and hot marker keys (sl:{ns}:hot:{band}:{crn}) now correctly embed {band} hash tags, completely eliminating CROSSSLOT errors in Redis Cluster and Valkey Cluster environments.
+- Lua Type Mismatches: Formatted millisecond timestamps as strings (fmt.Sprintf("%.0f", ts)) before passing to Lua scripts in both Write() and flushBatch(), resolving ERR Lua redis lib command arguments must be strings or integers errors that caused silent write failures in Redis/Valkey.
+- WriteDedup Script Binding: Fixed WriteDedup() which was incorrectly using atomicWriteLua (4-arg script) instead of the dedicated atomicDedupWriteLua (5-arg script with hash comparison). Deduplication was previously non-functional.
+- Test Isolation (Redis): Fixed the cleanRedisKeys glob pattern from fmt.Sprintf("sl:%s:", ns) to fmt.Sprintf("sl:%s:*", ns), enabling proper key cleanup between test runs and eliminating ErrDuplicateIdempotencyKey false positives.
+- Test Isolation (Kafka): Implemented unique Kafka topic and group ID generation per test run (fmt.Sprintf("topic-%d", time.Now().UnixNano())) to eliminate offset pollution and OffsetOutOfRange errors in CI/CD pipelines.
+- Goroutine Leaks in Tests: Added case <-ctx.Done(): return to SQS and Kafka consumer loops alongside stop channels, preventing orphaned goroutines from triggering 5-minute global test timeouts.
+- Unexported Struct Fields: Fixed sqsEvent.CorrelationKey being lowercase (correlation_key), which caused json.Marshal to silently omit the field and all SQS messages to arrive with empty correlation keys.
+- Return Type Mismatch: Fixed buildIntegrationSluice returning docdb.Sink (value) instead of *docdb.Sink (pointer), resolving compile errors in integration tests.
+
 ## [1.0.2] - 2026-08-21
 ### Added
 - **Explicit Cluster Mode Support**: Introduced `ClusterMode` boolean field to `RedisConfig` across root and `shield` packages to explicitly select between standalone (`redis.Client`) and cluster-aware (`redis.ClusterClient`) go-redis clients.
