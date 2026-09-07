@@ -14,10 +14,13 @@ import (
 
 // Config holds the engine-level tunables passed from the top-level sluice.Config.
 type Config struct {
-	Namespace    string
-	BandCount    int
-	FlushWindow  time.Duration
-	MaxBatchSize int
+	Namespace      string
+	BandCount      int
+	FlushWindow    time.Duration
+	MaxBatchSize   int
+	KeyTTL         time.Duration // In-flight dirty key TTL
+	ActivityWindow time.Duration // Hot correlation_key session TTL
+	HotAwareFlush  bool          // Extend TTL on successful commit
 }
 
 // MetricsRecorder is the subset of telemetry methods the engine needs.
@@ -34,6 +37,19 @@ type MetricsRecorder interface {
 // WriteContract is the domain function the caller contributes.
 // Returns a resolved WriteModel ready for BulkWrite assembly.
 type WriteContract func(correlationKey string, payload []byte) (*sink.WriteModel, error)
+
+// ReadContract loads the current payload for a correlation key from the
+// backing sink/document store. It is used by the hot/cold regime when a correlation_key
+// is cold and must be warmed into Redis.
+type ReadContract func(correlationKey string) ([]byte, error)
+
+// IndexContract extracts secondary-index fields from a payload.
+//
+// Suggested value handling:
+//   - string values       -> equality SET index
+//   - int/int64/float64   -> range ZSET index
+//   - time.Time           -> range ZSET index using Unix milliseconds
+type IndexContract func(correlationKey string, payload []byte) (map[string]interface{}, error)
 
 // OnFlushCallback is invoked after every BulkWrite attempt — success or failure.
 type OnFlushCallback func(correlationKeys []string, result *sink.BulkWriteResult, err error)
@@ -85,12 +101,13 @@ func New(
 	}
 }
 
-// Start launches one goroutine per band. Non-blocking.
+// Start launches one goroutine per band and the pre-eviction flusher. Non-blocking.
 func (e *Engine) Start() {
 	for band := 0; band < e.cfg.BandCount; band++ {
 		e.wg.Add(1)
 		go e.runBand(band)
 	}
+	e.startPreEvictionFlusher()
 }
 
 // SignalVolume sends a non-blocking volume trigger to a band's goroutine.
@@ -108,6 +125,48 @@ func (e *Engine) DrainAndStop() {
 		close(e.stopCh)
 		e.wg.Wait()
 	})
+}
+
+// startPreEvictionFlusher monitors the oldest dirty keys and forces a flush
+// if they are approaching the KeyTTL expiration threshold. This prevents
+// silent data loss from Redis evicting payloads before they are flushed.
+func (e *Engine) startPreEvictionFlusher() {
+	if e.cfg.KeyTTL <= 0 {
+		return
+	}
+
+	// Check at half the KeyTTL interval
+	interval := e.cfg.KeyTTL / 2
+	if interval < time.Second {
+		interval = time.Second
+	}
+
+	e.wg.Add(1)
+	go func() {
+		defer e.wg.Done()
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-e.stopCh:
+				return
+			case <-ticker.C:
+				now := float64(time.Now().UnixMilli())
+				// Threshold: current time - KeyTTL + 5s safety buffer
+				threshold := now - float64(e.cfg.KeyTTL.Milliseconds()) + 5000
+
+				for band := 0; band < e.cfg.BandCount; band++ {
+					// OldestDirtyScore returns the score of the oldest item in the dirty ZSET
+					// without leaking redis.Z types to the engine package.
+					oldestScore, err := e.shield.OldestDirtyScore(context.Background(), band)
+					if err == nil && oldestScore > 0 && oldestScore < threshold {
+						e.SignalVolume(band)
+					}
+				}
+			}
+		}
+	}()
 }
 
 func (e *Engine) runBand(band int) {
@@ -140,7 +199,7 @@ func (e *Engine) runBand(band int) {
 //  2. Apply WriteContract to each record.
 //  3. BulkWrite to the sink.
 //  4. Partition results:
-//     - Success            → CommitKeys (ZREM from dirty set).
+//     - Success            → CommitKeys (ZREM from dirty set) + RefreshHotTTL.
 //     - Permanent failure  → MoveToDeadLetter (duplicate key, code 11000).
 //     - Transient failure  → no action; keys remain in dirty set for retry.
 //     - Total failure      → no action; all keys remain in dirty set for retry.
@@ -170,7 +229,6 @@ func (e *Engine) flushBand(ctx context.Context, band int) error {
 	// Apply WriteContract — build sink models.
 	models := make([]sink.WriteModel, 0, len(records))
 	corrKeys := make([]string, 0, len(records))
-
 	for _, rec := range records {
 		wm, contractErr := e.contract(rec.CorrelationKey, rec.Payload)
 		if contractErr != nil {
@@ -260,10 +318,17 @@ func (e *Engine) flushBand(ctx context.Context, band int) error {
 
 	// Commit successful keys — ZREM from dirty set.
 	if len(successKeys) > 0 {
-		if commitErr := e.shield.CommitKeys(ctx, band, successKeys); commitErr != nil {
-			// CommitKeys failure is non-fatal: worst case these keys are
-			// re-flushed on the next cycle. Upsert semantics make that safe.
-			e.metrics.RecordRedisOp(e.cfg.Namespace, "commit_keys", 0, commitErr)
+		if commitErr := e.shield.CommitKeys(ctx, band, successKeys); commitErr == nil {
+			if e.cfg.HotAwareFlush {
+				// Refresh payload TTL
+				_ = e.shield.RefreshHotTTL(ctx, band, successKeys)
+				// Refresh hot markers for any keys that are currently hot
+				for _, ck := range successKeys {
+					if isHot, _ := e.shield.IsHot(ctx, ck); isHot {
+						_ = e.shield.SetHotMarker(ctx, ck, e.cfg.ActivityWindow)
+					}
+				}
+			}
 		}
 	}
 

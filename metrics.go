@@ -19,6 +19,11 @@ type MetricsRecorder interface {
 
 	// RecordDLQProcess is called after a ProcessDLQ invocation completes.
 	RecordDLQProcess(namespace, strategy string, processed, succeeded, failed int)
+
+	// ── Hot/Cold Regime Metrics ────────────────────────────────────────────
+	RecordWarmUp(namespace string, duration time.Duration, err error)
+	RecordRead(namespace string, duration time.Duration, isHot bool, err error)
+	RecordHotSetSize(namespace string, size int)
 }
 
 type noopMetrics struct{}
@@ -31,3 +36,7 @@ func (n *noopMetrics) RecordDirtyQueueDepth(_ string, _ string, _ int)          
 func (n *noopMetrics) RecordContractError(_ string, _ string, _ error)                 {}
 func (n *noopMetrics) RecordDeadLetter(_ string, _ string, _ int)                      {}
 func (n *noopMetrics) RecordDLQProcess(_ string, _ string, _ int, _ int, _ int)        {}
+func (n *noopMetrics) RecordWarmUp(_ string, _ time.Duration, _ error)                 {}
+func (n *noopMetrics) RecordRead(_ string, _ time.Duration, _ bool, _ error)           {}
+func (n *noopMetrics) RecordHotSize(_ string, _ int)                                   {}
+func (n *noopMetrics) RecordHotSetSize(_ string, _ int)                                {}

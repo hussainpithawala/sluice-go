@@ -149,3 +149,9 @@ func (s *Sink) Write(ctx context.Context, model sink.WriteModel) error {
 
 func (s *Sink) Ping(ctx context.Context) error  { return s.client.Ping(ctx, readpref.Primary()) }
 func (s *Sink) Close(ctx context.Context) error { return s.client.Disconnect(ctx) }
+
+// Client returns the underlying mongo.Client, allowing it to be shared
+// with source/docdb.Source to maintain a single connection pool.
+func (s *Sink) Client() *mongo.Client {
+	return s.client
+}

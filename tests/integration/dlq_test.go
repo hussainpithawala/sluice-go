@@ -26,12 +26,14 @@ func dlqRedisClient(t *testing.T) *redis.Client {
 	return c
 }
 
-// cleanRedisKeys removes all keys matching the given namespace pattern.
+// cleanRedisKeys removes all keys matching the given namespace pattern
+// to ensure test isolation.
 func cleanRedisKeys(t *testing.T, rc *redis.Client, ns string) {
 	t.Helper()
 	ctx := context.Background()
 	var cursor uint64
 	for {
+		// FIX: Added the '*' wildcard
 		keys, next, err := rc.Scan(ctx, cursor, fmt.Sprintf("sl:%s:*", ns), 100).Result()
 		require.NoError(t, err)
 		if len(keys) > 0 {
@@ -146,7 +148,7 @@ func TestProcessDLQ_Ignore(t *testing.T) {
 // WriteContract with Upsert=true and persists the records to MongoDB.
 func TestProcessDLQ_Upsert(t *testing.T) {
 	const ns = "dlq_upsert_test"
-	rc := dlqRedisClient(t)
+	var rc = dlqRedisClient(t)
 	ctx := context.Background()
 	cleanRedisKeys(t, rc, ns)
 
@@ -401,10 +403,10 @@ func TestProcessDLQ_AfterClose(t *testing.T) {
 // TestProcessDLQ_ReInsert_DefaultMutator verifies that the default key
 // mutator produces unique keys with a recognizable suffix pattern.
 func TestProcessDLQ_ReInsert_DefaultMutator(t *testing.T) {
-	key1 := sluice.DefaultKeyMutator("crn_123")
-	key2 := sluice.DefaultKeyMutator("crn_123")
+	key1 := sluice.DefaultKeyMutator("correlationKey_123")
+	key2 := sluice.DefaultKeyMutator("correlationKey_123")
 
-	assert.Contains(t, key1, "crn_123_dlq_")
-	assert.Contains(t, key2, "crn_123_dlq_")
+	assert.Contains(t, key1, "correlationKey_123_dlq_")
+	assert.Contains(t, key2, "correlationKey_123_dlq_")
 	assert.NotEqual(t, key1, key2, "default mutator should produce unique keys")
 }

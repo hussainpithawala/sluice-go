@@ -37,25 +37,25 @@ type NudgeInventoryPayload struct {
 // nudgeWriteContract validates incoming payloads. If a payload violates our system contract
 // (e.g. channel field is empty or key starts with "bad_"), it returns an error.
 // This causes Sluice's flush engine to isolate and route this record to the DLQ.
-func nudgeWriteContract(crn string, rawPayload []byte) (*sluice.WriteModel, error) {
+func nudgeWriteContract(correlationKey string, rawPayload []byte) (*sluice.WriteModel, error) {
 	var p NudgeInventoryPayload
 	if err := json.Unmarshal(rawPayload, &p); err != nil {
-		return nil, fmt.Errorf("nudge contract: invalid payload for CRN %s: %w", crn, err)
+		return nil, fmt.Errorf("nudge contract: invalid payload for correlation_key %s: %w", correlationKey, err)
 	}
 
 	// Structural Contract Rule: We simulate ingestion errors on certain records.
-	if p.Channel == "REJECT" || (len(crn) >= 4 && crn[:4] == "bad_") {
+	if p.Channel == "REJECT" || (len(correlationKey) >= 4 && correlationKey[:4] == "bad_") {
 		// If healing is enabled during recovery, correct the payload instead of rejecting it!
 		if healBadRecords.Load() {
 			p.Channel = "email" // Heal bad channel payload to a safe default
-			slog.Info("dlq-healing: corrected bad payload field during recovery", "crn", crn)
+			slog.Info("dlq-healing: corrected bad payload field during recovery", "correlationKey", correlationKey)
 		} else {
-			return nil, fmt.Errorf("contract violation: invalid channel type on key %s", crn)
+			return nil, fmt.Errorf("contract violation: invalid channel type on key %s", correlationKey)
 		}
 	}
 
 	return &sluice.WriteModel{
-		Filter: bson.D{{Key: "_id", Value: crn}},
+		Filter: bson.D{{Key: "_id", Value: correlationKey}},
 		Update: bson.D{{Key: "$set", Value: bson.D{
 			{Key: "nudge_master_id", Value: p.NudgeMasterID},
 			{Key: "channel", Value: p.Channel},
@@ -70,6 +70,14 @@ func nudgeWriteContract(crn string, rawPayload []byte) (*sluice.WriteModel, erro
 
 // logMetrics registers trace counters.
 type logMetrics struct{ log *slog.Logger }
+
+func (m *logMetrics) RecordWarmUp(namespace string, duration time.Duration, err error) {
+	m.log.Info("warm-up", "ns", namespace, "duration", duration.Milliseconds(), "error", err)
+}
+
+func (m *logMetrics) RecordRead(namespace string, duration time.Duration, isHot bool, err error) {
+	m.log.Info("read", "ns", namespace, "duration", duration.Milliseconds(), "isHot", isHot, "error", err)
+}
 
 func (m *logMetrics) RecordWrite(_ string) {}
 func (m *logMetrics) RecordDegradedWrite(ns string, err error) {
@@ -88,14 +96,18 @@ func (m *logMetrics) RecordDirtyQueueDepth(ns, band string, depth int) {
 		m.log.Warn("dirty queue depth", "ns", ns, "band", band, "depth", depth)
 	}
 }
-func (m *logMetrics) RecordContractError(ns, crn string, err error) {
-	m.log.Error("contract error", "ns", ns, "crn", crn, "err", err)
+func (m *logMetrics) RecordContractError(ns, correlationKey string, err error) {
+	m.log.Error("contract error", "ns", ns, "correlationKey", correlationKey, "err", err)
 }
 func (m *logMetrics) RecordDeadLetter(ns, band string, count int) {
 	m.log.Warn("dead-letter record written", "ns", ns, "band", band, "count", count)
 }
 func (m *logMetrics) RecordDLQProcess(ns, strategy string, processed, succeeded, failed int) {
 	m.log.Info("dlq-process-complete", "ns", ns, "strategy", strategy, "processed", processed, "succeeded", succeeded, "failed", failed)
+}
+
+func (m *logMetrics) RecordHotSetSize(namespace string, size int) {
+	m.log.Info("hot-set-size", "ns", namespace, "size", size)
 }
 
 func main() {
@@ -139,14 +151,14 @@ func run(log *slog.Logger) error {
 
 	// Ingest exactly 10 requests
 	for i := 1; i <= 10; i++ {
-		var crn string
+		var correlationKey string
 		var channel string
 
 		if i <= 6 {
-			crn = fmt.Sprintf("crn_good_%d", i)
+			correlationKey = fmt.Sprintf("correlationKey_good_%d", i)
 			channel = "push"
 		} else {
-			crn = fmt.Sprintf("bad_crn_failed_%d", i)
+			correlationKey = fmt.Sprintf("bad_correlationKey_failed_%d", i)
 			channel = "REJECT" // This will violate the contract
 		}
 
@@ -159,8 +171,8 @@ func run(log *slog.Logger) error {
 			LastUpdated:   time.Now().UTC(),
 		})
 
-		if err := sl.Write(ctx, crn, payload); err != nil {
-			log.Error("validation ingest failed", "crn", crn, "err", err)
+		if err := sl.Write(ctx, correlationKey, payload); err != nil {
+			log.Error("validation ingest failed", "correlationKey", correlationKey, "err", err)
 		}
 	}
 

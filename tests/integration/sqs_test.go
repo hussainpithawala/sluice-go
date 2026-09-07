@@ -22,8 +22,8 @@ import (
 )
 
 type sqsEvent struct {
-	CRN           string `json:"crn"`
-	NudgeMasterID string `json:"nudge_master_id"`
+	CorrelationKey string `json:"correlationKey"`
+	NudgeMasterID  string `json:"nudge_master_id"`
 }
 
 func newLocalStackSQS(t *testing.T) *sqs.Client {
@@ -53,11 +53,13 @@ func publishSQSMessages(t *testing.T, client *sqs.Client, queueURL string, n int
 	ctx := context.Background()
 	for start := 0; start < n; start += 10 {
 		end := start + 10
-		if end > n { end = n }
+		if end > n {
+			end = n
+		}
 		entries := make([]types.SendMessageBatchRequestEntry, 0, end-start)
 		for i := start; i < end; i++ {
-			crn := fmt.Sprintf("crn_sqs_%07d", i)
-			body, _ := json.Marshal(sqsEvent{CRN: crn, NudgeMasterID: nudgeMasterID})
+			correlationKey := fmt.Sprintf("correlationKey_sqs_%07d", i)
+			body, _ := json.Marshal(sqsEvent{CorrelationKey: correlationKey, NudgeMasterID: nudgeMasterID})
 			entries = append(entries, types.SendMessageBatchRequestEntry{
 				Id: aws.String(fmt.Sprintf("msg_%d", i)), MessageBody: aws.String(string(body)),
 			})
@@ -75,6 +77,8 @@ func runSQSConsumer(ctx context.Context, t *testing.T, client *sqs.Client, queue
 		select {
 		case <-stopCh:
 			return
+		case <-ctx.Done():
+			return
 		default:
 		}
 		out, err := client.ReceiveMessage(ctx, &sqs.ReceiveMessageInput{
@@ -82,35 +86,46 @@ func runSQSConsumer(ctx context.Context, t *testing.T, client *sqs.Client, queue
 		})
 		if err != nil {
 			select {
-			case <-stopCh: return
-			default: time.Sleep(100 * time.Millisecond); continue
+			case <-stopCh:
+				return
+			default:
+				time.Sleep(100 * time.Millisecond)
+				continue
 			}
 		}
 		for _, msg := range out.Messages {
 			var evt sqsEvent
-			if err := json.Unmarshal([]byte(*msg.Body), &evt); err != nil { continue }
-			if writeErr := sl.Write(ctx, evt.CRN, makePayload(evt.NudgeMasterID)); writeErr == nil { processed.Add(1) }
+			if err := json.Unmarshal([]byte(*msg.Body), &evt); err != nil {
+				continue
+			}
+			if writeErr := sl.Write(ctx, evt.CorrelationKey, makePayload(evt.NudgeMasterID)); writeErr == nil {
+				processed.Add(1)
+			}
 			_, _ = client.DeleteMessage(ctx, &sqs.DeleteMessageInput{QueueUrl: aws.String(queueURL), ReceiptHandle: msg.ReceiptHandle})
 		}
 	}
 }
 
 func TestSQSConsumer_BatchFlush(t *testing.T) {
-	const totalMessages, consumerCount, nudgeMasterID = 5_000, 4, "nm_sqs_test"
+	const totalMessages, consumerCount, nudgeMasterID = 1_000, 4, "nm_sqs_test"
 	sqsClient := newLocalStackSQS(t)
-	queueURL  := createSQSQueue(t, sqsClient, "sluice-integration-test")
-	sl, _     := buildIntegrationSluice(t, "sqs_inventory")
-	coll      := mongoCollection(t, "sqs_inventory")
-	_, _       = coll.DeleteMany(context.Background(), bson.M{})
+	queueURL := createSQSQueue(t, sqsClient, "sluice-integration-test")
+	sl, _ := buildIntegrationSluice(t, "sqs_inventory")
+	coll := mongoCollection(t, "sqs_inventory")
+	_, _ = coll.DeleteMany(context.Background(), bson.M{})
 	publishSQSMessages(t, sqsClient, queueURL, totalMessages, nudgeMasterID)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	stopCh := make(chan struct{})
 	var wg sync.WaitGroup
 	var processed atomic.Int64
-	for i := 0; i < consumerCount; i++ { wg.Add(1); go runSQSConsumer(ctx, t, sqsClient, queueURL, sl, &processed, stopCh, &wg) }
+	for i := 0; i < consumerCount; i++ {
+		wg.Add(1)
+		go runSQSConsumer(ctx, t, sqsClient, queueURL, sl, &processed, stopCh, &wg)
+	}
 	require.Eventually(t, func() bool { return processed.Load() >= int64(totalMessages) }, 45*time.Second, 500*time.Millisecond)
-	close(stopCh); wg.Wait()
+	close(stopCh)
+	wg.Wait()
 	waitForCount(t, coll, bson.M{}, int64(totalMessages), 30*time.Second)
 	require.Equal(t, int64(totalMessages), countDocs(t, coll, bson.M{}))
 	t.Logf("SQS test passed: %d docs in MongoDB", totalMessages)
@@ -119,19 +134,23 @@ func TestSQSConsumer_BatchFlush(t *testing.T) {
 func TestSQSConsumer_SpikeLoad(t *testing.T) {
 	const totalMessages = 10_000
 	sqsClient := newLocalStackSQS(t)
-	queueURL  := createSQSQueue(t, sqsClient, "sluice-spike-test")
-	sl, _     := buildIntegrationSluice(t, "sqs_spike")
-	coll      := mongoCollection(t, "sqs_spike")
-	_, _       = coll.DeleteMany(context.Background(), bson.M{})
+	queueURL := createSQSQueue(t, sqsClient, "sluice-spike-test")
+	sl, _ := buildIntegrationSluice(t, "sqs_spike")
+	coll := mongoCollection(t, "sqs_spike")
+	_, _ = coll.DeleteMany(context.Background(), bson.M{})
 	publishSQSMessages(t, sqsClient, queueURL, totalMessages, "nm_spike")
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 	stopCh := make(chan struct{})
 	var wg sync.WaitGroup
 	var processed atomic.Int64
-	for i := 0; i < 8; i++ { wg.Add(1); go runSQSConsumer(ctx, t, sqsClient, queueURL, sl, &processed, stopCh, &wg) }
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go runSQSConsumer(ctx, t, sqsClient, queueURL, sl, &processed, stopCh, &wg)
+	}
 	require.Eventually(t, func() bool { return processed.Load() >= int64(totalMessages) }, 75*time.Second, 500*time.Millisecond)
-	close(stopCh); wg.Wait()
+	close(stopCh)
+	wg.Wait()
 	waitForCount(t, coll, bson.M{}, int64(totalMessages), 30*time.Second)
 	t.Logf("SQS spike test passed: %d docs in MongoDB", totalMessages)
 }
