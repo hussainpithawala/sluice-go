@@ -217,7 +217,7 @@ func (s *Sluice) IsHot(ctx context.Context, correlationKey string) (bool, error)
 	t := time.Now()
 	// We can just try to Read it, or add an Exists method to shield.
 	// For simplicity, shield.Read returns isHot flag.
-	_, isHot, err := s.shield.Read(ctx, correlationKey)
+	_, _, isHot, err := s.shield.ReadWithTTL(ctx, correlationKey)
 	s.metrics.RecordRedisOp(s.cfg.Namespace, "is_hot", time.Since(t), err)
 	return isHot, err
 }
@@ -231,7 +231,7 @@ func (s *Sluice) Read(ctx context.Context, correlationKey string) ([]byte, error
 	}
 
 	t := time.Now()
-	payload, pttl, err := s.shield.ReadWithTTL(ctx, correlationKey)
+	payload, pttl, _, err := s.shield.ReadWithTTL(ctx, correlationKey)
 
 	// Hot path: found in Redis journal
 	if err == nil && payload != nil {
@@ -464,7 +464,7 @@ func (s *Sluice) Query(ctx context.Context, q Query) ([]QueryResult, error) {
 			}
 
 			if valid {
-				payload, _, _ := s.shield.Read(ctx, ck)
+				payload, _, _, _ := s.shield.ReadWithTTL(ctx, ck)
 				if payload != nil {
 					results = append(results, QueryResult{CorrelationKey: ck, Payload: payload})
 				}

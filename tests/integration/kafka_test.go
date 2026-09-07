@@ -5,6 +5,7 @@ package integration_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -18,9 +19,9 @@ import (
 )
 
 type kafkaEvent struct {
-	correlation_key string `json:"correlationKey"`
-	NudgeMasterID   string `json:"nudge_master_id"`
-	SequenceNo      int    `json:"seq"`
+	CorrelationKey string `json:"correlationKey"`
+	NudgeMasterID  string `json:"nudge_master_id"`
+	SequenceNo     int    `json:"seq"`
 }
 
 /*
@@ -98,7 +99,7 @@ func publishKafkaMessages(t *testing.T, w *kafka.Writer, n int, nudgeMasterID st
 	msgs := make([]kafka.Message, 0, n)
 	for i := 0; i < n; i++ {
 		correlationKey := fmt.Sprintf("correlationKey_kafka_%07d", i)
-		body, _ := json.Marshal(kafkaEvent{correlation_key: correlationKey, NudgeMasterID: nudgeMasterID, SequenceNo: i})
+		body, _ := json.Marshal(kafkaEvent{CorrelationKey: correlationKey, NudgeMasterID: nudgeMasterID, SequenceNo: i})
 		msgs = append(msgs, kafka.Message{Key: []byte(correlationKey), Value: body})
 	}
 	for start := 0; start < len(msgs); start += 200 {
@@ -117,6 +118,12 @@ func runKafkaConsumer(ctx context.Context, t *testing.T, reader *kafka.Reader,
 	for processed.Load() < target {
 		msg, err := reader.FetchMessage(ctx)
 		if err != nil {
+			// FIX: Handle OffsetOutOfRange by resetting to the beginning
+			if errors.Is(err, kafka.OffsetOutOfRange) {
+				t.Logf("OffsetOutOfRange detected, resetting to FirstOffset")
+				_ = reader.SetOffset(kafka.FirstOffset)
+				continue
+			}
 			if ctx.Err() != nil {
 				return
 			}
@@ -128,8 +135,11 @@ func runKafkaConsumer(ctx context.Context, t *testing.T, reader *kafka.Reader,
 			_ = reader.CommitMessages(ctx, msg)
 			continue
 		}
-		if writeErr := sl.Write(ctx, evt.correlation_key, makePayload(evt.NudgeMasterID)); writeErr == nil {
+		if writeErr := sl.Write(ctx, evt.CorrelationKey, makePayload(evt.NudgeMasterID)); writeErr == nil {
 			processed.Add(1)
+		} else {
+			// FIX: Log write errors so they don't fail silently
+			t.Logf("sl.Write failed for CRN %s: %v", evt.CorrelationKey, writeErr)
 		}
 		_ = reader.CommitMessages(ctx, msg)
 	}
@@ -137,7 +147,12 @@ func runKafkaConsumer(ctx context.Context, t *testing.T, reader *kafka.Reader,
 
 func TestKafkaConsumer_BatchFlush(t *testing.T) {
 	const totalMessages, partitions, consumerCount = 1_000, 8, 4
-	const topic, groupID, nudgeMasterID = "sluice-nudge-inventory", "sluice-integration", "nm_kafka_test"
+
+	// FIX: Unique topic and groupID prevent offset pollution between test runs
+	topic := fmt.Sprintf("sluice-nudge-inventory-%d", time.Now().UnixNano())
+	groupID := fmt.Sprintf("sluice-integration-%d", time.Now().UnixNano())
+	const nudgeMasterID = "nm_kafka_test"
+
 	ensureKafkaTopic(t, topic, partitions)
 	sl, _ := buildIntegrationSluice(t, "kafka_inventory")
 	coll := mongoCollection(t, "kafka_inventory")
@@ -161,7 +176,11 @@ func TestKafkaConsumer_BatchFlush(t *testing.T) {
 
 func TestKafkaConsumer_HighThroughput(t *testing.T) {
 	const totalMessages, partitions, consumerCount = 50_000, 16, 8
-	const topic, groupID, nudgeMasterID = "sluice-high-throughput", "sluice-perf", "nm_perf_test"
+	// FIX: Unique topic and groupID
+	topic := fmt.Sprintf("sluice-high-throughput-%d", time.Now().UnixNano())
+	groupID := fmt.Sprintf("sluice-perf-%d", time.Now().UnixNano())
+	const nudgeMasterID = "nm_perf_test"
+
 	ensureKafkaTopic(t, topic, partitions)
 	sl, _ := buildIntegrationSluice(t, "kafka_perf")
 	coll := mongoCollection(t, "kafka_perf")

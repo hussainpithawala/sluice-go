@@ -43,6 +43,7 @@ import (
 	sluice "github.com/hussainpithawala/sluice-go"
 	"github.com/hussainpithawala/sluice-go/sink/docdb"
 	"github.com/hussainpithawala/sluice-go/source"
+	sourcedocdb "github.com/hussainpithawala/sluice-go/source/docdb"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
@@ -331,11 +332,16 @@ func run(log *slog.Logger) (err error) {
 
 	mongoURI := getEnv("MONGO_URI", "mongodb://localhost:27017")
 
+	databaseName := "adroll"
+	collectionName := "nudge_inventory"
+
 	// ── Sink (write path) ──────────────────────────────────────────────────
 	sk, err := docdb.New(ctx, docdb.Config{
-		URI: mongoURI, Database: "adroll", Collection: "nudge_inventory",
+		URI: mongoURI, Database: databaseName, Collection: collectionName,
 		MaxPoolSize: 100, MinPoolSize: 10,
 	})
+
+	src := sourcedocdb.NewSourceWithClient(sk.Client(), databaseName, collectionName)
 
 	if err != nil {
 		return fmt.Errorf("connect to MongoDB at %s: %w", mongoURI, err)
@@ -374,6 +380,7 @@ func run(log *slog.Logger) (err error) {
 		}).
 		WithSink(sk).
 		WithWriteContract(nudgeWriteContract).
+		WithSource(src).
 		WithReadContract(nudgeReadContract).   // ← ReadContract for HotLoad/Read
 		WithIndexContract(nudgeIndexContract). // ← IndexContract for Query
 		WithFlushWindow(250 * time.Millisecond).

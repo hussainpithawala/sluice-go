@@ -5,6 +5,7 @@ package shield
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"log/slog"
@@ -141,6 +142,27 @@ type Shield struct {
 // Returns 0 if deduplicated (TTL refreshed), 1 if written.
 const atomicWriteLua = `redis.call('HSET', KEYS[1], 'p', ARGV[1], 'ts', ARGV[2]) redis.call('EXPIRE', KEYS[1], tonumber(ARGV[4])) redis.call('ZADD', KEYS[2], ARGV[2], ARGV[3]) return 1`
 
+const atomicDedupWriteLua = `
+local payloadKey = KEYS[1]
+local dirtyKey = KEYS[2]
+local payload = ARGV[1]
+local score = ARGV[2]
+local corrKey = ARGV[3]
+local ttl = tonumber(ARGV[4])
+local contentHash = ARGV[5]
+
+local existingHash = redis.call('HGET', payloadKey, 'h')
+if existingHash == contentHash then
+    redis.call('EXPIRE', payloadKey, ttl)
+    return 0
+end
+
+redis.call('HSET', payloadKey, 'p', payload, 'ts', score, 'h', contentHash)
+redis.call('EXPIRE', payloadKey, ttl)
+redis.call('ZADD', dirtyKey, score, corrKey)
+return 1
+`
+
 // New initialises the Redis client and validates connectivity.
 func New(cfg RedisConfig, namespace string, bandCount int, keyTTL time.Duration, activityWindow time.Duration) (*Shield, error) {
 	if strings.ContainsAny(namespace, "{}") {
@@ -220,11 +242,12 @@ func New(cfg RedisConfig, namespace string, bandCount int, keyTTL time.Duration,
 // When batching is enabled, the write is buffered and pipelined to Redis
 // by the background batcher goroutine. Returns nil immediately in that case.
 func (s *Shield) Write(ctx context.Context, correlationKey string, payload []byte) error {
+	floatTs := float64(time.Now().UnixMilli())
 	if s.batchCh != nil {
 		s.batchCh <- writeEntry{
 			correlationKey: correlationKey,
 			payload:        payload,
-			ts:             float64(time.Now().UnixMilli()),
+			ts:             floatTs,
 		}
 		return nil
 	}
@@ -232,14 +255,14 @@ func (s *Shield) Write(ctx context.Context, correlationKey string, payload []byt
 	// not float64. This matches what flushBatch already does.
 	return s.writeScript.Run(ctx, s.client,
 		[]string{s.payloadKey(correlationKey), s.dirtyKey(correlationKey)},
-		payload, fmt.Sprintf("%.0f", float64(time.Now().UnixMilli())), correlationKey, int64(s.keyTTL.Seconds()),
+		payload, fmt.Sprintf("%.0f", floatTs), correlationKey, int64(s.keyTTL.Seconds()),
 	).Err()
 }
 
 // WriteDedup handles xxHash64 deduplication in a separate, Valkey-safe Lua script.
 func (s *Shield) WriteDedup(ctx context.Context, correlationKey string, payload []byte, hash string) (bool, error) {
 	band := s.BandFor(correlationKey)
-	script := redis.NewScript(atomicWriteLua)
+	script := redis.NewScript(atomicDedupWriteLua)
 
 	// FIX: Format timestamp as string for Lua HSET compatibility
 	tsStr := fmt.Sprintf("%.0f", float64(time.Now().UnixMilli()))
@@ -295,22 +318,22 @@ func (s *Shield) IsHot(ctx context.Context, correlationKey string) (bool, error)
 }
 
 // ReadWithTTL fetches payload and remaining TTL in one pipeline round-trip.
-func (s *Shield) ReadWithTTL(ctx context.Context, correlationKey string) ([]byte, time.Duration, error) {
+func (s *Shield) ReadWithTTL(ctx context.Context, correlationKey string) ([]byte, time.Duration, bool, error) {
 	key := s.payloadKey(correlationKey)
 	pipe := s.client.Pipeline()
 	hget := pipe.HGet(ctx, key, "p")
 	pttl := pipe.PTTL(ctx, key)
 	_, err := pipe.Exec(ctx)
 
-	if err == redis.Nil {
-		return nil, 0, nil
+	if errors.Is(err, redis.Nil) {
+		return nil, 0, false, nil
 	}
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, false, err
 	}
 	payload, _ := hget.Result()
 	ttl, _ := pttl.Result()
-	return []byte(payload), ttl, nil
+	return []byte(payload), ttl, true, nil
 }
 
 // SetNX implements exactly-once delivery via SETNX EX.
@@ -318,17 +341,29 @@ func (s *Shield) SetNX(ctx context.Context, key string, value interface{}, expir
 	return s.client.SetNX(ctx, key, value, expiration).Result()
 }
 
-// HotLoad forces a payload into the journal with ActivityWindow TTL.
+// HotLoad forces a payload into the journal with ActivityWindow TTL
+// and sets the hot marker so IsHot() correctly identifies this CRN as active.
 func (s *Shield) HotLoad(ctx context.Context, correlationKey string, payload []byte) error {
-	err := s.Write(ctx, correlationKey, payload)
-	return err
+	// 1. Write the payload to the dirty queue and Redis hash
+	if err := s.Write(ctx, correlationKey, payload); err != nil {
+		return err
+	}
+
+	// 2. Extend the payload TTL to ActivityWindow for hot CRNs.
+	// Note: Expire() returns a *BoolCmd, so we must call .Err() to extract the error.
+	if err := s.client.Expire(ctx, s.payloadKey(correlationKey), s.activityWindow).Err(); err != nil {
+		return err
+	}
+
+	// 3. Set the hot marker so IsHot() returns true for this CRN.
+	return s.SetHotMarker(ctx, correlationKey, s.activityWindow)
 }
 
 // Read fetches the payload from Redis. Returns (payload, isHot, error).
 func (s *Shield) Read(ctx context.Context, correlationKey string) ([]byte, bool, error) {
 	key := s.payloadKey(correlationKey)
 	val, err := s.client.HGet(ctx, key, "p").Result()
-	if err == redis.Nil {
+	if errors.Is(err, redis.Nil) {
 		return nil, false, nil
 	}
 	if err != nil {
