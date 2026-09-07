@@ -190,7 +190,7 @@ signalling any band whose oldest dirty key is approaching expiry. It is disabled
 
 ---
 
-## At-least-once delivery and crash safety
+## Exactly-once logical application through idempotent correlation-key materialization
 
 ```mermaid
 sequenceDiagram
@@ -462,99 +462,189 @@ enabled, plan Redis memory against your concurrent active-session count instead.
 
 ```mermaid
 flowchart TD
-    subgraph Ingest ["Ingest layer"]
-        SQS([SQS Queue])
-        KAF(["Kafka Topics — 16 partitions by correlation_key"])
+%% ============================================================
+%% ASYNCHRONOUS / COLD WRITE
+%% ============================================================
+
+  subgraph ColdWrite["COLD WRITE — asynchronous ingestion"]
+    direction LR
+
+    SQS([SQS])
+    KAF(["Kafka<br/>16 partitions / correlation_key"])
+
+    CW["Consumer Workers"]
+
+    SQS --> CW
+    KAF --> CW
+  end
+
+
+%% ============================================================
+%% SYNCHRONOUS / HOT WRITE
+%% ============================================================
+
+  subgraph HotWrite["HOT WRITE — synchronous API"]
+    direction LR
+
+    API["Application / HTTP API"]
+
+    HW["Write()<br/>synchronous journal update"]
+
+    API -->|"hot write"| HW
+  end
+
+
+%% ============================================================
+%% SLUICE
+%% ============================================================
+
+  subgraph Sluice["SLUICE"]
+    direction TB
+
+    subgraph WriteBuffer["WRITE BUFFER"]
+      direction LR
+
+      W["Write()"]
+      BC["In-memory Channel<br/>burst absorption"]
+      BP["Pipeline Flush<br/>EVALSHA × N"]
+
+      W --> BC
+      BC --> BP
     end
 
-    subgraph Consumers ["Consumer layer"]
-        CW1[Consumer Worker 1]
-        CW2[Consumer Worker 2]
-        CWN[Consumer Worker N]
+
+    subgraph Journal["REDIS STATE JOURNAL"]
+      direction TB
+
+      PAYLOAD["Payload<br/>HSET payload / timestamp / hash"]
+
+      DIRTY["Dirty Queue<br/>ZSET · 16 bands"]
+
+      HOT["Hot Marker<br/>TTL = ActivityWindow"]
+
+      INDEX["Secondary Indexes<br/>SET + ZSET"]
+
+      DLQ["Dead Letter<br/>ZSET · TTL 7 days"]
+
+      PAYLOAD --> DIRTY
+      PAYLOAD --> INDEX
     end
 
-    subgraph App ["Sync request layer"]
-        HTTP["HTTP handlers — HotLoad / Read / Query"]
+
+    subgraph Flush["FLUSH ENGINE"]
+      direction TB
+
+      TRIG["Flush Triggers<br/>250ms / MaxBatchSize / Pre-eviction"]
+
+      DRAIN["DrainBand<br/>ZRANGEBYSCORE + HMGET"]
+
+      CONTRACT["WriteContract<br/>caller-supplied"]
+
+      BULK["BulkWrite<br/>ordered=false"]
+
+      HOTTTL["HotAwareFlush<br/>extend ActivityWindow"]
+
+      TRIG --> DRAIN
+      DRAIN --> CONTRACT
+      CONTRACT --> BULK
+      BULK --> HOTTTL
     end
+  end
 
-    subgraph Library ["sluice library"]
-        subgraph Journal ["Redis cluster — state journal"]
-            PH["sl:ns:payload:{band}:correlationKey — HSET p, ts, h"]
-            DS["sl:ns:dirty:{0..15} — ZSET score=timestamp — 16 band partitions"]
-            HM["sl:ns:hot:{band}:correlationKey — hot marker — TTL ActivityWindow"]
-            IX["sl:ns:idx / ridx:{band}:field — SET + ZSET secondary indexes"]
-            DLQ["sl:ns:dlq:{0..15} — dead-letter ZSET — TTL 7 days"]
-        end
-        subgraph Batcher ["Write batcher (opt-in)"]
-            BC["In-memory channel — absorbs bursts"]
-            BP["Pipeline flush — EVALSHA×N + ZCARD×bands"]
-        end
-        subgraph Engine ["Flush engine — 16 band goroutines"]
-            TT["Time trigger — 250ms window"]
-            VT["Volume trigger — MaxBatchSize threshold"]
-            PE["Pre-eviction trigger — oldest key near KeyTTL"]
-            DR["DrainBand — ZRANGEBYSCORE + pipeline HMGET"]
-            WC["WriteContract — caller-supplied domain logic"]
-            BW["BulkWrite assembly — ordered=false"]
-            RT["RefreshHotTTL — HotAwareFlush"]
-            DLP["ProcessDLQ — Ignore / Upsert / ReInsert"]
-        end
-        subgraph ReadPath ["Read path"]
-            RC["ReadContract — caller-supplied filter"]
-            SRC["Source.Read — FindOne"]
-        end
-    end
 
-    subgraph Store ["Document store"]
-        DB[("AWS DocumentDB — nudge_inventory — _id = correlation_key")]
-    end
+%% ============================================================
+%% DOCUMENT STORE
+%% ============================================================
 
-    SQS --> CW1
-    SQS --> CW2
-    SQS --> CWN
-    KAF --> CW1
-    KAF --> CW2
-    KAF --> CWN
-    CW1 -->|"sluice.Write"| BC
-    CW2 -->|"sluice.Write"| BC
-    CWN -->|"sluice.Write"| BC
-    BC --> BP
-    BP -->|"pipeline EVALSHA"| PH
-    PH --> DS
-    PH --> IX
-    TT --> DR
-    VT --> DR
-    PE --> DR
-    DS --> DR
-    DR --> WC
-    WC --> BW
-    BW -->|"non-retryable errors"| DLQ
-    BW --> DB
-    BW --> RT
-    RT --> PH
-    DLQ --> DLP
-    DLP --> DB
-    HTTP -->|"hot: sub-ms"| PH
-    HTTP --> HM
-    HTTP -->|"Query"| IX
-    HTTP -->|"cold miss"| RC
-    RC --> SRC
-    SRC --> DB
+  subgraph Store["DOCUMENT STORE"]
+    DB[("AWS DocumentDB<br/>nudge_inventory")]
+  end
 
-    style PH fill:#FAEEDA,stroke:#BA7517,color:#633806
-    style DS fill:#FAEEDA,stroke:#BA7517,color:#633806
-    style HM fill:#FAEEDA,stroke:#BA7517,color:#633806
-    style IX fill:#FAEEDA,stroke:#BA7517,color:#633806
-    style DLQ fill:#FAECE7,stroke:#993C1D,color:#712B13
-    style DB fill:#FAECE7,stroke:#993C1D,color:#712B13
-    style TT fill:#E1F5EE,stroke:#0F6E56,color:#085041
-    style VT fill:#E1F5EE,stroke:#0F6E56,color:#085041
-    style PE fill:#E1F5EE,stroke:#0F6E56,color:#085041
-    style RT fill:#E1F5EE,stroke:#0F6E56,color:#085041
-    style BC fill:#E8EAF6,stroke:#3949AB,color:#1A237E
-    style BP fill:#E8EAF6,stroke:#3949AB,color:#1A237E
-    style RC fill:#EDE7F6,stroke:#5E35B1,color:#311B92
-    style SRC fill:#EDE7F6,stroke:#5E35B1,color:#311B92
+
+%% ============================================================
+%% COLD WRITE → SLUICE
+%% ============================================================
+
+  CW -->|"Write() · cold"| W
+
+
+%% ============================================================
+%% HOT WRITE → SLUICE
+%% ============================================================
+
+  HW --> W
+
+%% Hot synchronous writes can establish / refresh hot state
+  HW -.->|"hotLoad / hot session"| HOT
+
+
+%% ============================================================
+%% SLUICE WRITE PIPELINE
+%% ============================================================
+
+  BP -->|"pipeline EVALSHA"| PAYLOAD
+
+  DIRTY --> DRAIN
+
+  BULK -->|"successful flush"| DB
+
+  BULK -->|"non-retryable error"| DLQ
+
+  HOTTTL -->|"refresh TTL"| HOT
+
+
+%% ============================================================
+%% READ PATH — ONE READ MODEL
+%% ============================================================
+
+  subgraph Read["UNIFIED READ PATH"]
+    direction LR
+
+    READ["Read()"]
+
+    HOTREAD["Hot Read<br/>Redis Journal<br/><b>sub-ms</b>"]
+
+    COLDREAD["Cold Miss<br/>ReadContract"]
+
+    QUERY["Query()<br/>secondary indexes"]
+
+    READ -->|"hot"| HOTREAD
+    READ -->|"cold miss"| COLDREAD
+
+    QUERY --> INDEX
+  end
+
+
+%% ============================================================
+%% READ CONNECTIONS
+%% ============================================================
+
+  HOTREAD --> PAYLOAD
+  HOTREAD --> HOT
+
+  COLDREAD -->|"Source.Read"| DB
+
+
+%% ============================================================
+%% STYLING
+%% ============================================================
+
+  classDef cold fill:#E8EAF6,stroke:#3949AB,color:#1A237E
+  classDef hot fill:#E1F5EE,stroke:#0F6E56,color:#085041
+  classDef journal fill:#FAEEDA,stroke:#BA7517,color:#633806
+  classDef store fill:#FAECE7,stroke:#993C1D,color:#712B13
+  classDef read fill:#EDE7F6,stroke:#5E35B1,color:#311B92
+  classDef engine fill:#F3F4F6,stroke:#6B7280,color:#374151
+  classDef dlq fill:#FAECE7,stroke:#993C1D,color:#712B13
+
+  class SQS,KAF,CW cold
+  class API,HW hot
+  class W,BC,BP cold
+  class PAYLOAD,DIRTY,HOT,INDEX journal
+  class TRIG,DRAIN,CONTRACT,BULK,HOTTTL engine
+  class READ,HOTREAD,COLDREAD,QUERY read
+  class DB store
+  class DLQ dlq
 ```
 
 ---
