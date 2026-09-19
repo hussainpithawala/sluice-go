@@ -4,164 +4,16 @@ package shield
 
 import (
 	"context"
-	"crypto/tls"
 	"errors"
 	"fmt"
 	"hash/fnv"
 	"log/slog"
+	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/redis/go-redis/v9"
 )
-
-// FlushRecord is the internal unit that travels through the pipeline.
-type FlushRecord struct {
-	CorrelationKey string
-	Payload        []byte
-	ReceivedAt     time.Time
-}
-
-// WriteOptions configures optional behaviors for a single write operation.
-type WriteOptions struct {
-	ForceHot     bool
-	ContentHash  string
-	DedupEnabled bool
-	IndexesJSON  string
-}
-
-// RedisConfig holds Redis connectivity parameters.
-type RedisConfig struct {
-	// Network type to use, either tcp or unix.
-	// Default is tcp.
-	//
-	// Ignored when ClusterMode is true: go-redis ClusterOptions has no
-	// Network field, since a unix socket cannot reach a multi-node cluster.
-	Network string
-
-	// Redis server address(es) in "host:port" format.
-	//
-	// For cluster-mode-enabled deployments (including AWS ElastiCache CME),
-	// this is typically a single cluster CONFIGURATION ENDPOINT — NOT
-	// multiple node addresses. Address count alone cannot distinguish
-	// "one node, standalone" from "one config endpoint, cluster" — see
-	// ClusterMode below, which is the actual switch.
-	Addrs []string
-
-	// ClusterMode explicitly selects a cluster-aware client (go-redis
-	// ClusterClient) when true, or a standalone client when false.
-	//
-	// This MUST be set explicitly — it is intentionally not inferred from
-	// len(Addrs), because a cluster-mode-enabled deployment (e.g. AWS
-	// ElastiCache CME) is commonly configured with a SINGLE address (the
-	// cluster configuration endpoint), which previously caused this package
-	// to silently build a standalone client against what is actually a
-	// multi-shard cluster. Get this wrong and every command that lands on
-	// a slot outside the one node you happen to hit will fail once the
-	// cluster redirects it (MOVED) — a standalone client doesn't follow
-	// those redirects.
-	ClusterMode bool
-
-	// Username to authenticate the current connection when Redis ACLs are used.
-	// See: https://redis.io/commands/auth.
-	Username string
-
-	// Password to authenticate the current connection.
-	// See: https://redis.io/commands/auth.
-	Password string
-
-	// Redis DB to select after connecting to a server.
-	// See: https://redis.io/commands/select.
-	// NOTE: cluster-mode-enabled clusters only support DB 0. Setting this
-	// nonzero with ClusterMode=true will fail at connection/command time.
-	DB int
-
-	// Dial timeout for establishing new connections.
-	// Default is 5 seconds.
-	DialTimeout time.Duration
-
-	// Timeout for socket reads.
-	// If timeout is reached, read commands will fail with a timeout error
-	// instead of blocking.
-	//
-	// Use value -1 for no timeout and 0 for default.
-	// Default is 3 seconds.
-	ReadTimeout time.Duration
-
-	// Timeout for socket writes.
-	// If timeout is reached, write commands will fail with a timeout error
-	// instead of blocking.
-	//
-	// Use value -1 for no timeout and 0 for default.
-	// Default is ReadTimout.
-	WriteTimeout time.Duration
-
-	// Maximum number of socket connections.
-	// Default is 10 connections per every CPU as reported by runtime.NumCPU.
-	PoolSize int
-
-	// TLS Config used to connect to a server.
-	// TLS will be negotiated only if this field is set.
-	TLSConfig *tls.Config
-}
-
-// VolumeSignaler is called by the batcher after flushing a batch to signal
-// the engine that a band may have reached its volume threshold.
-type VolumeSignaler func(band int)
-
-// writeEntry is a single buffered write waiting to be pipelined.
-type writeEntry struct {
-	correlationKey string
-	payload        []byte
-	ts             float64
-}
-
-// Shield manages all Redis interactions for the library.
-type Shield struct {
-	client         redis.UniversalClient
-	namespace      string
-	bandCount      int
-	keyTTL         time.Duration
-	activityWindow time.Duration
-	dlqTTL         time.Duration // how long dead-letter payload hashes are kept
-	writeScript    *redis.Script
-	writeScriptSHA string // pre-loaded SHA; used by flushBatch to avoid sending script text each time
-
-	// Batching fields — all nil/zero when batching is disabled.
-	batchCh        chan writeEntry
-	batchSize      int
-	batchWin       time.Duration
-	stopBatch      chan struct{}
-	batchWg        sync.WaitGroup
-	volumeSignaler VolumeSignaler
-	batchCtx       context.Context // parent context; cancellation stops the batcher
-}
-
-// atomicWriteLua handles content deduplication atomically without cjson.
-// Returns 0 if deduplicated (TTL refreshed), 1 if written.
-const atomicWriteLua = `redis.call('HSET', KEYS[1], 'p', ARGV[1], 'ts', ARGV[2]) redis.call('EXPIRE', KEYS[1], tonumber(ARGV[4])) redis.call('ZADD', KEYS[2], ARGV[2], ARGV[3]) return 1`
-
-const atomicDedupWriteLua = `
-local payloadKey = KEYS[1]
-local dirtyKey = KEYS[2]
-local payload = ARGV[1]
-local score = ARGV[2]
-local corrKey = ARGV[3]
-local ttl = tonumber(ARGV[4])
-local contentHash = ARGV[5]
-
-local existingHash = redis.call('HGET', payloadKey, 'h')
-if existingHash == contentHash then
-    redis.call('EXPIRE', payloadKey, ttl)
-    return 0
-end
-
-redis.call('HSET', payloadKey, 'p', payload, 'ts', score, 'h', contentHash)
-redis.call('EXPIRE', payloadKey, ttl)
-redis.call('ZADD', dirtyKey, score, corrKey)
-return 1
-`
 
 // New initialises the Redis client and validates connectivity.
 func New(cfg RedisConfig, namespace string, bandCount int, keyTTL time.Duration, activityWindow time.Duration) (*Shield, error) {
@@ -305,7 +157,7 @@ func (s *Shield) UpdateIndexes(ctx context.Context, correlationKey string, index
 
 func (s *Shield) hotMarkerKey(correlationKey string) string {
 	band := s.BandFor(correlationKey)
-	return fmt.Sprintf("sl:%s:hot:{%d}:%s", s.namespace, band, correlationKey)
+	return fmt.Sprintf("sl:%s:hot:{%d}:%s", s.Namespace, band, correlationKey)
 }
 
 func (s *Shield) SetHotMarker(ctx context.Context, correlationKey string, ttl time.Duration) error {
@@ -317,23 +169,49 @@ func (s *Shield) IsHot(ctx context.Context, correlationKey string) (bool, error)
 	return n > 0, err
 }
 
-// ReadWithTTL fetches payload and remaining TTL in one pipeline round-trip.
-func (s *Shield) ReadWithTTL(ctx context.Context, correlationKey string) ([]byte, time.Duration, bool, error) {
+// ReadJournal fetches payload, remaining TTL, and the journal write version
+// in one pipelined round-trip. Version is the ts assigned at write time and
+// is the single ordering/versioning token shared by the L1 local journal,
+// adapter ordering guards, and (Phase 2) broadcast messages.
+func (s *Shield) ReadJournal(ctx context.Context, correlationKey string) (JournalRead, error) {
 	key := s.payloadKey(correlationKey)
 	pipe := s.client.Pipeline()
 	hget := pipe.HGet(ctx, key, "p")
 	pttl := pipe.PTTL(ctx, key)
-	_, err := pipe.Exec(ctx)
+	hts := pipe.HGet(ctx, key, "ts")
 
-	if errors.Is(err, redis.Nil) {
-		return nil, 0, false, nil
+	_, err := pipe.Exec(ctx)
+	if err != nil && !errors.Is(err, redis.Nil) {
+		return JournalRead{}, err
 	}
-	if err != nil {
-		return nil, 0, false, err
+
+	payload, perr := hget.Result()
+	if errors.Is(perr, redis.Nil) || payload == "" {
+		return JournalRead{}, nil // not found
 	}
-	payload, _ := hget.Result()
+
 	ttl, _ := pttl.Result()
-	return []byte(payload), ttl, true, nil
+	tsStr, _ := hts.Result()
+
+	var version int64
+	if tsStr != "" {
+		if f, perr := strconv.ParseFloat(tsStr, 64); perr == nil {
+			version = int64(f)
+		}
+	}
+
+	return JournalRead{
+		Payload: []byte(payload),
+		PTTL:    ttl,
+		Version: version,
+		Found:   true,
+	}, nil
+}
+
+// Deprecated: use ReadJournal. Kept so v1.0.7 call sites compile unchanged.
+func (s *Shield) ReadWithTTL(ctx context.Context, correlationKey string) ([]byte, time.Duration, bool, error) {
+	jr, err := s.ReadJournal(ctx, correlationKey)
+	return jr.Payload, jr.PTTL, jr.Found, err
 }
 
 // SetNX implements exactly-once delivery via SETNX EX.
@@ -455,38 +333,7 @@ func (s *Shield) DrainBand(ctx context.Context, band, maxBatch int) ([]FlushReco
 		return nil, fmt.Errorf("sluice/shield: pipeline hmget band %d: %w", band, err)
 	}
 
-	records := make([]FlushRecord, 0, len(members))
-	// expired collects keys whose payload TTL elapsed before we could flush them.
-	// These are cleaned from the dirty set immediately — there is nothing to write.
-	expired := make([]interface{}, 0)
-
-	for i, cmd := range cmds {
-		vals, cmdErr := cmd.Result()
-		if cmdErr != nil || vals[0] == nil {
-			// Payload hash evicted by Redis TTL — safe to remove from dirty set.
-			expired = append(expired, corrKeys[i])
-			continue
-		}
-		payload, ok := vals[0].(string)
-		if !ok || payload == "" {
-			expired = append(expired, corrKeys[i])
-			continue
-		}
-		// Valid payload — return WITHOUT ZREMing. CommitKeys is called
-		// by the engine only after a confirmed successful BulkWrite.
-		records = append(records, FlushRecord{
-			CorrelationKey: corrKeys[i],
-			Payload:        []byte(payload),
-			ReceivedAt:     time.Now(),
-		})
-	}
-
-	// Clean up expired keys immediately — there is nothing to flush for them.
-	if len(expired) > 0 {
-		_ = s.client.ZRem(ctx, dirtyKey, expired...).Err()
-	}
-
-	return records, nil
+	return drainAction(ctx, members, cmds, corrKeys, s, dirtyKey)
 }
 
 // CommitKeys removes successfully persisted correlation keys from the dirty
@@ -618,6 +465,10 @@ func (s *Shield) DrainDLQ(ctx context.Context, band, maxBatch int) ([]FlushRecor
 		return nil, fmt.Errorf("sluice/shield: pipeline hmget dlq band %d: %w", band, err)
 	}
 
+	return drainAction(ctx, members, cmds, corrKeys, s, dlqKey)
+}
+
+func drainAction(ctx context.Context, members []redis.Z, cmds []*redis.SliceCmd, corrKeys []string, s *Shield, drainKey string) ([]FlushRecord, error) {
 	records := make([]FlushRecord, 0, len(members))
 	expired := make([]interface{}, 0)
 
@@ -632,15 +483,28 @@ func (s *Shield) DrainDLQ(ctx context.Context, band, maxBatch int) ([]FlushRecor
 			expired = append(expired, corrKeys[i])
 			continue
 		}
+
+		// Extract the journal write timestamp for ordering guards and L1 versioning.
+		var ts int64
+		if len(vals) > 1 {
+			if tsStr, ok := vals[1].(string); ok && tsStr != "" {
+				if f, perr := strconv.ParseFloat(tsStr, 64); perr == nil {
+					ts = int64(f)
+				}
+			}
+		}
+
+		// Valid payload — return WITHOUT ZREMing...
 		records = append(records, FlushRecord{
 			CorrelationKey: corrKeys[i],
 			Payload:        []byte(payload),
 			ReceivedAt:     time.Now(),
+			JournalTS:      ts,
 		})
 	}
 
 	if len(expired) > 0 {
-		_ = s.client.ZRem(ctx, dlqKey, expired...).Err()
+		_ = s.client.ZRem(ctx, drainKey, expired...).Err()
 	}
 
 	return records, nil
@@ -675,6 +539,8 @@ func (s *Shield) BandCount() int { return s.bandCount }
 
 // Namespace returns the namespace configured for this Shield instance.
 func (s *Shield) Namespace() string { return s.namespace }
+
+func (s *Shield) Client() redis.UniversalClient { return s.client }
 
 // BandForKey returns the band index for correlationKey using FNV-32a.
 // Exported at package level so callers that need to predict where a key lands
@@ -845,7 +711,7 @@ func (s *Shield) flushBatch(entries []writeEntry) {
 		}
 		if _, err := pipe.Exec(ctx); err != nil && err != redis.Nil {
 			slog.Error("sluice/shield: batch pipeline exec failed",
-				"namespace", s.namespace, "batch_size", len(entries), "err", err)
+				"namespace", s.Namespace, "batch_size", len(entries), "err", err)
 		}
 		for i, b := range touchedBands {
 			if depth, err := zcardCmds[i].Result(); err == nil && int(depth) >= s.batchSize {
@@ -857,7 +723,7 @@ func (s *Shield) flushBatch(entries []writeEntry) {
 
 	if _, err := pipe.Exec(ctx); err != nil && err != redis.Nil {
 		slog.Error("sluice/shield: batch pipeline exec failed",
-			"namespace", s.namespace, "batch_size", len(entries), "err", err)
+			"namespace", s.Namespace, "batch_size", len(entries), "err", err)
 	}
 }
 
