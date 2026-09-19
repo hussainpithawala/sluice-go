@@ -157,7 +157,7 @@ func (s *Shield) UpdateIndexes(ctx context.Context, correlationKey string, index
 
 func (s *Shield) hotMarkerKey(correlationKey string) string {
 	band := s.BandFor(correlationKey)
-	return fmt.Sprintf("sl:%s:hot:{%d}:%s", s.Namespace, band, correlationKey)
+	return fmt.Sprintf("sl:%s:hot:{%d}:%s", s.namespace, band, correlationKey)
 }
 
 func (s *Shield) SetHotMarker(ctx context.Context, correlationKey string, ttl time.Duration) error {
@@ -549,7 +549,7 @@ func (s *Shield) Client() redis.UniversalClient { return s.client }
 func BandForKey(correlationKey string, bandCount int) int {
 	h := fnv.New32a()
 	_, _ = h.Write([]byte(correlationKey))
-	return int(h.Sum32()) % bandCount
+	return int(h.Sum32() % uint32(bandCount))
 }
 
 // BandFor returns the band index for the given correlation key using FNV-32a.
@@ -711,7 +711,7 @@ func (s *Shield) flushBatch(entries []writeEntry) {
 		}
 		if _, err := pipe.Exec(ctx); err != nil && err != redis.Nil {
 			slog.Error("sluice/shield: batch pipeline exec failed",
-				"namespace", s.Namespace, "batch_size", len(entries), "err", err)
+				"namespace", s.namespace, "batch_size", len(entries), "err", err)
 		}
 		for i, b := range touchedBands {
 			if depth, err := zcardCmds[i].Result(); err == nil && int(depth) >= s.batchSize {
@@ -723,7 +723,7 @@ func (s *Shield) flushBatch(entries []writeEntry) {
 
 	if _, err := pipe.Exec(ctx); err != nil && err != redis.Nil {
 		slog.Error("sluice/shield: batch pipeline exec failed",
-			"namespace", s.Namespace, "batch_size", len(entries), "err", err)
+			"namespace", s.namespace, "batch_size", len(entries), "err", err)
 	}
 }
 

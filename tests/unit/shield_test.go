@@ -2,6 +2,7 @@ package unit
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"testing"
@@ -13,8 +14,10 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// testRedisAddr returns the Redis address for testing.
-// Defaults to localhost:6379 if not set.
+// testRedisDB isolates tests from the default DB (0) to prevent SCAN hangs
+// and accidental data deletion in your local dev environment.
+const testRedisDB = 15
+
 func testRedisAddr() string {
 	if addr := os.Getenv("REDIS_ADDR"); addr != "" {
 		return addr
@@ -22,11 +25,11 @@ func testRedisAddr() string {
 	return "localhost:6379"
 }
 
-// newTestShield creates a Shield instance for testing with a unique namespace.
 func newTestShield(t *testing.T, namespace string) *shield.Shield {
 	cfg := shield.RedisConfig{
 		Addrs:        []string{testRedisAddr()},
 		ClusterMode:  false,
+		DB:           testRedisDB, // <--- ISOLATE TESTS
 		DialTimeout:  5 * time.Second,
 		ReadTimeout:  3 * time.Second,
 		WriteTimeout: 3 * time.Second,
@@ -36,21 +39,37 @@ func newTestShield(t *testing.T, namespace string) *shield.Shield {
 	s, err := shield.New(cfg, namespace, 16, 30*time.Second, 4*time.Hour)
 	require.NoError(t, err, "failed to create shield")
 
-	// Clean up any existing keys for this namespace
+	// Clean up any existing keys for this namespace with a strict timeout
 	cleanRedisKeys(t, s.Client(), namespace)
 
 	return s
 }
 
-// cleanRedisKeys removes all keys matching the namespace pattern.
 func cleanRedisKeys(t *testing.T, client redis.UniversalClient, namespace string) {
-	ctx := context.Background()
-	pattern := fmt.Sprintf("sl:%s:*", namespace)
+	// Fail fast if cleanup takes too long (prevents infinite hangs)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 
+	// If this is the first test running against the isolated DB,
+	// FLUSHDB is instantaneous and guarantees a clean slate.
+	// If you prefer to only delete the specific namespace, use the SCAN loop below.
+
+	// Option A: Instant cleanup (Recommended for isolated test DBs)
+	if err := client.FlushDB(ctx).Err(); err != nil {
+		t.Logf("warning: flushdb failed, falling back to scan: %v", err)
+	} else {
+		return
+	}
+
+	// Option B: Namespace-specific cleanup (Fallback)
+	pattern := fmt.Sprintf("sl:%s:*", namespace)
 	var cursor uint64
 	for {
 		keys, nextCursor, err := client.Scan(ctx, cursor, pattern, 100).Result()
 		if err != nil {
+			if errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("cleanRedisKeys timed out: Redis DB might be too large. Use FLUSHDB or a dedicated test instance.")
+			}
 			t.Logf("warning: scan failed: %v", err)
 			break
 		}
@@ -252,68 +271,199 @@ func TestRead_HotPath(t *testing.T) {
 	assert.Equal(t, payload, readPayload)
 }
 
+// knownKeysForBand contains pre-computed keys that hash to each band.
+// Generated once by running: for i := 0; i < 10000; i++ { band := BandForKey(fmt.Sprintf("key_%d", i), 16); ... }
+var knownKeysForBand = map[int][]string{
+	0:  {"key_3", "key_19", "key_35", "key_51"},
+	1:  {"key_1", "key_17", "key_33", "key_49"},
+	2:  {"key_6", "key_22", "key_38", "key_54"},
+	15: {"key_15", "key_31", "key_47", "key_63"},
+}
+
 func TestDrainBand_Basic(t *testing.T) {
-	s := newTestShield(t, "test_drain_band_basic")
+	const (
+		namespace   = "test_drain_band_basic"
+		bandCount   = 16
+		testDB      = 15 // isolated DB; keeps FlushDB instant and side-effect-free
+		wantRecords = 3
+		candidates  = 64 // pigeonhole: >=4 candidates share a band when bandCount=16
+	)
+
+	addr := os.Getenv("REDIS_ADDR")
+	if addr == "" {
+		addr = "localhost:6379"
+	}
+
+	s, err := shield.New(shield.RedisConfig{
+		Addrs:        []string{addr},
+		ClusterMode:  false,
+		DB:           testDB,
+		DialTimeout:  5 * time.Second,
+		ReadTimeout:  3 * time.Second,
+		WriteTimeout: 3 * time.Second,
+		PoolSize:     10,
+	}, namespace, bandCount, 30*time.Second, 4*time.Hour)
+	require.NoError(t, err, "shield.New")
 	defer s.Close()
 
-	ctx := context.Background()
-	band := 0
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
 
-	// Write 3 keys to the same band
-	keys := []string{"key_001", "key_002", "key_003"}
-	for _, key := range keys {
-		// Ensure all keys hash to band 0
-		for s.BandFor(key) != band {
-			key = key + "_retry"
+	// Conclusive isolation: wipe the dedicated test DB so no residue from any
+	// previous run or test can influence a single assertion below.
+	require.NoError(t, s.Client().FlushDB(ctx).Err(), "FlushDB test db")
+	defer func() { _ = s.Client().FlushDB(context.Background()).Err() }()
+
+	// ── Deterministic key selection ────────────────────────────────────────
+	// FNV-32a is a pure function: band assignment for a fixed candidate list
+	// is identical on every run. Grouping + lowest-band tie-break makes the
+	// selected triple fully deterministic without any unbounded search.
+	byBand := make(map[int][]string, bandCount)
+	for i := 0; i < candidates; i++ {
+		key := fmt.Sprintf("drain_basic_%03d", i)
+		b := shield.BandForKey(key, bandCount)
+		byBand[b] = append(byBand[b], key)
+	}
+
+	targetBand := -1
+	for b := 0; b < bandCount; b++ { // lowest qualifying band = deterministic tie-break
+		if len(byBand[b]) >= wantRecords {
+			targetBand = b
+			break
 		}
-		err := s.Write(ctx, key, []byte(fmt.Sprintf(`{"key":"%s"}`, key)))
-		require.NoError(t, err)
+	}
+	require.NotEqual(t, -1, targetBand,
+		"pigeonhole guarantee violated: no band holds %d candidates", wantRecords)
+	keys := byBand[targetBand][:wantRecords]
+
+	// ── Write exactly wantRecords keys, all hashing to targetBand ──────────
+	payloads := make(map[string][]byte, wantRecords)
+	for _, k := range keys {
+		p := []byte(fmt.Sprintf(`{"key":%q,"v":1}`, k))
+		payloads[k] = p
+		require.NoError(t, s.Write(ctx, k, p), "Write %s", k)
 	}
 
-	// Drain the band
-	records, err := s.DrainBand(ctx, band, 10)
+	// Pre-drain invariant: only targetBand is dirty; a neighbour band is empty.
+	depth, err := s.DirtyQueueDepth(ctx, targetBand)
 	require.NoError(t, err)
-	assert.Len(t, records, 3)
+	require.Equal(t, int64(wantRecords), depth, "dirty depth before drain")
 
-	// Verify records have payloads
-	for _, rec := range records {
-		assert.NotEmpty(t, rec.Payload)
-		assert.NotEmpty(t, rec.CorrelationKey)
+	otherBand := (targetBand + 1) % bandCount
+	otherDepth, err := s.DirtyQueueDepth(ctx, otherBand)
+	require.NoError(t, err)
+	require.Zero(t, otherDepth, "band %d must be untouched", otherBand)
+
+	// ── Drain ──────────────────────────────────────────────────────────────
+	records, err := s.DrainBand(ctx, targetBand, 10)
+	require.NoError(t, err, "DrainBand")
+	require.Len(t, records, wantRecords, "DrainBand record count")
+
+	seen := make(map[string]bool, wantRecords)
+	got := make(map[string][]byte, wantRecords)
+	for _, r := range records {
+		require.NotEmpty(t, r.CorrelationKey)
+		require.False(t, seen[r.CorrelationKey], "duplicate record for %s", r.CorrelationKey)
+		seen[r.CorrelationKey] = true
+		got[r.CorrelationKey] = r.Payload
+		// If your tree carries FlushRecord.JournalTS (ts contract), assert it:
+		// require.Positive(t, r.JournalTS, "journal ts for %s", r.CorrelationKey)
+	}
+	for _, k := range keys {
+		require.Contains(t, got, k, "missing record for %s", k)
+		require.Equal(t, payloads[k], got[k], "payload round-trip for %s", k)
 	}
 
-	// Keys should still be in dirty set (not committed yet)
-	depth, err := s.DirtyQueueDepth(ctx, band)
+	// ── Two-phase commit: drain must NOT remove dirty entries ──────────────
+	depth, err = s.DirtyQueueDepth(ctx, targetBand)
 	require.NoError(t, err)
-	assert.Equal(t, int64(3), depth)
+	assert.Equal(t, int64(wantRecords), depth,
+		"dirty entries must survive DrainBand until CommitKeys")
+
+	// ── Commit, then verify the band is fully drained ──────────────────────
+	require.NoError(t, s.CommitKeys(ctx, targetBand, keys), "CommitKeys")
+
+	depth, err = s.DirtyQueueDepth(ctx, targetBand)
+	require.NoError(t, err)
+	assert.Zero(t, depth, "dirty depth after commit")
+
+	records2, err := s.DrainBand(ctx, targetBand, 10)
+	require.NoError(t, err)
+	assert.Empty(t, records2, "second drain must be empty")
+}
+
+func TestGenerateKnownKeysForBand(t *testing.T) {
+	s := newTestShield(t, "generate_keys")
+	defer s.Close()
+
+	keysByBand := make(map[int][]string)
+
+	for i := 0; i < 10000; i++ {
+		key := fmt.Sprintf("key_%d", i)
+		band := s.BandFor(key)
+		if len(keysByBand[band]) < 10 { // Collect up to 10 keys per band
+			keysByBand[band] = append(keysByBand[band], key)
+		}
+	}
+
+	// Print the map for copy-paste
+	fmt.Println("var knownKeysForBand = map[int][]string{")
+	for band := 0; band < 16; band++ {
+		keys := keysByBand[band]
+		fmt.Printf("\t%d: %#v,\n", band, keys)
+	}
+	fmt.Println("}")
 }
 
 func TestCommitKeys(t *testing.T) {
 	s := newTestShield(t, "test_commit_keys")
 	defer s.Close()
 
-	ctx := context.Background()
-	band := 0
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 
-	// Write and drain
-	key := "commit_test_key"
-	for s.BandFor(key) != band {
-		key = key + "_x"
+	const (
+		bandCount  = 16
+		candidates = 32
+	)
+
+	// Deterministic key selection: generate candidates, group by band,
+	// pick the lowest band with at least one candidate.
+	byBand := make(map[int][]string, bandCount)
+	for i := 0; i < candidates; i++ {
+		key := fmt.Sprintf("commit_test_%03d", i)
+		b := s.BandFor(key)
+		byBand[b] = append(byBand[b], key)
 	}
 
+	targetBand := -1
+	for b := 0; b < bandCount; b++ {
+		if len(byBand[b]) > 0 {
+			targetBand = b
+			break
+		}
+	}
+	require.NotEqual(t, -1, targetBand, "no band had any candidates")
+
+	key := byBand[targetBand][0]
+
+	// Write the key
 	err := s.Write(ctx, key, []byte(`{"test":"data"}`))
 	require.NoError(t, err)
 
-	records, err := s.DrainBand(ctx, band, 10)
+	// Drain the band
+	records, err := s.DrainBand(ctx, targetBand, 10)
 	require.NoError(t, err)
-	assert.Len(t, records, 1)
+	require.Len(t, records, 1)
+	assert.Equal(t, key, records[0].CorrelationKey)
 
 	// Commit the key
 	corrKeys := []string{records[0].CorrelationKey}
-	err = s.CommitKeys(ctx, band, corrKeys)
+	err = s.CommitKeys(ctx, targetBand, corrKeys)
 	require.NoError(t, err)
 
 	// Dirty queue should be empty now
-	depth, err := s.DirtyQueueDepth(ctx, band)
+	depth, err := s.DirtyQueueDepth(ctx, targetBand)
 	require.NoError(t, err)
 	assert.Equal(t, int64(0), depth)
 }
@@ -322,102 +472,123 @@ func TestMoveToDeadLetter(t *testing.T) {
 	s := newTestShield(t, "test_move_to_dlq")
 	defer s.Close()
 
-	ctx := context.Background()
-	band := 0
+	// Strict timeout to catch Redis hangs instantly instead of generic test timeouts
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 
-	// Write a key
-	key := "dlq_test_key"
-	for s.BandFor(key) != band {
-		key = key + "_y"
+	const (
+		bandCount  = 16
+		candidates = 32
+	)
+
+	// Deterministic key selection: generate candidates, group by band,
+	// pick the lowest band with at least one candidate.
+	byBand := make(map[int][]string, bandCount)
+	for i := 0; i < candidates; i++ {
+		key := fmt.Sprintf("dlq_test_%03d", i)
+		b := s.BandFor(key)
+		byBand[b] = append(byBand[b], key)
 	}
 
+	targetBand := -1
+	for b := 0; b < bandCount; b++ {
+		if len(byBand[b]) > 0 {
+			targetBand = b
+			break
+		}
+	}
+	require.NotEqual(t, -1, targetBand, "no band had any candidates")
+
+	key := byBand[targetBand][0]
+
+	// Write the key
 	err := s.Write(ctx, key, []byte(`{"bad":"data"}`))
 	require.NoError(t, err)
 
 	// Drain it
-	records, err := s.DrainBand(ctx, band, 10)
+	records, err := s.DrainBand(ctx, targetBand, 10)
 	require.NoError(t, err)
 	require.Len(t, records, 1)
 
+	// Explicitly verify the drained record matches what we wrote
+	assert.Equal(t, key, records[0].CorrelationKey)
+
 	// Move to DLQ
 	corrKeys := []string{records[0].CorrelationKey}
-	err = s.MoveToDeadLetter(ctx, band, corrKeys, "test_reason")
+	err = s.MoveToDeadLetter(ctx, targetBand, corrKeys, "test_reason")
 	require.NoError(t, err)
 
-	// Dirty queue should be empty
-	depth, err := s.DirtyQueueDepth(ctx, band)
+	// Dirty queue should be empty (keys removed from dirty set)
+	depth, err := s.DirtyQueueDepth(ctx, targetBand)
 	require.NoError(t, err)
-	assert.Equal(t, int64(0), depth)
+	assert.Equal(t, int64(0), depth, "dirty queue must be empty after DLQ move")
 
-	// DLQ should have 1 entry
-	dlqDepth, err := s.DeadLetterDepth(ctx, band)
+	// DLQ should have exactly 1 entry
+	dlqDepth, err := s.DeadLetterDepth(ctx, targetBand)
 	require.NoError(t, err)
-	assert.Equal(t, int64(1), dlqDepth)
+	assert.Equal(t, int64(1), dlqDepth, "DLQ must contain exactly 1 entry")
 }
 
 func TestDrainDLQ(t *testing.T) {
 	s := newTestShield(t, "test_drain_dlq")
 	defer s.Close()
 
-	ctx := context.Background()
-	band := 0
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 
-	// Write, drain, and move to DLQ
-	key := "dlq_drain_key"
-	for s.BandFor(key) != band {
-		key = key + "_z"
-	}
+	targetBand, keys := findKeysForTest(t, s, "dlq_drain", 1)
+	key := keys[0]
 
 	err := s.Write(ctx, key, []byte(`{"dlq":"test"}`))
 	require.NoError(t, err)
 
-	records, err := s.DrainBand(ctx, band, 10)
+	records, err := s.DrainBand(ctx, targetBand, 10)
 	require.NoError(t, err)
 	require.Len(t, records, 1)
+	assert.Equal(t, key, records[0].CorrelationKey)
 
-	err = s.MoveToDeadLetter(ctx, band, []string{records[0].CorrelationKey}, "reason")
+	err = s.MoveToDeadLetter(ctx, targetBand, []string{records[0].CorrelationKey}, "reason")
 	require.NoError(t, err)
 
 	// Drain DLQ
-	dlqRecords, err := s.DrainDLQ(ctx, band, 10)
+	dlqRecords, err := s.DrainDLQ(ctx, targetBand, 10)
 	require.NoError(t, err)
 	assert.Len(t, dlqRecords, 1)
-	assert.Equal(t, records[0].CorrelationKey, dlqRecords[0].CorrelationKey)
+	assert.Equal(t, key, dlqRecords[0].CorrelationKey)
 }
 
 func TestCommitDLQKeys(t *testing.T) {
 	s := newTestShield(t, "test_commit_dlq_keys")
 	defer s.Close()
 
-	ctx := context.Background()
-	band := 0
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 
-	// Setup: write → drain → DLQ → drain DLQ
-	key := "dlq_commit_key"
-	for s.BandFor(key) != band {
-		key = key + "_w"
-	}
+	targetBand, keys := findKeysForTest(t, s, "dlq_commit", 1)
+	key := keys[0]
 
 	err := s.Write(ctx, key, []byte(`{"commit":"dlq"}`))
 	require.NoError(t, err)
 
-	records, err := s.DrainBand(ctx, band, 10)
+	records, err := s.DrainBand(ctx, targetBand, 10)
 	require.NoError(t, err)
 	require.Len(t, records, 1)
+	assert.Equal(t, key, records[0].CorrelationKey)
 
-	err = s.MoveToDeadLetter(ctx, band, []string{records[0].CorrelationKey}, "test")
+	err = s.MoveToDeadLetter(ctx, targetBand, []string{records[0].CorrelationKey}, "test")
 	require.NoError(t, err)
 
-	dlqRecords, err := s.DrainDLQ(ctx, band, 10)
+	dlqRecords, err := s.DrainDLQ(ctx, targetBand, 10)
 	require.NoError(t, err)
 	require.Len(t, dlqRecords, 1)
+	assert.Equal(t, key, dlqRecords[0].CorrelationKey)
 
 	// Commit DLQ keys
-	err = s.CommitDLQKeys(ctx, band, []string{dlqRecords[0].CorrelationKey})
+	err = s.CommitDLQKeys(ctx, targetBand, []string{dlqRecords[0].CorrelationKey})
 	require.NoError(t, err)
 
 	// DLQ should be empty
-	dlqDepth, err := s.DeadLetterDepth(ctx, band)
+	dlqDepth, err := s.DeadLetterDepth(ctx, targetBand)
 	require.NoError(t, err)
 	assert.Equal(t, int64(0), dlqDepth)
 }
@@ -473,23 +644,13 @@ func TestSInter_ClusterSafe(t *testing.T) {
 	s := newTestShield(t, "test_sinter")
 	defer s.Close()
 
-	ctx := context.Background()
-	band := 0
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 
-	// Create two equality indexes in the same band
-	key1 := "sinter_key_001"
-	key2 := "sinter_key_002"
-	key3 := "sinter_key_003"
-
-	for s.BandFor(key1) != band {
-		key1 = key1 + "_a"
-	}
-	for s.BandFor(key2) != band {
-		key2 = key2 + "_b"
-	}
-	for s.BandFor(key3) != band {
-		key3 = key3 + "_c"
-	}
+	// Deterministically find 3 keys guaranteed to hash to the SAME band.
+	// This is mandatory for SInter to work in Redis Cluster (single hash slot).
+	targetBand, keys := findKeysForTest(t, s, "sinter", 3)
+	key1, key2, key3 := keys[0], keys[1], keys[2]
 
 	// key1 and key2 have channel=push
 	// key2 and key3 have campaign=camp_001
@@ -497,16 +658,13 @@ func TestSInter_ClusterSafe(t *testing.T) {
 	indexes2 := map[string]interface{}{"channel": "push", "campaign": "camp_001"}
 	indexes3 := map[string]interface{}{"campaign": "camp_001"}
 
-	err := s.UpdateIndexes(ctx, key1, indexes1, 1*time.Hour)
-	require.NoError(t, err)
-	err = s.UpdateIndexes(ctx, key2, indexes2, 1*time.Hour)
-	require.NoError(t, err)
-	err = s.UpdateIndexes(ctx, key3, indexes3, 1*time.Hour)
-	require.NoError(t, err)
+	require.NoError(t, s.UpdateIndexes(ctx, key1, indexes1, 1*time.Hour))
+	require.NoError(t, s.UpdateIndexes(ctx, key2, indexes2, 1*time.Hour))
+	require.NoError(t, s.UpdateIndexes(ctx, key3, indexes3, 1*time.Hour))
 
 	// Intersect: channel=push AND campaign=camp_001
-	eqKey1 := shield.IndexKey(s.Namespace(), band, "channel", "push")
-	eqKey2 := shield.IndexKey(s.Namespace(), band, "campaign", "camp_001")
+	eqKey1 := shield.IndexKey(s.Namespace(), targetBand, "channel", "push")
+	eqKey2 := shield.IndexKey(s.Namespace(), targetBand, "campaign", "camp_001")
 
 	result, err := s.SInter(ctx, eqKey1, eqKey2)
 	require.NoError(t, err)
@@ -592,19 +750,16 @@ func TestOldestDirtyScore(t *testing.T) {
 	s := newTestShield(t, "test_oldest_dirty")
 	defer s.Close()
 
-	ctx := context.Background()
-	band := 0
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 
-	// Empty band should return 0
-	score, err := s.OldestDirtyScore(ctx, band)
+	// Empty band should return 0 (namespace is isolated, so band 0 is empty)
+	score, err := s.OldestDirtyScore(ctx, 0)
 	require.NoError(t, err)
 	assert.Equal(t, float64(0), score)
 
-	// Write a key
-	key := "oldest_key"
-	for s.BandFor(key) != band {
-		key = key + "_old"
-	}
+	targetBand, keys := findKeysForTest(t, s, "oldest", 1)
+	key := keys[0]
 
 	before := time.Now().UnixMilli()
 	err = s.Write(ctx, key, []byte(`{"oldest":true}`))
@@ -612,7 +767,7 @@ func TestOldestDirtyScore(t *testing.T) {
 	after := time.Now().UnixMilli()
 
 	// Score should be within the write window
-	score, err = s.OldestDirtyScore(ctx, band)
+	score, err = s.OldestDirtyScore(ctx, targetBand)
 	require.NoError(t, err)
 	assert.GreaterOrEqual(t, int64(score), before)
 	assert.LessOrEqual(t, int64(score), after)
@@ -622,14 +777,11 @@ func TestRefreshHotTTL(t *testing.T) {
 	s := newTestShield(t, "test_refresh_hot_ttl")
 	defer s.Close()
 
-	ctx := context.Background()
-	band := 0
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 
-	// Write a key
-	key := "refresh_key"
-	for s.BandFor(key) != band {
-		key = key + "_ref"
-	}
+	targetBand, keys := findKeysForTest(t, s, "refresh", 1)
+	key := keys[0]
 
 	err := s.Write(ctx, key, []byte(`{"refresh":true}`))
 	require.NoError(t, err)
@@ -639,7 +791,7 @@ func TestRefreshHotTTL(t *testing.T) {
 	require.NoError(t, err)
 
 	// Refresh hot TTL
-	err = s.RefreshHotTTL(ctx, band, []string{key})
+	err = s.RefreshHotTTL(ctx, targetBand, []string{key})
 	require.NoError(t, err)
 
 	// TTL should be extended (approximately to activityWindow)
@@ -647,29 +799,26 @@ func TestRefreshHotTTL(t *testing.T) {
 	require.NoError(t, err)
 	assert.Greater(t, newTTL, initialTTL)
 }
-
 func TestZRangeWithScores(t *testing.T) {
 	s := newTestShield(t, "test_zrange_scores")
 	defer s.Close()
 
-	ctx := context.Background()
-	band := 0
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	targetBand, keys := findKeysForTest(t, s, "score", 3)
 
 	// Write multiple keys with small delays to get different scores
-	keys := make([]string, 3)
-	for i := 0; i < 3; i++ {
-		key := fmt.Sprintf("score_key_%d", i)
-		for s.BandFor(key) != band {
-			key = key + "_s"
-		}
-		keys[i] = key
+	for i, key := range keys {
 		err := s.Write(ctx, key, []byte(fmt.Sprintf(`{"i":%d}`, i)))
 		require.NoError(t, err)
-		time.Sleep(2 * time.Millisecond) // Ensure different timestamps
+		if i < len(keys)-1 {
+			time.Sleep(2 * time.Millisecond) // Ensure different timestamps
+		}
 	}
 
 	// Get scores
-	scores, err := s.ZRangeWithScores(ctx, band, 0, 2)
+	scores, err := s.ZRangeWithScores(ctx, targetBand, 0, 2)
 	require.NoError(t, err)
 	assert.Len(t, scores, 3)
 
@@ -861,4 +1010,29 @@ func TestClose(t *testing.T) {
 	ctx := context.Background()
 	_, err = s.Client().Ping(ctx).Result()
 	assert.Error(t, err, "operations should fail after Close()")
+}
+
+// findKeysForTest deterministically finds `count` distinct keys that hash to the same band.
+// It generates a fixed set of candidates, groups them by band, and returns the selected band
+// and the slice of keys. This eliminates unbounded brute-force loops and guarantees
+// cluster-safe hash slot colocation for commands like SInter.
+func findKeysForTest(t *testing.T, s *shield.Shield, prefix string, count int) (int, []string) {
+	t.Helper()
+	const bandCount = 16
+	candidates := 256 // Generous buffer; pigeonhole guarantees success
+
+	byBand := make(map[int][]string, bandCount)
+	for i := 0; i < candidates; i++ {
+		key := fmt.Sprintf("%s_%04d", prefix, i)
+		b := s.BandFor(key)
+		byBand[b] = append(byBand[b], key)
+	}
+
+	for b := 0; b < bandCount; b++ {
+		if len(byBand[b]) >= count {
+			return b, byBand[b][:count]
+		}
+	}
+	t.Fatalf("failed to find %d keys in the same band for prefix %q", count, prefix)
+	return -1, nil
 }

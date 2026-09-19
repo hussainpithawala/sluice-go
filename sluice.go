@@ -29,6 +29,7 @@ import (
 	"github.com/cespare/xxhash/v2"
 	"github.com/hussainpithawala/sluice-go/internal/dlq"
 	"github.com/hussainpithawala/sluice-go/internal/engine"
+	"github.com/hussainpithawala/sluice-go/internal/localjournal"
 	"github.com/hussainpithawala/sluice-go/internal/shield"
 	"github.com/hussainpithawala/sluice-go/sink"
 	"github.com/hussainpithawala/sluice-go/source"
@@ -54,7 +55,7 @@ func (b *Builder) WithReadContract(rc ReadContract) *Builder { b.cfg.ReadContrac
 
 // WithIndexContract sets the domain function that extracts secondary index fields.
 func (b *Builder) WithIndexContract(ic IndexContract) *Builder { b.cfg.IndexContract = ic; return b }
-func (b *Builder) WithWriteContract(wc WriteContract) *Builder { b.contract = wc; return b }
+func (b *Builder) WithWriteContract(wc WriteContract) *Builder { b.writeContract = wc; return b }
 func (b *Builder) WithFlushWindow(d time.Duration) *Builder    { b.cfg.FlushWindow = d; return b }
 func (b *Builder) WithMaxBatchSize(n int) *Builder             { b.cfg.MaxBatchSize = n; return b }
 func (b *Builder) WithBandCount(n int) *Builder                { b.cfg.BandCount = n; return b }
@@ -82,6 +83,13 @@ func (b *Builder) WithContentDedup(v bool) *Builder {
 	b.cfg.ContentDedup = v
 	return b
 }
+
+// WithLocalCache enables the L1 in-process read tier.
+func (b *Builder) WithLocalCache(cfg localjournal.LocalCacheConfig) *Builder {
+	b.localCacheCfg = cfg
+	return b
+}
+
 func (b *Builder) OnFlush(cb OnFlushCallback) *Builder { b.callback = cb; return b }
 
 // WithBatchedWrites enables pipelined Redis writes. Instead of one Redis
@@ -149,9 +157,10 @@ func (b *Builder) Build(ctx context.Context) (*Sluice, error) {
 			b.callback(keys, pubResult, err)
 		}
 	}
+
 	// Wrap contract to convert public WriteModel to sink.WriteModel
 	wrappedContract := func(correlationKey string, payload []byte) (*sink.WriteModel, error) {
-		wm, err := b.contract(correlationKey, payload)
+		wm, err := b.writeContract(correlationKey, payload)
 		if err != nil {
 			return nil, err
 		}
@@ -172,7 +181,27 @@ func (b *Builder) Build(ctx context.Context) (*Sluice, error) {
 		sh.StartBatcher(ctx)
 	}
 
-	s := &Sluice{cfg: b.cfg, shield: sh, engine: eng, sk: b.sk, src: b.src, contract: b.contract, metrics: metrics}
+	s := &Sluice{cfg: b.cfg, shield: sh, engine: eng, sk: b.sk, src: b.src, writeContract: b.writeContract, metrics: metrics}
+
+	// ── L1 Local Journal (opt-in, default-off) ────────────────────────────
+	if b.localCacheCfg.Mode != localjournal.LocalCacheOff {
+		if b.localCacheCfg.MaxEntries <= 0 {
+			b.localCacheCfg.MaxEntries = 200_000
+		}
+		if b.localCacheCfg.LocalTTL <= 0 {
+			b.localCacheCfg.LocalTTL = 60 * time.Second
+		}
+		if b.localCacheCfg.Mode == localjournal.LocalCachePushPull {
+			return nil, fmt.Errorf("sluice: LocalCachePushPull is not yet implemented (Phase 2); use LocalCacheLazy")
+		}
+
+		s.local = localjournal.New(localjournal.Config{
+			Namespace:  b.namespace,
+			MaxEntries: b.localCacheCfg.MaxEntries,
+			LocalTTL:   b.localCacheCfg.LocalTTL,
+			// Recorder: s.metrics, // Will wire in Step 2 (MetricsRecorder additions)
+		})
+	}
 
 	if b.cfg.DLQAutoProcess {
 		s.startDLQProcessor()
@@ -188,7 +217,7 @@ func (b *Builder) validate() error {
 	if b.sk == nil {
 		return ErrMissingSink
 	}
-	if b.contract == nil {
+	if b.writeContract == nil {
 		return ErrMissingContract
 	}
 	if len(b.cfg.Redis.Addrs) == 0 {
@@ -222,10 +251,110 @@ func (s *Sluice) IsHot(ctx context.Context, correlationKey string) (bool, error)
 	return isHot, err
 }
 
-// Read returns current state from the journal.
+func (s *Sluice) Read(ctx context.Context, correlationKey string) ([]byte, error) {
+	if s.closed.Load() {
+		return nil, ErrLibraryClosed
+	}
+
+	// ── Tier 1: L1 Local Journal (Sub-microsecond) ─────────────────────
+	if s.local != nil {
+		if p, _, ok := s.local.Get(correlationKey); ok {
+			// s.metrics.RecordLocalCacheHit(s.namespace) // Step 2
+			return p, nil
+		}
+	}
+
+	// ── Tier 2: L2 Redis Journal (Sub-millisecond) ─────────────────────
+	// Uses the new ReadJournal to get the version (ts) for L1 healing.
+	jr, err := s.shield.ReadJournal(ctx, correlationKey)
+	if err != nil {
+		return nil, err
+	}
+
+	if jr.Found {
+		// Heal L1 with the versioned payload
+		if s.local != nil {
+			s.local.Put(correlationKey, jr.Payload, jr.Version)
+		}
+
+		// Existing lazy hot-TTL refresh (20% threshold)
+		if s.hotAwareFlush.Load() && jr.PTTL >= 0 && jr.PTTL < s.activityWindow/5 {
+			go func() {
+				bgCtx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+				defer cancel()
+				_ = s.shield.RefreshHotTTL(bgCtx, s.shield.BandFor(correlationKey), []string{correlationKey})
+			}()
+		}
+
+		return jr.Payload, nil
+	}
+
+	// ── Tier 3: L3 Source Fallback (Cold Read) ─────────────────────────
+	if s.src != nil && s.readContract != nil {
+		readModel, err := s.readContract(correlationKey)
+		if err != nil {
+			return nil, fmt.Errorf("read contract: %w", err)
+		}
+
+		payload, err := s.src.Read(ctx, *readModel)
+		if err != nil {
+			if errors.Is(err, source.ErrRecordNotFound) {
+				return nil, ErrRecordNotFound
+			}
+			return nil, err
+		}
+
+		// Optional: Seed L1 on cold read miss?
+		// RFC says "Demand-fill on first miss", so yes, we can put it in L1.
+		// But we don't have a journal `ts` for it yet (it wasn't in Redis).
+		// For Phase 1 Lazy, we skip L1 seeding on cold reads to avoid
+		// version conflicts when the next Write() lands.
+
+		return payload, nil
+	}
+
+	return nil, ErrRecordNotFound
+}
+
+// ReadFresh bypasses the L1 local journal and reads directly from L2 (Redis)
+// or L3 (Source). Use this for money-critical reads where cross-pod
+// eventual consistency (broadcast lag) is unacceptable.
+func (s *Sluice) ReadFresh(ctx context.Context, correlationKey string) ([]byte, error) {
+	if s.closed.Load() {
+		return nil, ErrLibraryClosed
+	}
+
+	jr, err := s.shield.ReadJournal(ctx, correlationKey)
+	if err != nil {
+		return nil, err
+	}
+	if jr.Found {
+		return jr.Payload, nil
+	}
+
+	// Fallback to Source
+	if s.src != nil && s.readContract != nil {
+		readModel, err := s.readContract(correlationKey)
+		if err != nil {
+			return nil, fmt.Errorf("read contract: %w", err)
+		}
+		payload, err := s.src.Read(ctx, *readModel)
+		if err != nil {
+			if errors.Is(err, source.ErrRecordNotFound) {
+				return nil, ErrRecordNotFound
+			}
+			return nil, err
+		}
+		return payload, nil
+	}
+
+	return nil, ErrRecordNotFound
+}
+
+// ReadOld returns current state from the journal.
 // Hot correlation_key: sub-millisecond Redis read with lazy TTL refresh.
 // Cold correlation_key: falls back to the configured Source via ReadContract.
-func (s *Sluice) Read(ctx context.Context, correlationKey string) ([]byte, error) {
+func (s *Sluice) ReadOld(ctx context.Context, correlationKey string) ([]byte, error) {
 	if s.closed.Load() {
 		return nil, ErrLibraryClosed
 	}
@@ -533,7 +662,7 @@ func (s *Sluice) ProcessDLQ(ctx context.Context, strategy DLQStrategy, opts ...D
 
 	// Wrap the public WriteContract to produce sink.WriteModel.
 	wrappedContract := func(correlationKey string, payload []byte) (*sink.WriteModel, error) {
-		wm, err := s.contract(correlationKey, payload)
+		wm, err := s.writeContract(correlationKey, payload)
 		if err != nil {
 			return nil, err
 		}
@@ -607,7 +736,7 @@ func (s *Sluice) startDLQProcessor() {
 }
 
 func (s *Sluice) degradedWrite(ctx context.Context, correlationKey string, payload []byte) error {
-	wm, err := s.contract(correlationKey, payload)
+	wm, err := s.writeContract(correlationKey, payload)
 	if err != nil {
 		s.metrics.RecordContractError(s.cfg.Namespace, correlationKey, err)
 		return fmt.Errorf("%w: %v", ErrContractViolation, err)
