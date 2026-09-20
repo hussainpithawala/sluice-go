@@ -21,11 +21,12 @@ import (
 // It satisfies the embedded localjournal.MetricsRecorder interface and
 // stubs every other method so it compiles against the full interface.
 type countingRecorder struct {
-	mu           sync.Mutex
-	hits         int
-	misses       int
-	missReasons  map[string]int
-	setSizeCalls int
+	mu                    sync.Mutex
+	hits                  int
+	misses                int
+	missReasons           map[string]int
+	setSizeCalls          int
+	lastLagRecordDuration time.Duration
 
 	// spy: if set, called on every RecordRedisOp so we can detect
 	// whether the L2 Redis tier was touched during a Read.
@@ -50,6 +51,12 @@ func (r *countingRecorder) RecordLocalCacheMiss(_ string, reason localjournal.Mi
 func (r *countingRecorder) RecordLocalSetSize(string, int) {
 	r.mu.Lock()
 	r.setSizeCalls++
+	r.mu.Unlock()
+}
+
+func (r *countingRecorder) RecordBroadcastLag(_ string, lag time.Duration) {
+	r.mu.Lock()
+	r.lastLagRecordDuration = lag
 	r.mu.Unlock()
 }
 

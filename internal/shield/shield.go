@@ -93,11 +93,23 @@ func New(cfg RedisConfig, namespace string, bandCount int, keyTTL time.Duration,
 // Write atomically stores payload and marks the correlation key dirty.
 // When batching is enabled, the write is buffered and pipelined to Redis
 // by the background batcher goroutine. Returns nil immediately in that case.
+
+// Thin wrapper over writeWithKind with kind=upsert.
 func (s *Shield) Write(ctx context.Context, correlationKey string, payload []byte) error {
+	return s.writeWithKind(ctx, correlationKey, payload, broadcastKindUpsert)
+}
+
+// writeWithKind is the shared core of Write and HotLoad. The kind selects
+// the broadcast message type (upsert vs. seed); the journal write itself
+// is identical in both cases.
+func (s *Shield) writeWithKind(ctx context.Context, correlationKey string, payload []byte, kind broadcastKind) error {
 	floatTs := float64(time.Now().UnixMilli())
 
-	// Batched path: buffer for the background batcher.
 	if s.batchCh != nil {
+		// Batched path always emits upsert; HotLoad bypasses the batcher
+		// because it needs an immediate Expire + marker, which the batcher
+		// cannot express. HotLoad is rare (once per promotion), so this
+		// direct path is acceptable.
 		s.batchCh <- writeEntry{
 			correlationKey: correlationKey,
 			payload:        payload,
@@ -106,22 +118,19 @@ func (s *Shield) Write(ctx context.Context, correlationKey string, payload []byt
 		return nil
 	}
 
-	// Non-batched path.
 	if !s.broadcastEnabled {
-		// Original path: single EVALSHA, no broadcast.
 		return s.writeScript.Run(ctx, s.client,
 			[]string{s.payloadKey(correlationKey), s.dirtyKey(correlationKey)},
 			payload, fmt.Sprintf("%.0f", floatTs), correlationKey, int64(s.keyTTL.Seconds()),
 		).Err()
 	}
 
-	// Broadcast enabled: pipeline journal write + XADD in one round-trip.
 	pipe := s.client.Pipeline()
 	pipe.EvalSha(ctx, s.writeScriptSHA,
 		[]string{s.payloadKey(correlationKey), s.dirtyKey(correlationKey)},
 		payload, fmt.Sprintf("%.0f", floatTs), correlationKey, int64(s.keyTTL.Seconds()),
 	)
-	s.enqueueBroadcast(ctx, pipe, correlationKey, int64(floatTs), broadcastKindUpsert, payload)
+	s.enqueueBroadcast(ctx, pipe, correlationKey, int64(floatTs), kind, payload)
 	_, err := pipe.Exec(ctx)
 	return err
 }

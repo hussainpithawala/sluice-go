@@ -13,14 +13,6 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// MetricsRecorder defines the telemetry interface required by the Subscriber.
-// This is typically satisfied by the core sluice MetricsRecorder via interface embedding.
-type MetricsRecorder interface {
-	// RecordBroadcastLag emits the time difference between the stream's
-	// last-generated ID and the subscriber's current cursor.
-	RecordBroadcastLag(namespace string, lag time.Duration)
-}
-
 // Subscriber reads the L1 broadcast stream and applies messages to the local
 // in-process cache. One instance runs per namespace per pod.
 //

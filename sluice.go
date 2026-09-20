@@ -27,6 +27,7 @@ import (
 	"log/slog"
 
 	"github.com/cespare/xxhash/v2"
+	"github.com/hussainpithawala/sluice-go/internal/broadcast"
 	"github.com/hussainpithawala/sluice-go/internal/dlq"
 	"github.com/hussainpithawala/sluice-go/internal/engine"
 	"github.com/hussainpithawala/sluice-go/internal/localjournal"
@@ -205,13 +206,50 @@ func (b *Builder) Build(ctx context.Context) (*Sluice, error) {
 	}
 
 	// Inside Build(ctx), after shield.New and EnableBatching:
-	if b.localCacheCfg.Mode == localjournal.LocalCachePushPull {
-		s.shield.EnableBroadcast(shield.BroadcastConfig{
-			Mode:   shield.BroadcastMode(b.localCacheCfg.Broadcast),
-			MaxLen: b.localCacheCfg.Retention,
-		})
-	}
+	// ── L1 Local Journal (opt-in, default-off) ────────────────────────────
+	if b.localCacheCfg.Mode != localjournal.LocalCacheOff {
+		if b.localCacheCfg.MaxEntries <= 0 {
+			b.localCacheCfg.MaxEntries = 200_000
+		}
+		if b.localCacheCfg.LocalTTL <= 0 {
+			b.localCacheCfg.LocalTTL = 60 * time.Second
+		}
 
+		s.local = localjournal.New(localjournal.Config{
+			Namespace:  b.namespace,
+			MaxEntries: b.localCacheCfg.MaxEntries,
+			LocalTTL:   b.localCacheCfg.LocalTTL,
+			Metrics:    s.metrics,
+		})
+
+		if b.localCacheCfg.Mode == localjournal.LocalCachePushPull {
+			// Defaults per RFC §5.3.
+			if b.localCacheCfg.Retention <= 0 {
+				b.localCacheCfg.Retention = 200_000
+			}
+
+			// Broadcaster: piggy-backed XADD on every write (Step 2.1).
+			s.shield.EnableBroadcast(shield.BroadcastConfig{
+				Mode:   shield.BroadcastMode(b.localCacheCfg.Broadcast),
+				MaxLen: b.localCacheCfg.Retention,
+			})
+
+			// Subscriber: blocked XREAD loop applying version-checked Puts (Step 2.2).
+			s.broadcastSub = broadcast.NewSubscriber(
+				s.shield.Client(),
+				shield.BroadcastKey(b.namespace),
+				s.local,
+				s.metrics, // satisfies broadcast.MetricsRecorder via interface embedding
+				broadcast.Config{
+					Namespace: b.namespace,
+					Mode:      broadcast.Mode(b.localCacheCfg.Broadcast),
+					Stream:    shield.BroadcastKey(b.namespace),
+					MaxLen:    b.localCacheCfg.Retention,
+				},
+			)
+			s.broadcastSub.Start()
+		}
+	}
 	if b.cfg.DLQAutoProcess {
 		s.startDLQProcessor()
 	}
@@ -334,23 +372,30 @@ func (s *Sluice) Read(ctx context.Context, correlationKey string) ([]byte, error
 	return nil, ErrRecordNotFound
 }
 
-// ReadFresh bypasses the L1 local journal and reads directly from L2 (Redis)
-// or L3 (Source). Use this for money-critical reads where cross-pod
-// eventual consistency (broadcast lag) is unacceptable.
+// ReadFresh is the strong-consistency escape hatch (RFC §5.8).
+// It bypasses L1 entirely and reads from the Redis journal (L2), falling
+// through to the Source (L3) on a journal miss — identical semantics to
+// v1.0.7 Read(). Use for money-critical reads that cannot tolerate
+// bounded staleness; use Read() for everything else.
 func (s *Sluice) ReadFresh(ctx context.Context, correlationKey string) ([]byte, error) {
 	if s.closed.Load() {
 		return nil, ErrLibraryClosed
 	}
 
+	tRead := time.Now()
 	jr, err := s.shield.ReadJournal(ctx, correlationKey)
+	s.metrics.RecordRedisOp(s.cfg.Namespace, "readfresh", time.Since(tRead), err)
 	if err != nil {
 		return nil, err
 	}
+
 	if jr.Found {
+		// Deliberately do NOT heal L1 here. ReadFresh callers want the
+		// journal's authoritative view; seeding L1 would mask freshness.
 		return jr.Payload, nil
 	}
 
-	// Fallback to Source
+	// ── L3: Source fallback (identical to Read's cold path) ──────────────
 	if s.src != nil && s.readContract != nil {
 		readModel, err := s.readContract(correlationKey)
 		if err != nil {
@@ -470,6 +515,7 @@ func (s *Sluice) HotLoad(ctx context.Context, correlationKey string) ([]byte, er
 //  2. Index Maintenance: Updates secondary SET/ZSET indexes via pipeline.
 //  3. Hot Regime Signaling: Triggers immediate flush if the correlation_key is currently hot.
 //  4. Standard Volume Trigger: Falls back to depth-based flush if not hot/batched.
+
 func (s *Sluice) Write(ctx context.Context, correlationKey string, payload []byte) error {
 	if s.closed.Load() {
 		return ErrLibraryClosed
@@ -634,6 +680,13 @@ func (s *Sluice) Query(ctx context.Context, q Query) ([]QueryResult, error) {
 // DrainAndClose flushes all remaining dirty keys, stops band goroutines,
 // and releases Redis and sink connections. Call exactly once during shutdown.
 func (s *Sluice) DrainAndClose(ctx context.Context) error {
+	// Stop the broadcast subscriber BEFORE the engine drains: no new L1
+	// Puts should arrive while the journal is being flushed to the sink.
+	// Bounded by the subscriber's BlockMS + processing time.
+	if s.broadcastSub != nil {
+		s.broadcastSub.Stop()
+	}
+
 	if !s.closed.CompareAndSwap(false, true) {
 		return nil
 	}

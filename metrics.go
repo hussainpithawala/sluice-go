@@ -3,6 +3,7 @@ package sluice
 import (
 	"time"
 
+	"github.com/hussainpithawala/sluice-go/internal/broadcast"
 	"github.com/hussainpithawala/sluice-go/internal/dlq"
 	"github.com/hussainpithawala/sluice-go/internal/engine"
 	"github.com/hussainpithawala/sluice-go/internal/localjournal"
@@ -22,6 +23,7 @@ type MetricsRecorder interface {
 	dlq.MetricsRecorder
 	engine.MetricsRecorder
 	localjournal.MetricsRecorder
+	broadcast.MetricsRecorder
 }
 
 type noopMetrics struct{}
@@ -41,3 +43,4 @@ func (n *noopMetrics) RecordHotSetSize(_ string, _ int)                         
 func (n *noopMetrics) RecordLocalCacheHit(_ string)                                    {}
 func (n *noopMetrics) RecordLocalCacheMiss(_ string, _ localjournal.MissReason)        {}
 func (n *noopMetrics) RecordLocalSetSize(_ string, _ int)                              {}
+func (n *noopMetrics) RecordBroadcastLag(_ string, _ time.Duration)                    {}

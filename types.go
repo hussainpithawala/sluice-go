@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/hussainpithawala/sluice-go/internal/broadcast"
 	"github.com/hussainpithawala/sluice-go/internal/engine"
 	"github.com/hussainpithawala/sluice-go/internal/localjournal"
 	"github.com/hussainpithawala/sluice-go/internal/shield"
@@ -34,6 +35,7 @@ type Sluice struct {
 	local          *localjournal.Cache
 	hotAwareFlush  atomic.Bool
 	activityWindow time.Duration
+	broadcastSub   *broadcast.Subscriber
 }
 
 // Builder assembles a Sluice instance with a fluent API.

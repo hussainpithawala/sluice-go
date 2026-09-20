@@ -7,6 +7,14 @@ import "time"
 // but the kind is preserved for telemetry and future differentiation.
 type Kind string
 
+// MetricsRecorder defines the telemetry interface required by the Subscriber.
+// This is typically satisfied by the core sluice MetricsRecorder via interface embedding.
+type MetricsRecorder interface {
+	// RecordBroadcastLag emits the time difference between the stream's
+	// last-generated ID and the subscriber's current cursor.
+	RecordBroadcastLag(namespace string, lag time.Duration)
+}
+
 const (
 	// KindUpsert is emitted on every normal write-through.
 	KindUpsert Kind = "upsert"
