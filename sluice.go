@@ -204,6 +204,14 @@ func (b *Builder) Build(ctx context.Context) (*Sluice, error) {
 		})
 	}
 
+	// Inside Build(ctx), after shield.New and EnableBatching:
+	if b.localCacheCfg.Mode == localjournal.LocalCachePushPull {
+		s.shield.EnableBroadcast(shield.BroadcastConfig{
+			Mode:   shield.BroadcastMode(b.localCacheCfg.Broadcast),
+			MaxLen: b.localCacheCfg.Retention,
+		})
+	}
+
 	if b.cfg.DLQAutoProcess {
 		s.startDLQProcessor()
 	}

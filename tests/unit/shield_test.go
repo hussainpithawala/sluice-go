@@ -407,7 +407,6 @@ func TestGenerateKnownKeysForBand(t *testing.T) {
 	}
 
 	// Print the map for copy-paste
-	fmt.Println("var knownKeysForBand = map[int][]string{")
 	for band := 0; band < 16; band++ {
 		keys := keysByBand[band]
 		fmt.Printf("\t%d: %#v,\n", band, keys)

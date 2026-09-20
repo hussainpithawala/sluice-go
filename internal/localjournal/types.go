@@ -1,6 +1,10 @@
 package localjournal
 
-import "time"
+import (
+	"time"
+
+	"github.com/hussainpithawala/sluice-go/internal/shield"
+)
 
 type LocalCacheMode int
 
@@ -15,6 +19,8 @@ type LocalCacheConfig struct {
 	Mode       LocalCacheMode
 	MaxEntries int           // Global LRU cap (default 200,000)
 	LocalTTL   time.Duration // Staleness bound (default 60s)
+	Broadcast  shield.BroadcastMode
+	Retention  int64
 }
 
 type MetricsRecorder interface {

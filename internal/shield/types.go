@@ -130,6 +130,11 @@ type Shield struct {
 	batchWg        sync.WaitGroup
 	volumeSignaler VolumeSignaler
 	batchCtx       context.Context // parent context; cancellation stops the batcher
+
+	// Broadcast fields — all zero when broadcasting is disabled.
+	broadcastEnabled bool
+	broadcastMode    BroadcastMode
+	broadcastMaxLen  int64
 }
 
 type JournalRead struct {
@@ -163,3 +168,42 @@ redis.call('EXPIRE', payloadKey, ttl)
 redis.call('ZADD', dirtyKey, score, corrKey)
 return 1
 `
+
+// Broadcasting related changes
+
+// BroadcastMode selects what the broadcaster emits per message.
+type BroadcastMode int
+
+const (
+	// BroadcastPayload includes the full payload (~1KB messages).
+	// Maximum read offload: peers can Put directly without refetching.
+	// Use when read:write ratio is high (current ad-tech profile).
+	BroadcastPayload BroadcastMode = iota
+
+	// BroadcastInvalidation sends only crn/band/ts/kind (~40B messages).
+	// Peers refetch from Redis on next Read() miss.
+	// Use when write velocity approaches read velocity.
+	BroadcastInvalidation
+)
+
+// BroadcastConfig configures the L1 broadcast stream.
+type BroadcastConfig struct {
+	// Mode selects payload vs. invalidation broadcasting.
+	Mode BroadcastMode
+
+	// MaxLen is the XADD MAXLEN ~ N retention bound.
+	// Default: 200_000 (≈30s of hot-write traffic at reference scale).
+	// Longer gaps heal lazily via ReadJournal fallback.
+	MaxLen int64
+}
+
+// broadcastKind distinguishes message intent in the stream.
+// The subscriber treats them uniformly (version-checked Put),
+// but the kind is preserved for telemetry and future differentiation.
+type broadcastKind string
+
+const (
+	broadcastKindUpsert broadcastKind = "upsert" // normal write-through
+	broadcastKindSeed   broadcastKind = "seed"   // HotLoad promotion (step 2.5)
+	broadcastKindTouch  broadcastKind = "touch"  // optional TTL extension (deferred)
+)

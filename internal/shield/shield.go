@@ -95,6 +95,8 @@ func New(cfg RedisConfig, namespace string, bandCount int, keyTTL time.Duration,
 // by the background batcher goroutine. Returns nil immediately in that case.
 func (s *Shield) Write(ctx context.Context, correlationKey string, payload []byte) error {
 	floatTs := float64(time.Now().UnixMilli())
+
+	// Batched path: buffer for the background batcher.
 	if s.batchCh != nil {
 		s.batchCh <- writeEntry{
 			correlationKey: correlationKey,
@@ -103,12 +105,25 @@ func (s *Shield) Write(ctx context.Context, correlationKey string, payload []byt
 		}
 		return nil
 	}
-	// FIX: format timestamp as a string — Lua HSET requires string values,
-	// not float64. This matches what flushBatch already does.
-	return s.writeScript.Run(ctx, s.client,
+
+	// Non-batched path.
+	if !s.broadcastEnabled {
+		// Original path: single EVALSHA, no broadcast.
+		return s.writeScript.Run(ctx, s.client,
+			[]string{s.payloadKey(correlationKey), s.dirtyKey(correlationKey)},
+			payload, fmt.Sprintf("%.0f", floatTs), correlationKey, int64(s.keyTTL.Seconds()),
+		).Err()
+	}
+
+	// Broadcast enabled: pipeline journal write + XADD in one round-trip.
+	pipe := s.client.Pipeline()
+	pipe.EvalSha(ctx, s.writeScriptSHA,
 		[]string{s.payloadKey(correlationKey), s.dirtyKey(correlationKey)},
 		payload, fmt.Sprintf("%.0f", floatTs), correlationKey, int64(s.keyTTL.Seconds()),
-	).Err()
+	)
+	s.enqueueBroadcast(ctx, pipe, correlationKey, int64(floatTs), broadcastKindUpsert, payload)
+	_, err := pipe.Exec(ctx)
+	return err
 }
 
 // WriteDedup handles xxHash64 deduplication in a separate, Valkey-safe Lua script.
@@ -124,7 +139,17 @@ func (s *Shield) WriteDedup(ctx context.Context, correlationKey string, payload 
 		payload, tsStr, correlationKey, int64(s.keyTTL.Seconds()), hash,
 	).Int()
 
-	return res == 1, err // true if written, false if deduplicated
+	written := res == 1
+
+	// Broadcast only when actually written (not deduplicated).
+	// Deduplicated writes refresh TTL only; no state change to propagate.
+	// RFC §11.2: rely on LocalTTL alone for dedup'd entries.
+	if written && s.broadcastEnabled {
+		ts, _ := strconv.ParseInt(tsStr, 10, 64)
+		_ = s.XAddBroadcast(ctx, correlationKey, ts, broadcastKindUpsert, payload)
+	}
+
+	return written, err // true if written, false if deduplicated
 }
 
 // UpdateIndexes maintains secondary indexes via a Go-side pipeline.
@@ -578,6 +603,81 @@ func (s *Shield) EnableBatching(batchSize int, batchWindow time.Duration) {
 	s.stopBatch = make(chan struct{})
 }
 
+// EnableBroadcast configures the shield to emit L1 broadcast messages
+// on every write. Must be called before StartBatcher (if batching is used).
+//
+// When batching is enabled, the XADD rides the same pipeline as the
+// journal EVALSHA — zero additional round-trips on the hot path.
+// When batching is disabled, the XADD is pipelined alongside the
+// journal write in a single round-trip.
+func (s *Shield) EnableBroadcast(cfg BroadcastConfig) {
+	if cfg.MaxLen <= 0 {
+		cfg.MaxLen = 200_000
+	}
+	s.broadcastEnabled = true
+	s.broadcastMode = cfg.Mode
+	s.broadcastMaxLen = cfg.MaxLen
+}
+
+// BroadcastKey returns the L1 broadcast stream key for a namespace.
+// Pattern: sl:<namespace>:bcast
+//
+// CLUSTER NOTE: intentionally NO {band} hash tag. The stream is a single
+// key on a single slot. Its load is write-rate only (one XADD per write),
+// not read-rate. Per-band streams (sl:<ns>:bcast:{<band>}) are reserved
+// as a config option if stream-shard load ever matters (RFC §11.1).
+func BroadcastKey(namespace string) string {
+	return fmt.Sprintf("sl:%s:bcast", namespace)
+}
+
+func (s *Shield) broadcastKey() string {
+	return BroadcastKey(s.namespace)
+}
+
+// enqueueBroadcast adds an XADD command to the given pipeline.
+// Used by flushBatch (batched path) and Write (non-batched path).
+//
+// In BroadcastPayload mode, the full payload is included so subscribers
+// can Put directly into L1 without refetching. In BroadcastInvalidation
+// mode, only crn/band/ts/kind are sent (~40B), and subscribers refetch.
+func (s *Shield) enqueueBroadcast(ctx context.Context, pipe redis.Pipeliner, correlationKey string, ts int64, kind broadcastKind, payload []byte) {
+	if !s.broadcastEnabled {
+		return
+	}
+
+	// Build field/value pairs for the stream entry.
+	// go-redis XAddArgs.Values accepts []interface{} as alternating k/v pairs.
+	values := []interface{}{
+		"crn", correlationKey,
+		"band", s.BandFor(correlationKey),
+		"ts", ts,
+		"kind", string(kind),
+	}
+	if s.broadcastMode == BroadcastPayload {
+		values = append(values, "payload", payload)
+	}
+
+	pipe.XAdd(ctx, &redis.XAddArgs{
+		Stream: s.broadcastKey(),
+		MaxLen: s.broadcastMaxLen,
+		Approx: true, // MAXLEN ~ N (approximate trimming)
+		Values: values,
+	})
+}
+
+// XAddBroadcast appends a single broadcast message to the L1 stream.
+// Used by code paths that cannot pipeline (e.g., WriteDedup after
+// checking the dedup result). Returns nil if broadcasting is disabled.
+func (s *Shield) XAddBroadcast(ctx context.Context, correlationKey string, ts int64, kind broadcastKind, payload []byte) error {
+	if !s.broadcastEnabled {
+		return nil
+	}
+	pipe := s.client.Pipeline()
+	s.enqueueBroadcast(ctx, pipe, correlationKey, ts, kind, payload)
+	_, err := pipe.Exec(ctx)
+	return err
+}
+
 // SetVolumeSignaler sets the callback invoked after each batch flush to trigger
 // volume-based drain. Must be called before StartBatcher.
 func (s *Shield) SetVolumeSignaler(fn VolumeSignaler) {
@@ -694,6 +794,9 @@ func (s *Shield) flushBatch(entries []writeEntry) {
 			[]string{s.payloadKey(e.correlationKey), s.dirtyKey(e.correlationKey)},
 			e.payload, fmt.Sprintf("%.0f", e.ts), e.correlationKey, ttlSec,
 		)
+		// Piggy-back broadcast XADD in the same pipeline.
+		// Zero additional round-trips on the batched hot path.
+		s.enqueueBroadcast(ctx, pipe, e.correlationKey, int64(e.ts), broadcastKindUpsert, e.payload)
 	}
 
 	var touchedBands []int
