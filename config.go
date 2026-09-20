@@ -40,7 +40,7 @@ func (c Config) toInternal() engine.Config {
 	}
 }
 
-func defaultConfig(namespace string) Config {
+func DefaultConfig(namespace string) Config {
 	return Config{
 		Namespace:          namespace,
 		BandCount:          16,

@@ -30,7 +30,7 @@ type Config struct {
 	MaxEntries int              // global LRU cap, spread across shards; <=0 disables
 	LocalTTL   time.Duration    // per-entry staleness bound
 	Now        func() time.Time // injectable clock for testing
-	Recorder   Recorder
+	Metrics    MetricsRecorder
 }
 
 // entry represents a single cached payload.
@@ -160,8 +160,8 @@ func (c *Cache) Get(key string) ([]byte, int64, bool) {
 	p, v := e.payload, e.version
 	sh.mu.Unlock()
 
-	if c.cfg.Recorder != nil {
-		c.cfg.Recorder.LocalCacheHit(c.cfg.Namespace)
+	if c.cfg.Metrics != nil {
+		c.cfg.Metrics.RecordLocalCacheHit(c.cfg.Namespace)
 	}
 	return p, v, true
 }
@@ -235,8 +235,8 @@ func (c *Cache) Invalidate(key string) {
 }
 
 // miss is a helper to record cache miss telemetry.
-func (c *Cache) miss(r MissReason) {
-	if c.cfg.Recorder != nil {
-		c.cfg.Recorder.LocalCacheMiss(c.cfg.Namespace, r)
+func (c *Cache) miss(reason MissReason) {
+	if c.cfg.Metrics != nil {
+		c.cfg.Metrics.RecordLocalCacheMiss(c.cfg.Namespace, reason)
 	}
 }

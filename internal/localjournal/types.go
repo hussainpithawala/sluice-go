@@ -16,3 +16,15 @@ type LocalCacheConfig struct {
 	MaxEntries int           // Global LRU cap (default 200,000)
 	LocalTTL   time.Duration // Staleness bound (default 60s)
 }
+
+type MetricsRecorder interface {
+	// RecordLocalCacheHit is called when a Read() is served from L1 memory.
+	RecordLocalCacheHit(namespace string)
+
+	// RecordLocalCacheMiss is called when a Read() falls through L1 to L2/L3.
+	// reason is typically "absent" or "expired".
+	RecordLocalCacheMiss(namespace string, reason MissReason)
+
+	// RecordLocalSetSize is used to track L1 memory footprint (entries count).
+	RecordLocalSetSize(namespace string, size int)
+}

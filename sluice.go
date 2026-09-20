@@ -39,7 +39,7 @@ import (
 // New returns a Builder initialised with production-safe defaults.
 // namespace isolates all Redis keys for this instance.
 func New(namespace string) *Builder {
-	return &Builder{cfg: defaultConfig(namespace)}
+	return &Builder{cfg: DefaultConfig(namespace)}
 }
 
 func (b *Builder) WithRedis(rc RedisConfig) *Builder  { b.cfg.Redis = rc; return b }
@@ -199,6 +199,7 @@ func (b *Builder) Build(ctx context.Context) (*Sluice, error) {
 			Namespace:  b.namespace,
 			MaxEntries: b.localCacheCfg.MaxEntries,
 			LocalTTL:   b.localCacheCfg.LocalTTL,
+			Metrics:    s.metrics,
 			// Recorder: s.metrics, // Will wire in Step 2 (MetricsRecorder additions)
 		})
 	}
@@ -259,14 +260,23 @@ func (s *Sluice) Read(ctx context.Context, correlationKey string) ([]byte, error
 	// ── Tier 1: L1 Local Journal (Sub-microsecond) ─────────────────────
 	if s.local != nil {
 		if p, _, ok := s.local.Get(correlationKey); ok {
-			// s.metrics.RecordLocalCacheHit(s.namespace) // Step 2
+			// Telemetry (RecordLocalCacheHit) is handled internally by the cache
+			// via the localMetricsAdapter wired in Build().
 			return p, nil
 		}
 	}
 
 	// ── Tier 2: L2 Redis Journal (Sub-millisecond) ─────────────────────
 	// Uses the new ReadJournal to get the version (ts) for L1 healing.
+	// ── Tier 2: L2 Redis Journal (Sub-millisecond) ─────────────────────
+	// Uses the new ReadJournal to get the version (ts) for L1 healing.
+	tRead := time.Now()
 	jr, err := s.shield.ReadJournal(ctx, correlationKey)
+
+	// Instrument the L2 fallback so observability (and our integration tests)
+	// can track exactly when the read path falls through L1 to Redis.
+	s.metrics.RecordRedisOp(s.cfg.Namespace, "readjournal", time.Since(tRead), err)
+
 	if err != nil {
 		return nil, err
 	}
@@ -461,6 +471,13 @@ func (s *Sluice) Write(ctx context.Context, correlationKey string, payload []byt
 	}
 
 	t := time.Now()
+
+	// Capture L1 version BEFORE the Redis write.
+	// This guarantees l1Version <= journal_ts. If a subsequent ReadJournal heal
+	// or Phase 2 broadcast arrives with the journal's exact ts, it will safely
+	// update L1 without violating the strict (>) version gating.
+	l1Version := t.UnixMilli()
+
 	var written bool
 	var err error
 
@@ -488,12 +505,15 @@ func (s *Sluice) Write(ctx context.Context, correlationKey string, payload []byt
 	if written {
 		s.metrics.RecordWrite(s.cfg.Namespace)
 
+		// ── L1 Write-Through (Sub-microsecond same-pod consistency) ─────
+		if s.local != nil {
+			s.local.Put(correlationKey, payload, l1Version)
+		}
+
 		// 2. Index maintenance via pipeline (best-effort, Valkey-safe)
 		if s.cfg.IndexContract != nil {
 			indexes, idxErr := s.cfg.IndexContract(correlationKey, payload)
 			if idxErr == nil && len(indexes) > 0 {
-				// We ignore the error here because index maintenance is eventually
-				// consistent and should not block or fail the primary write path.
 				_ = s.shield.UpdateIndexes(ctx, correlationKey, indexes, s.cfg.ActivityWindow)
 			}
 		}
@@ -751,4 +771,29 @@ func (s *Sluice) degradedWrite(ctx context.Context, correlationKey string, paylo
 	s.metrics.RecordDegradedWrite(s.cfg.Namespace, writeErr)
 	s.metrics.RecordRedisOp(s.cfg.Namespace, "degraded_write", time.Since(t), writeErr)
 	return writeErr
+}
+
+// Test methods
+
+// TestConfig is a minimal wiring struct for integration tests that need to
+// inject a pre-built shield and L1 cache without going through the full
+// Build() pipeline (which requires sink, engine, source, etc.).
+//
+// NOT part of the public API contract — guarded by build tag or test-only
+// file if you prefer.
+type TestConfig struct {
+	Namespace string
+	Shield    *shield.Shield
+	Local     *localjournal.Cache
+	Metrics   MetricsRecorder
+}
+
+// NewForTest assembles a Sluice from pre-built dependencies. Test-only.
+func NewForTest(cfg TestConfig) *Sluice {
+	return &Sluice{
+		cfg:     DefaultConfig(cfg.Namespace),
+		shield:  cfg.Shield,
+		local:   cfg.Local,
+		metrics: cfg.Metrics,
+	}
 }

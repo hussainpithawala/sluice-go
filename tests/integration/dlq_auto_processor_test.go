@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hussainpithawala/sluice-go/internal/localjournal"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.mongodb.org/mongo-driver/bson"
@@ -221,16 +222,19 @@ func (c *dlqProcessCounter) total() int {
 	return c.processed
 }
 
-func (c *dlqProcessCounter) RecordWrite(string)                                    {}
-func (c *dlqProcessCounter) RecordDegradedWrite(string, error)                     {}
-func (c *dlqProcessCounter) RecordRedisOp(string, string, time.Duration, error)    {}
-func (c *dlqProcessCounter) RecordFlush(string, string, int, time.Duration, error) {}
-func (c *dlqProcessCounter) RecordDirtyQueueDepth(string, string, int)             {}
-func (c *dlqProcessCounter) RecordContractError(string, string, error)             {}
-func (c *dlqProcessCounter) RecordDeadLetter(string, string, int)                  {}
-func (c *dlqProcessCounter) RecordWarmUp(string, time.Duration, error)             {}
-func (c *dlqProcessCounter) RecordRead(string, time.Duration, bool, error)         {}
-func (c *dlqProcessCounter) RecordHotSetSize(string, int)                          {}
+func (c *dlqProcessCounter) RecordWrite(string)                                       {}
+func (c *dlqProcessCounter) RecordDegradedWrite(string, error)                        {}
+func (c *dlqProcessCounter) RecordRedisOp(string, string, time.Duration, error)       {}
+func (c *dlqProcessCounter) RecordFlush(string, string, int, time.Duration, error)    {}
+func (c *dlqProcessCounter) RecordDirtyQueueDepth(string, string, int)                {}
+func (c *dlqProcessCounter) RecordContractError(string, string, error)                {}
+func (c *dlqProcessCounter) RecordDeadLetter(string, string, int)                     {}
+func (c *dlqProcessCounter) RecordWarmUp(string, time.Duration, error)                {}
+func (c *dlqProcessCounter) RecordRead(string, time.Duration, bool, error)            {}
+func (c *dlqProcessCounter) RecordHotSetSize(string, int)                             {}
+func (c *dlqProcessCounter) RecordLocalCacheHit(_ string)                             {}
+func (c *dlqProcessCounter) RecordLocalCacheMiss(_ string, _ localjournal.MissReason) {}
+func (c *dlqProcessCounter) RecordLocalSetSize(_ string, _ int)                       {}
 
 // TestDLQAutoProcess_ContinuesAfterProcessingError verifies that the
 // auto-processor doesn't stop if an individual DLQ processing cycle fails.

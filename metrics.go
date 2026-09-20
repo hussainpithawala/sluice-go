@@ -1,29 +1,27 @@
 package sluice
 
-import "time"
+import (
+	"time"
+
+	"github.com/hussainpithawala/sluice-go/internal/dlq"
+	"github.com/hussainpithawala/sluice-go/internal/engine"
+	"github.com/hussainpithawala/sluice-go/internal/localjournal"
+)
 
 // MetricsRecorder emits library-internal telemetry into the caller's
 // monitoring system (Prometheus, Datadog, CloudWatch, etc.).
 type MetricsRecorder interface {
+	RecordRead(namespace string, duration time.Duration, isHot bool, err error)
 	RecordWrite(namespace string)
 	RecordDegradedWrite(namespace string, reason error)
-	RecordRedisOp(namespace, op string, duration time.Duration, err error)
-	RecordFlush(namespace, band string, batchSize int, duration time.Duration, err error)
-	RecordDirtyQueueDepth(namespace, band string, depth int)
-	RecordContractError(namespace, correlationKey string, err error)
-
-	// RecordDeadLetter is called when one or more records are moved to the
-	// dead-letter set after a permanent sink failure (e.g. duplicate key).
-	// count is the number of correlation keys moved in this operation.
-	RecordDeadLetter(namespace, band string, count int)
-
-	// RecordDLQProcess is called after a ProcessDLQ invocation completes.
-	RecordDLQProcess(namespace, strategy string, processed, succeeded, failed int)
 
 	// ── Hot/Cold Regime Metrics ────────────────────────────────────────────
 	RecordWarmUp(namespace string, duration time.Duration, err error)
-	RecordRead(namespace string, duration time.Duration, isHot bool, err error)
 	RecordHotSetSize(namespace string, size int)
+
+	dlq.MetricsRecorder
+	engine.MetricsRecorder
+	localjournal.MetricsRecorder
 }
 
 type noopMetrics struct{}
@@ -40,3 +38,6 @@ func (n *noopMetrics) RecordWarmUp(_ string, _ time.Duration, _ error)          
 func (n *noopMetrics) RecordRead(_ string, _ time.Duration, _ bool, _ error)           {}
 func (n *noopMetrics) RecordHotSize(_ string, _ int)                                   {}
 func (n *noopMetrics) RecordHotSetSize(_ string, _ int)                                {}
+func (n *noopMetrics) RecordLocalCacheHit(_ string)                                    {}
+func (n *noopMetrics) RecordLocalCacheMiss(_ string, _ localjournal.MissReason)        {}
+func (n *noopMetrics) RecordLocalSetSize(_ string, _ int)                              {}

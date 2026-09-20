@@ -41,6 +41,7 @@ import (
 	"time"
 
 	sluice "github.com/hussainpithawala/sluice-go"
+	"github.com/hussainpithawala/sluice-go/internal/localjournal"
 	"github.com/hussainpithawala/sluice-go/sink/docdb"
 	"github.com/hussainpithawala/sluice-go/source"
 	sourcedocdb "github.com/hussainpithawala/sluice-go/source/docdb"
@@ -158,6 +159,18 @@ func (m *logMetrics) RecordRead(ns string, duration time.Duration, isHot bool, e
 }
 func (m *logMetrics) RecordHotSetSize(ns string, size int) {
 	m.log.Info("hot-set-size", "ns", ns, "size", size)
+}
+
+func (m *logMetrics) RecordLocalCacheHit(namespace string) {
+	m.log.Info("record-local-cache-hit", "ns", namespace)
+}
+
+func (m *logMetrics) RecordLocalCacheMiss(namespace string, reason localjournal.MissReason) {
+	m.log.Info("record-local-cache-miss", "ns", namespace, "reason", reason)
+}
+
+func (m *logMetrics) RecordLocalSetSize(namespace string, size int) {
+	m.log.Info("record-local-set-size", "ns", namespace, "size", size)
 }
 
 // ─── Cold Regime: Simulated Bulk Consumer ────────────────────────────────────
