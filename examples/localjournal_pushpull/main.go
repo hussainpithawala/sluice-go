@@ -155,7 +155,7 @@ func (m *logMetrics) RecordHotSetSize(ns string, size int) {
 	m.log.Info("hot-set-size", "pod", m.tag, "ns", ns, "size", size)
 }
 func (m *logMetrics) RecordLocalCacheHit(namespace string) {
-	//m.log.Info("local-cache-hit", "pod", m.tag, "ns", namespace)
+	m.log.Info("local-cache-hit", "pod", m.tag, "ns", namespace)
 }
 func (m *logMetrics) RecordLocalCacheMiss(namespace string, reason localjournal.MissReason) {
 	m.log.Info("local-cache-miss", "pod", m.tag, "ns", namespace, "reason", reason)
@@ -504,7 +504,12 @@ func dumpStreamTail(ctx context.Context, redisAddrs []string, clusterMode bool, 
 	} else {
 		c = redis.NewClient(&redis.Options{Addr: redisAddrs[0]})
 	}
-	defer c.Close()
+	defer func(c redis.UniversalClient) {
+		err := c.Close()
+		if err != nil {
+			slog.Debug("Unable to close the redis-universal-client")
+		}
+	}(c)
 
 	entries, err := c.XRange(ctx, stream, "-", "+").Result()
 	if err != nil {

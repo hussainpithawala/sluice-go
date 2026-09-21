@@ -61,24 +61,11 @@ type Config struct {
 	// Default: 200_000 (≈30s of hot-write traffic at reference scale).
 	MaxLen int64
 
-	// BlockMS is the XREAD BLOCK duration for the subscriber loop.
+	// Block_in_milli_secs is the XREAD BLOCK duration for the subscriber loop.
 	// Default: 1s. Lower values reduce convergence lag but increase
 	// idle connection churn; higher values do the opposite.
-	BlockMS time.Duration
+	Block_in_milli_secs time.Duration
 
 	// Now is an injectable clock for testing. Default: time.Now.
 	Now func() time.Time
-}
-
-// applyDefaults fills zero-value Config fields with production defaults.
-func (c *Config) applyDefaults() {
-	if c.BlockMS <= 0 {
-		c.BlockMS = 1 * time.Second
-	}
-	if c.MaxLen <= 0 {
-		c.MaxLen = 200_000
-	}
-	if c.Now == nil {
-		c.Now = time.Now
-	}
 }

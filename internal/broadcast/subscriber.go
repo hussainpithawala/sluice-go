@@ -49,8 +49,8 @@ func NewSubscriber(
 	metrics MetricsRecorder,
 	cfg Config,
 ) *Subscriber {
-	if cfg.BlockMS <= 0 {
-		cfg.BlockMS = 50 * time.Millisecond // ← was 1s, now 50ms
+	if cfg.Block_in_milli_secs <= 0 {
+		cfg.Block_in_milli_secs = 50 * time.Millisecond // ← was 1s, now 50ms
 	}
 	return &Subscriber{
 		client:  client,
@@ -99,7 +99,7 @@ func (s *Subscriber) run(ctx context.Context) {
 		res, err := s.client.XRead(ctx, &redis.XReadArgs{
 			Streams: []string{s.stream, cursor},
 			Count:   100,
-			Block:   s.cfg.BlockMS, // ← FIX: Use configured BlockMS instead of hardcoded 5s
+			Block:   s.cfg.Block_in_milli_secs, // ← FIX: Use configured BlockMS instead of hardcoded 5s
 		}).Result()
 
 		if err != nil {

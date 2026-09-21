@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"testing"
 	"time"
@@ -122,7 +123,12 @@ func TestNew_Validation(t *testing.T) {
 
 func TestWrite_Basic(t *testing.T) {
 	s := newTestShield(t, "test_write_basic")
-	defer s.Close()
+	defer func(s *shield.Shield) {
+		err := s.Close()
+		if err != nil {
+			slog.Info("Unable to close")
+		}
+	}(s)
 
 	ctx := context.Background()
 	corrKey := "user_123"
@@ -146,7 +152,12 @@ func TestWrite_Basic(t *testing.T) {
 
 func TestWrite_Coalescing(t *testing.T) {
 	s := newTestShield(t, "test_write_coalescing")
-	defer s.Close()
+	defer func(s *shield.Shield) {
+		err := s.Close()
+		if err != nil {
+			slog.Info("Unable to close")
+		}
+	}(s)
 
 	ctx := context.Background()
 	corrKey := "user_456"
@@ -172,7 +183,12 @@ func TestWrite_Coalescing(t *testing.T) {
 
 func TestWriteDedup_ContentHash(t *testing.T) {
 	s := newTestShield(t, "test_write_dedup")
-	defer s.Close()
+	defer func(s *shield.Shield) {
+		err := s.Close()
+		if err != nil {
+			slog.Info("Unable to close")
+		}
+	}(s)
 
 	ctx := context.Background()
 	corrKey := "user_789"
@@ -197,7 +213,12 @@ func TestWriteDedup_ContentHash(t *testing.T) {
 
 func TestRead_NotFound(t *testing.T) {
 	s := newTestShield(t, "test_read_not_found")
-	defer s.Close()
+	defer func(s *shield.Shield) {
+		err := s.Close()
+		if err != nil {
+			slog.Info("Unable to close")
+		}
+	}(s)
 
 	ctx := context.Background()
 	payload, ttl, found, err := s.ReadWithTTL(ctx, "nonexistent_key")
@@ -209,7 +230,12 @@ func TestRead_NotFound(t *testing.T) {
 
 func TestHotMarker(t *testing.T) {
 	s := newTestShield(t, "test_hot_marker")
-	defer s.Close()
+	defer func(s *shield.Shield) {
+		err := s.Close()
+		if err != nil {
+			slog.Info("Unable to close")
+		}
+	}(s)
 
 	ctx := context.Background()
 	corrKey := "hot_user_001"
@@ -231,7 +257,12 @@ func TestHotMarker(t *testing.T) {
 
 func TestHotLoad(t *testing.T) {
 	s := newTestShield(t, "test_hot_load")
-	defer s.Close()
+	defer func(s *shield.Shield) {
+		err := s.Close()
+		if err != nil {
+			slog.Info("Unable to close")
+		}
+	}(s)
 
 	ctx := context.Background()
 	corrKey := "hot_user_002"
@@ -254,7 +285,12 @@ func TestHotLoad(t *testing.T) {
 
 func TestRead_HotPath(t *testing.T) {
 	s := newTestShield(t, "test_read_hot_path")
-	defer s.Close()
+	defer func(s *shield.Shield) {
+		err := s.Close()
+		if err != nil {
+			slog.Info("Unable to close")
+		}
+	}(s)
 
 	ctx := context.Background()
 	corrKey := "hot_user_003"
@@ -269,15 +305,6 @@ func TestRead_HotPath(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, isHot)
 	assert.Equal(t, payload, readPayload)
-}
-
-// knownKeysForBand contains pre-computed keys that hash to each band.
-// Generated once by running: for i := 0; i < 10000; i++ { band := BandForKey(fmt.Sprintf("key_%d", i), 16); ... }
-var knownKeysForBand = map[int][]string{
-	0:  {"key_3", "key_19", "key_35", "key_51"},
-	1:  {"key_1", "key_17", "key_33", "key_49"},
-	2:  {"key_6", "key_22", "key_38", "key_54"},
-	15: {"key_15", "key_31", "key_47", "key_63"},
 }
 
 func TestDrainBand_Basic(t *testing.T) {
@@ -304,7 +331,12 @@ func TestDrainBand_Basic(t *testing.T) {
 		PoolSize:     10,
 	}, namespace, bandCount, 30*time.Second, 4*time.Hour)
 	require.NoError(t, err, "shield.New")
-	defer s.Close()
+	defer func(s *shield.Shield) {
+		err := s.Close()
+		if err != nil {
+			slog.Info("Unable to close")
+		}
+	}(s)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -394,7 +426,12 @@ func TestDrainBand_Basic(t *testing.T) {
 
 func TestGenerateKnownKeysForBand(t *testing.T) {
 	s := newTestShield(t, "generate_keys")
-	defer s.Close()
+	defer func(s *shield.Shield) {
+		err := s.Close()
+		if err != nil {
+			slog.Info("Unable to close")
+		}
+	}(s)
 
 	keysByBand := make(map[int][]string)
 
@@ -416,7 +453,12 @@ func TestGenerateKnownKeysForBand(t *testing.T) {
 
 func TestCommitKeys(t *testing.T) {
 	s := newTestShield(t, "test_commit_keys")
-	defer s.Close()
+	defer func(s *shield.Shield) {
+		err := s.Close()
+		if err != nil {
+			slog.Info("Unable to close")
+		}
+	}(s)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -469,7 +511,12 @@ func TestCommitKeys(t *testing.T) {
 
 func TestMoveToDeadLetter(t *testing.T) {
 	s := newTestShield(t, "test_move_to_dlq")
-	defer s.Close()
+	defer func(s *shield.Shield) {
+		err := s.Close()
+		if err != nil {
+			slog.Info("Unable to close")
+		}
+	}(s)
 
 	// Strict timeout to catch Redis hangs instantly instead of generic test timeouts
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -530,7 +577,12 @@ func TestMoveToDeadLetter(t *testing.T) {
 
 func TestDrainDLQ(t *testing.T) {
 	s := newTestShield(t, "test_drain_dlq")
-	defer s.Close()
+	defer func(s *shield.Shield) {
+		err := s.Close()
+		if err != nil {
+			slog.Info("Unable to close")
+		}
+	}(s)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -558,7 +610,12 @@ func TestDrainDLQ(t *testing.T) {
 
 func TestCommitDLQKeys(t *testing.T) {
 	s := newTestShield(t, "test_commit_dlq_keys")
-	defer s.Close()
+	defer func(s *shield.Shield) {
+		err := s.Close()
+		if err != nil {
+			slog.Info("Unable to close")
+		}
+	}(s)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -594,7 +651,12 @@ func TestCommitDLQKeys(t *testing.T) {
 
 func TestSetNX_Idempotency(t *testing.T) {
 	s := newTestShield(t, "test_setnx")
-	defer s.Close()
+	defer func(s *shield.Shield) {
+		err := s.Close()
+		if err != nil {
+			slog.Info("Unable to close")
+		}
+	}(s)
 
 	ctx := context.Background()
 	key := "idempotency_key_001"
@@ -612,7 +674,12 @@ func TestSetNX_Idempotency(t *testing.T) {
 
 func TestUpdateIndexes(t *testing.T) {
 	s := newTestShield(t, "test_update_indexes")
-	defer s.Close()
+	defer func(s *shield.Shield) {
+		err := s.Close()
+		if err != nil {
+			slog.Info("Unable to close")
+		}
+	}(s)
 
 	ctx := context.Background()
 	corrKey := "indexed_key_001"
@@ -641,7 +708,12 @@ func TestUpdateIndexes(t *testing.T) {
 
 func TestSInter_ClusterSafe(t *testing.T) {
 	s := newTestShield(t, "test_sinter")
-	defer s.Close()
+	defer func(s *shield.Shield) {
+		err := s.Close()
+		if err != nil {
+			slog.Info("Unable to close")
+		}
+	}(s)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -673,7 +745,12 @@ func TestSInter_ClusterSafe(t *testing.T) {
 
 func TestBatching_EnableAndWrite(t *testing.T) {
 	s := newTestShield(t, "test_batching")
-	defer s.Close()
+	defer func(s *shield.Shield) {
+		err := s.Close()
+		if err != nil {
+			slog.Info("Unable to close")
+		}
+	}(s)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -699,6 +776,7 @@ func TestBatching_EnableAndWrite(t *testing.T) {
 	for i := 0; i < 50; i++ {
 		key := fmt.Sprintf("batch_key_%03d", i)
 		_, _, f, err := s.ReadWithTTL(ctx, key)
+
 		require.NoError(t, err)
 		if f {
 			found++
@@ -747,7 +825,12 @@ func TestBandForKey_Consistency(t *testing.T) {
 
 func TestOldestDirtyScore(t *testing.T) {
 	s := newTestShield(t, "test_oldest_dirty")
-	defer s.Close()
+	defer func(s *shield.Shield) {
+		err := s.Close()
+		if err != nil {
+			slog.Info("Unable to close")
+		}
+	}(s)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -774,7 +857,12 @@ func TestOldestDirtyScore(t *testing.T) {
 
 func TestRefreshHotTTL(t *testing.T) {
 	s := newTestShield(t, "test_refresh_hot_ttl")
-	defer s.Close()
+	defer func(s *shield.Shield) {
+		err := s.Close()
+		if err != nil {
+			slog.Info("Unable to close")
+		}
+	}(s)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -800,7 +888,12 @@ func TestRefreshHotTTL(t *testing.T) {
 }
 func TestZRangeWithScores(t *testing.T) {
 	s := newTestShield(t, "test_zrange_scores")
-	defer s.Close()
+	defer func(s *shield.Shield) {
+		err := s.Close()
+		if err != nil {
+			slog.Info("Unable to close")
+		}
+	}(s)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -829,7 +922,12 @@ func TestZRangeWithScores(t *testing.T) {
 
 func TestConcurrentWrites(t *testing.T) {
 	s := newTestShield(t, "test_concurrent")
-	defer s.Close()
+	defer func(s *shield.Shield) {
+		err := s.Close()
+		if err != nil {
+			slog.Info("Unable to close")
+		}
+	}(s)
 
 	ctx := context.Background()
 	const numGoroutines = 10
@@ -861,10 +959,20 @@ func TestConcurrentWrites(t *testing.T) {
 func TestNamespaceIsolation(t *testing.T) {
 	// Create two shields with different namespaces
 	s1 := newTestShield(t, "namespace_a")
-	defer s1.Close()
+	defer func(s1 *shield.Shield) {
+		err := s1.Close()
+		if err != nil {
+			slog.Info("Unable to close")
+		}
+	}(s1)
 
 	s2 := newTestShield(t, "namespace_b")
-	defer s2.Close()
+	defer func(s2 *shield.Shield) {
+		err := s2.Close()
+		if err != nil {
+			slog.Info("Unable to close")
+		}
+	}(s2)
 
 	ctx := context.Background()
 	key := "shared_key_name"
@@ -900,7 +1008,12 @@ func TestExpiredPayloadCleanup(t *testing.T) {
 	}
 	s, err := shield.New(cfg, "test_expiry", 16, 1*time.Second, 4*time.Hour)
 	require.NoError(t, err)
-	defer s.Close()
+	defer func(s *shield.Shield) {
+		err := s.Close()
+		if err != nil {
+			slog.Info("Unable to close")
+		}
+	}(s)
 
 	ctx := context.Background()
 	cleanRedisKeys(t, s.Client(), "test_expiry")
@@ -926,7 +1039,12 @@ func TestExpiredPayloadCleanup(t *testing.T) {
 
 func TestEmptyCorrelationKey(t *testing.T) {
 	s := newTestShield(t, "test_empty_key")
-	defer s.Close()
+	defer func(s *shield.Shield) {
+		err := s.Close()
+		if err != nil {
+			slog.Info("Unable to close")
+		}
+	}(s)
 
 	ctx := context.Background()
 
@@ -941,7 +1059,12 @@ func TestEmptyCorrelationKey(t *testing.T) {
 
 func TestLargePayload(t *testing.T) {
 	s := newTestShield(t, "test_large_payload")
-	defer s.Close()
+	defer func(s *shield.Shield) {
+		err := s.Close()
+		if err != nil {
+			slog.Info("Unable to close")
+		}
+	}(s)
 
 	ctx := context.Background()
 	key := "large_payload_key"
@@ -964,7 +1087,12 @@ func TestLargePayload(t *testing.T) {
 
 func TestSpecialCharactersInKey(t *testing.T) {
 	s := newTestShield(t, "test_special_chars")
-	defer s.Close()
+	defer func(s *shield.Shield) {
+		err := s.Close()
+		if err != nil {
+			slog.Info("Unable to close")
+		}
+	}(s)
 
 	ctx := context.Background()
 
@@ -993,7 +1121,12 @@ func TestSpecialCharactersInKey(t *testing.T) {
 
 func TestShieldMethods_BandCount_Namespace(t *testing.T) {
 	s := newTestShield(t, "test_methods")
-	defer s.Close()
+	defer func(s *shield.Shield) {
+		err := s.Close()
+		if err != nil {
+			slog.Info("Unable to close")
+		}
+	}(s)
 
 	assert.Equal(t, 16, s.BandCount())
 	assert.Equal(t, "test_methods", s.Namespace())

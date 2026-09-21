@@ -3,6 +3,7 @@ package integration
 import (
 	"context"
 	"log"
+	"log/slog"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -163,7 +164,12 @@ func buildTestSluice(t *testing.T, namespace string, mode localjournal.LocalCach
 // a negative network signal, both observed independently.
 func TestL1_WriteThenRead_HitsL1(t *testing.T) {
 	s, rec, sh := buildTestSluice(t, "test_l1_write_read", localjournal.LocalCacheLazy, 60*time.Second)
-	defer sh.Close()
+	defer func(sh *shield.Shield) {
+		err := sh.Close()
+		if err != nil {
+			slog.Info("close the shield")
+		}
+	}(sh)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -208,7 +214,12 @@ func TestL1_WriteThenRead_HitsL1(t *testing.T) {
 // hit counter monotonically increments (no silent fall-through).
 func TestL1_SecondRead_AlsoHitsL1(t *testing.T) {
 	s, rec, sh := buildTestSluice(t, "test_l1_repeat_read", localjournal.LocalCacheLazy, 60*time.Second)
-	defer sh.Close()
+	defer func(sh *shield.Shield) {
+		err := sh.Close()
+		if err != nil {
+			slog.Info("Unable to close")
+		}
+	}(sh)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -273,7 +284,12 @@ func TestL1_OffMode_BehavesLikeV107(t *testing.T) {
 // with the journal's authoritative version, and subsequent reads hit L1 again.
 func TestL1_TTLExpiry_FallsThroughToL2AndHeals(t *testing.T) {
 	s, rec, sh := buildTestSluice(t, "test_l1_expiry", localjournal.LocalCacheLazy, 50*time.Millisecond)
-	defer sh.Close()
+	defer func(sh *shield.Shield) {
+		err := sh.Close()
+		if err != nil {
+			slog.Info("Unable to close")
+		}
+	}(sh)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

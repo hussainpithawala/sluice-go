@@ -3,6 +3,7 @@ package integration
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"sync"
 	"testing"
@@ -118,9 +119,9 @@ func TestSubscriber_StartStop(t *testing.T) {
 		env.local,
 		metrics,
 		broadcast.Config{
-			Namespace: "test_bcast_lifecycle",
-			Mode:      broadcast.ModePayload,
-			BlockMS:   100 * time.Millisecond, // short block for fast test
+			Namespace:           "test_bcast_lifecycle",
+			Mode:                broadcast.ModePayload,
+			Block_in_milli_secs: 100 * time.Millisecond, // short block for fast test
 		},
 	)
 
@@ -155,9 +156,9 @@ func TestSubscriber_StopIsIdempotent(t *testing.T) {
 		env.local,
 		nil,
 		broadcast.Config{
-			Namespace: "test_bcast_stop_idem",
-			Mode:      broadcast.ModePayload,
-			BlockMS:   50 * time.Millisecond,
+			Namespace:           "test_bcast_stop_idem",
+			Mode:                broadcast.ModePayload,
+			Block_in_milli_secs: 50 * time.Millisecond,
 		},
 	)
 
@@ -182,9 +183,9 @@ func TestSubscriber_AppliesUpsertMessage(t *testing.T) {
 		env.local,
 		nil,
 		broadcast.Config{
-			Namespace: "test_bcast_upsert",
-			Mode:      broadcast.ModePayload,
-			BlockMS:   100 * time.Millisecond,
+			Namespace:           "test_bcast_upsert",
+			Mode:                broadcast.ModePayload,
+			Block_in_milli_secs: 100 * time.Millisecond,
 		},
 	)
 	sub.Start()
@@ -213,9 +214,9 @@ func TestSubscriber_AppliesSeedMessage(t *testing.T) {
 		env.local,
 		nil,
 		broadcast.Config{
-			Namespace: "test_bcast_seed",
-			Mode:      broadcast.ModePayload,
-			BlockMS:   100 * time.Millisecond,
+			Namespace:           "test_bcast_seed",
+			Mode:                broadcast.ModePayload,
+			Block_in_milli_secs: 100 * time.Millisecond,
 		},
 	)
 	sub.Start()
@@ -247,9 +248,9 @@ func TestSubscriber_VersionGating_RejectsOlder(t *testing.T) {
 		env.local,
 		nil,
 		broadcast.Config{
-			Namespace: "test_bcast_version",
-			Mode:      broadcast.ModePayload,
-			BlockMS:   100 * time.Millisecond,
+			Namespace:           "test_bcast_version",
+			Mode:                broadcast.ModePayload,
+			Block_in_milli_secs: 100 * time.Millisecond,
 		},
 	)
 	sub.Start()
@@ -283,9 +284,9 @@ func TestSubscriber_VersionGating_AcceptsNewer(t *testing.T) {
 		env.local,
 		nil,
 		broadcast.Config{
-			Namespace: "test_bcast_version_newer",
-			Mode:      broadcast.ModePayload,
-			BlockMS:   100 * time.Millisecond,
+			Namespace:           "test_bcast_version_newer",
+			Mode:                broadcast.ModePayload,
+			Block_in_milli_secs: 100 * time.Millisecond,
 		},
 	)
 	sub.Start()
@@ -317,9 +318,9 @@ func TestSubscriber_InvalidationMode(t *testing.T) {
 		env.local,
 		nil,
 		broadcast.Config{
-			Namespace: "test_bcast_invalidation",
-			Mode:      broadcast.ModeInvalidation, // <-- invalidation mode
-			BlockMS:   100 * time.Millisecond,
+			Namespace:           "test_bcast_invalidation",
+			Mode:                broadcast.ModeInvalidation, // <-- invalidation mode
+			Block_in_milli_secs: 100 * time.Millisecond,
 		},
 	)
 	sub.Start()
@@ -350,9 +351,9 @@ func TestSubscriber_CrossPodConvergence(t *testing.T) {
 		env.local,
 		nil,
 		broadcast.Config{
-			Namespace: "test_bcast_convergence",
-			Mode:      broadcast.ModePayload,
-			BlockMS:   100 * time.Millisecond,
+			Namespace:           "test_bcast_convergence",
+			Mode:                broadcast.ModePayload,
+			Block_in_milli_secs: 100 * time.Millisecond,
 		},
 	)
 	sub.Start()
@@ -387,9 +388,9 @@ func TestSubscriber_StreamTrimDoesNotCrash(t *testing.T) {
 		env.local,
 		nil,
 		broadcast.Config{
-			Namespace: "test_bcast_trim",
-			Mode:      broadcast.ModePayload,
-			BlockMS:   100 * time.Millisecond,
+			Namespace:           "test_bcast_trim",
+			Mode:                broadcast.ModePayload,
+			Block_in_milli_secs: 100 * time.Millisecond,
 		},
 	)
 	sub.Start()
@@ -434,9 +435,9 @@ func TestSubscriber_LagMetric(t *testing.T) {
 		env.local,
 		metrics,
 		broadcast.Config{
-			Namespace: "test_bcast_lag",
-			Mode:      broadcast.ModePayload,
-			BlockMS:   100 * time.Millisecond,
+			Namespace:           "test_bcast_lag",
+			Mode:                broadcast.ModePayload,
+			Block_in_milli_secs: 100 * time.Millisecond,
 		},
 	)
 	sub.Start()
@@ -473,9 +474,9 @@ func TestSubscriber_GracefulShutdownUnderLoad(t *testing.T) {
 		env.local,
 		nil,
 		broadcast.Config{
-			Namespace: "test_bcast_shutdown_load",
-			Mode:      broadcast.ModePayload,
-			BlockMS:   500 * time.Millisecond, // longer block to test unblocking
+			Namespace:           "test_bcast_shutdown_load",
+			Mode:                broadcast.ModePayload,
+			Block_in_milli_secs: 500 * time.Millisecond, // longer block to test unblocking
 		},
 	)
 	sub.Start()
@@ -527,9 +528,9 @@ func TestSubscriber_MultiplePods(t *testing.T) {
 			locals[i],
 			nil,
 			broadcast.Config{
-				Namespace: "test_bcast_multipod",
-				Mode:      broadcast.ModePayload,
-				BlockMS:   100 * time.Millisecond,
+				Namespace:           "test_bcast_multipod",
+				Mode:                broadcast.ModePayload,
+				Block_in_milli_secs: 100 * time.Millisecond,
 			},
 		)
 		subs[i].Start()
@@ -573,7 +574,12 @@ func TestSubscriber_ShieldWriteBroadcastsToSubscriber(t *testing.T) {
 		PoolSize:     10,
 	}, "test_bcast_shield", 16, 30*time.Second, 4*time.Hour)
 	require.NoError(t, err)
-	defer sh.Close()
+	defer func(sh *shield.Shield) {
+		err := sh.Close()
+		if err != nil {
+			slog.Debug("Unable to close shield")
+		}
+	}(sh)
 
 	sh.EnableBroadcast(shield.BroadcastConfig{
 		Mode:   shield.BroadcastPayload,
@@ -587,9 +593,9 @@ func TestSubscriber_ShieldWriteBroadcastsToSubscriber(t *testing.T) {
 		env.local,
 		nil,
 		broadcast.Config{
-			Namespace: "test_bcast_shield",
-			Mode:      broadcast.ModePayload,
-			BlockMS:   100 * time.Millisecond,
+			Namespace:           "test_bcast_shield",
+			Mode:                broadcast.ModePayload,
+			Block_in_milli_secs: 100 * time.Millisecond,
 		},
 	)
 	sub.Start()

@@ -242,7 +242,7 @@ func (s *Shield) ReadJournal(ctx context.Context, correlationKey string) (Journa
 	}, nil
 }
 
-// Deprecated: use ReadJournal. Kept so v1.0.7 call sites compile unchanged.
+// Use ReadJournal. Kept so v1.0.7 call sites compile unchanged.
 func (s *Shield) ReadWithTTL(ctx context.Context, correlationKey string) ([]byte, time.Duration, bool, error) {
 	jr, err := s.ReadJournal(ctx, correlationKey)
 	return jr.Payload, jr.PTTL, jr.Found, err

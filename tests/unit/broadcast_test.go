@@ -3,6 +3,7 @@ package unit
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"strconv"
 	"testing"
 	"time"
@@ -14,7 +15,12 @@ import (
 
 func TestXAddBroadcast_PayloadMode(t *testing.T) {
 	s := newTestShield(t, "test_broadcast")
-	defer s.Close()
+	defer func(s *shield.Shield) {
+		err := s.Close()
+		if err != nil {
+			slog.Info("Unable to close")
+		}
+	}(s)
 
 	// Enable broadcast with payload mode
 	s.EnableBroadcast(shield.BroadcastConfig{
@@ -58,7 +64,12 @@ func TestXAddBroadcast_PayloadMode(t *testing.T) {
 
 func TestXAddBroadcast_InvalidationMode(t *testing.T) {
 	s := newTestShield(t, "test_broadcast_inv")
-	defer s.Close()
+	defer func(s *shield.Shield) {
+		err := s.Close()
+		if err != nil {
+			slog.Info("Unable to close")
+		}
+	}(s)
 
 	s.EnableBroadcast(shield.BroadcastConfig{
 		Mode:   shield.BroadcastInvalidation,
@@ -89,7 +100,12 @@ func TestXAddBroadcast_InvalidationMode(t *testing.T) {
 
 func TestXAddBroadcast_DisabledIsNoOp(t *testing.T) {
 	s := newTestShield(t, "test_broadcast_off")
-	defer s.Close()
+	defer func(s *shield.Shield) {
+		err := s.Close()
+		if err != nil {
+			slog.Info("Unable to close")
+		}
+	}(s)
 
 	// Do NOT call EnableBroadcast
 
@@ -108,7 +124,12 @@ func TestXAddBroadcast_DisabledIsNoOp(t *testing.T) {
 
 func TestXAddBroadcast_BatchedPath(t *testing.T) {
 	s := newTestShield(t, "test_broadcast_batched")
-	defer s.Close()
+	defer func(s *shield.Shield) {
+		err := s.Close()
+		if err != nil {
+			slog.Info("Unable to close")
+		}
+	}(s)
 
 	s.EnableBatching(100, 10*time.Millisecond)
 	s.EnableBroadcast(shield.BroadcastConfig{

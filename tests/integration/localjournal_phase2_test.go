@@ -2,6 +2,7 @@ package integration
 
 import (
 	"context"
+	"log/slog"
 	"strconv"
 	"sync/atomic"
 	"testing"
@@ -34,7 +35,12 @@ func TestReadFresh_BypassesL1(t *testing.T) {
 		PoolSize:     10,
 	}, namespace, 16, 30*time.Second, 4*time.Hour)
 	require.NoError(t, err)
-	defer sh.Close()
+	defer func(sh *shield.Shield) {
+		err := sh.Close()
+		if err != nil {
+			slog.Info("Unable to close")
+		}
+	}(sh)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -103,7 +109,12 @@ func TestHotLoad_EmitsSeedBroadcast(t *testing.T) {
 		PoolSize:     10,
 	}, namespace, 16, 30*time.Second, 4*time.Hour)
 	require.NoError(t, err)
-	defer sh.Close()
+	defer func(sh *shield.Shield) {
+		err := sh.Close()
+		if err != nil {
+			slog.Info("Unable to close")
+		}
+	}(sh)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -196,10 +207,10 @@ func TestPushPull_EndToEnd_TwoPods(t *testing.T) {
 			local,
 			nil, // subscriber lag metrics not asserted in this e2e test
 			broadcast.Config{
-				Namespace: namespace,
-				Mode:      broadcast.ModePayload,
-				Stream:    shield.BroadcastKey(namespace),
-				BlockMS:   100 * time.Millisecond,
+				Namespace:           namespace,
+				Mode:                broadcast.ModePayload,
+				Stream:              shield.BroadcastKey(namespace),
+				Block_in_milli_secs: 100 * time.Millisecond,
 			},
 		)
 		sub.Start()
@@ -215,11 +226,21 @@ func TestPushPull_EndToEnd_TwoPods(t *testing.T) {
 	}
 
 	podA, subA, _, _, shA := buildPod(t)
-	defer shA.Close()
+	defer func(shA *shield.Shield) {
+		err := shA.Close()
+		if err != nil {
+			slog.Info("Unable to close")
+		}
+	}(shA)
 	defer subA.Stop()
 
 	podB, subB, recB, localB, shB := buildPod(t)
-	defer shB.Close()
+	defer func(shB *shield.Shield) {
+		err := shB.Close()
+		if err != nil {
+			slog.Info("Unable to close")
+		}
+	}(shB)
 	defer subB.Stop()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -242,6 +263,7 @@ func TestPushPull_EndToEnd_TwoPods(t *testing.T) {
 	// Install a Redis-read spy on Pod B BEFORE reading.
 	var redisReads int64
 	recB.redisOpHook = func(op string) {
+		//nolint:goconst
 		if op == "read" || op == "readjournal" || op == "readfresh" {
 			atomic.AddInt64(&redisReads, 1)
 		}

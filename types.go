@@ -44,8 +44,10 @@ type Builder struct {
 	sk            sink.FlushSink
 	src           source.Source
 	writeContract WriteContract
-	readContract  ReadContract
-	callback      OnFlushCallback
+	//nolint:unused
+	readContract ReadContract
+	callback     OnFlushCallback
+	//nolint:unused
 	namespace     string
 	localCacheCfg localjournal.LocalCacheConfig
 }
