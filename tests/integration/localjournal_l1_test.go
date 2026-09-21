@@ -2,6 +2,7 @@ package integration
 
 import (
 	"context"
+	"log"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -27,7 +28,7 @@ type countingRecorder struct {
 	missReasons           map[string]int
 	setSizeCalls          int
 	lastLagRecordDuration time.Duration
-
+	reads                 int
 	// spy: if set, called on every RecordRedisOp so we can detect
 	// whether the L2 Redis tier was touched during a Read.
 	redisOpHook func(op string)
@@ -61,11 +62,15 @@ func (r *countingRecorder) RecordBroadcastLag(_ string, lag time.Duration) {
 }
 
 // ── Stubs for the rest of MetricsRecorder (compile-time satisfaction) ──────
-func (r *countingRecorder) RecordRead(string, time.Duration, bool, error) {}
-func (r *countingRecorder) RecordWrite(string)                            {}
-func (r *countingRecorder) RecordDegradedWrite(string, error)             {}
-func (r *countingRecorder) RecordWarmUp(string, time.Duration, error)     {}
-func (r *countingRecorder) RecordHotSetSize(string, int)                  {}
+func (r *countingRecorder) RecordRead(string, time.Duration, bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.reads++
+}
+func (r *countingRecorder) RecordWrite(string)                        {}
+func (r *countingRecorder) RecordDegradedWrite(string, error)         {}
+func (r *countingRecorder) RecordWarmUp(string, time.Duration, error) {}
+func (r *countingRecorder) RecordHotSetSize(string, int)              {}
 func (r *countingRecorder) RecordRedisOp(_ string, op string, _ time.Duration, _ error) {
 	if r.redisOpHook != nil {
 		r.redisOpHook(op)
@@ -233,7 +238,12 @@ func TestL1_SecondRead_AlsoHitsL1(t *testing.T) {
 // with Mode=Off, every Read falls through to L2 and no L1 metric ever fires.
 func TestL1_OffMode_BehavesLikeV107(t *testing.T) {
 	s, rec, sh := buildTestSluice(t, "test_l1_off", localjournal.LocalCacheOff, 0)
-	defer sh.Close()
+	defer func(sh *shield.Shield) {
+		err := sh.Close()
+		if err != nil {
+			log.Fatal("Unable to close the suite")
+		}
+	}(sh)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

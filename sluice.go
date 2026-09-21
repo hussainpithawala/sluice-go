@@ -20,7 +20,6 @@ package sluice
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -290,35 +289,22 @@ func (s *Sluice) Read(ctx context.Context, correlationKey string) ([]byte, error
 	if s.local != nil {
 		p, _, ok := s.local.Get(correlationKey)
 		if ok {
-			// DIAGNOSTIC: L1 hit — log what we're returning
-			var dbg struct {
-				Priority int `json:"priority"`
-			}
-			_ = json.Unmarshal(p, &dbg)
-			// slog.Info("READ-L1-HIT", "crn", correlationKey, "priority", dbg.Priority, "version", ver)
 			return p, nil
 		}
-		// DIAGNOSTIC: L1 miss — log that we're falling through
-		slog.Debug("READ-L1-MISS", "crn", correlationKey)
 	}
 
 	// ── Tier 2: L2 Redis Journal ─────────────────────────────────────────
+	tRead := time.Now()
 	jr, err := s.shield.ReadJournal(ctx, correlationKey)
+	s.metrics.RecordRedisOp(s.cfg.Namespace, "readjournal", time.Since(tRead), err)
+
 	if err != nil {
 		return nil, err
 	}
 
 	if jr.Found {
-		// DIAGNOSTIC: log what L2 returned and what version we're healing with
-		var dbg struct {
-			Priority int `json:"priority"`
-		}
-		_ = json.Unmarshal(jr.Payload, &dbg)
-		slog.Info("READ-L2-FOUND", "crn", correlationKey, "priority", dbg.Priority, "journal_version", jr.Version)
-
 		if s.local != nil {
-			applied := s.local.Put(correlationKey, jr.Payload, jr.Version)
-			slog.Debug("READ-L2-HEAL", "crn", correlationKey, "journal_version", jr.Version, "applied", applied)
+			s.local.Put(correlationKey, jr.Payload, jr.Version)
 		}
 
 		if s.hotAwareFlush.Load() && jr.PTTL >= 0 && jr.PTTL < s.activityWindow/5 {
@@ -338,7 +324,6 @@ func (s *Sluice) Read(ctx context.Context, correlationKey string) ([]byte, error
 		if err != nil {
 			return nil, fmt.Errorf("read contract: %w", err)
 		}
-
 		payload, err := s.src.Read(ctx, *readModel)
 		if err != nil {
 			if errors.Is(err, source.ErrRecordNotFound) {
@@ -346,13 +331,6 @@ func (s *Sluice) Read(ctx context.Context, correlationKey string) ([]byte, error
 			}
 			return nil, err
 		}
-
-		// Optional: Seed L1 on cold read miss?
-		// RFC says "Demand-fill on first miss", so yes, we can put it in L1.
-		// But we don't have a journal `ts` for it yet (it wasn't in Redis).
-		// For Phase 1 Lazy, we skip L1 seeding on cold reads to avoid
-		// version conflicts when the next Write() lands.
-
 		return payload, nil
 	}
 
