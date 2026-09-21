@@ -254,15 +254,15 @@ func (s *Shield) SetNX(ctx context.Context, key string, value interface{}, expir
 }
 
 // HotLoad forces a payload into the journal with ActivityWindow TTL
-// and sets the hot marker so IsHot() correctly identifies this CRN as active.
+// kind=seed message so peer pods converge on the promoted key (RFC §5.4).
 func (s *Shield) HotLoad(ctx context.Context, correlationKey string, payload []byte) error {
-	// 1. Write the payload to the dirty queue and Redis hash
-	if err := s.Write(ctx, correlationKey, payload); err != nil {
+	// 1. Journal write + seed broadcast (kind=seed distinguishes promotions
+	//    from normal writes in stream telemetry).
+	if err := s.writeWithKind(ctx, correlationKey, payload, broadcastKindSeed); err != nil {
 		return err
 	}
 
-	// 2. Extend the payload TTL to ActivityWindow for hot CRNs.
-	// Note: Expire() returns a *BoolCmd, so we must call .Err() to extract the error.
+	// 2. Extend payload TTL to ActivityWindow for hot CRNs.
 	if err := s.client.Expire(ctx, s.payloadKey(correlationKey), s.activityWindow).Err(); err != nil {
 		return err
 	}
@@ -653,6 +653,9 @@ func (s *Shield) enqueueBroadcast(ctx context.Context, pipe redis.Pipeliner, cor
 	if !s.broadcastEnabled {
 		return
 	}
+
+	// DIAGNOSTIC: Log the exact stream key the broadcaster is using
+	slog.Info("ENQUEUE-BROADCAST", "stream", s.broadcastKey(), "crn", correlationKey, "ts", ts)
 
 	// Build field/value pairs for the stream entry.
 	// go-redis XAddArgs.Values accepts []interface{} as alternating k/v pairs.

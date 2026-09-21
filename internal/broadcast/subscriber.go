@@ -50,7 +50,7 @@ func NewSubscriber(
 	cfg Config,
 ) *Subscriber {
 	if cfg.BlockMS <= 0 {
-		cfg.BlockMS = 1 * time.Second
+		cfg.BlockMS = 50 * time.Millisecond // ← was 1s, now 50ms
 	}
 	return &Subscriber{
 		client:  client,
@@ -65,6 +65,9 @@ func NewSubscriber(
 // Non-blocking. Safe to call only once per instance.
 func (s *Subscriber) Start() {
 	s.ctx, s.cancel = context.WithCancel(context.Background())
+
+	// DIAGNOSTIC: Prove Start() was called and what stream it's watching
+	slog.Info("SUBSCRIBER-STARTING", "stream", s.stream, "namespace", s.cfg.Namespace)
 
 	s.wg.Add(2)
 	go s.run(s.ctx)
@@ -81,8 +84,17 @@ func (s *Subscriber) Stop() {
 }
 
 // run is the main blocked XREAD loop.
-func (s *Subscriber) run(ctx context.Context) {
+func (s *Subscriber) runO(ctx context.Context) {
 	defer s.wg.Done()
+	// DIAGNOSTIC: Prove the goroutine actually started running
+	slog.Info("SUBSCRIBER-RUN-ENTERED", "stream", s.stream)
+
+	// Add a panic catcher just in case it's crashing silently
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("SUBSCRIBER-PANIC", "stream", s.stream, "panic", r)
+		}
+	}()
 
 	for {
 		// Check for shutdown before blocking
@@ -94,12 +106,17 @@ func (s *Subscriber) run(ctx context.Context) {
 
 		cursor := s.getCursor()
 
-		// XREAD BLOCK pauses the connection until messages arrive or BlockMS elapses.
-		// go-redis respects context cancellation, which unblocks this immediately on Stop().
+		// DIAGNOSTIC: Log every time we attempt to read (will log every BlockMS)
+		slog.Info("SUBSCRIBER-LOOP-TICK", "stream", s.stream, "cursor", cursor)
+
+		// Use a SHORT block timeout (50ms) instead of a long one.
+		// XREAD BLOCK on Redis Cluster clients can fail to wake up promptly
+		// when the XADD arrives via a pipelined connection. A short block
+		// ensures we poll frequently and catch new messages within ~50ms.
 		res, err := s.client.XRead(ctx, &redis.XReadArgs{
 			Streams: []string{s.stream, cursor},
 			Count:   100,
-			Block:   s.cfg.BlockMS,
+			Block:   50 * time.Millisecond, // ← SHORT block, not 1s
 		}).Result()
 
 		if err != nil {
@@ -137,14 +154,69 @@ func (s *Subscriber) run(ctx context.Context) {
 	}
 }
 
+func (s *Subscriber) run(ctx context.Context) {
+	defer s.wg.Done()
+
+	const (
+		blockTimeout = 5 * time.Second // bounded, so ctx/shutdown is observed regularly
+		minBackoff   = 100 * time.Millisecond
+		maxBackoff   = 5 * time.Second
+	)
+
+	cursor := s.getCursor() // single owner goroutine -> keep it local
+	backoff := minBackoff
+
+	for ctx.Err() == nil {
+		res, err := s.client.XRead(ctx, &redis.XReadArgs{
+			Streams: []string{s.stream, cursor},
+			Count:   100,
+			Block:   blockTimeout, // NEVER 0 (= forever); use -1 for non-blocking
+		}).Result()
+
+		if err != nil {
+			switch {
+			case errors.Is(err, redis.Nil):
+				// Block timeout elapsed with no data: normal, loop again.
+				backoff = minBackoff
+				continue
+			case ctx.Err() != nil:
+				return
+			default:
+				slog.Warn("broadcast XREAD error", "stream", s.stream, "err", err)
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(backoff):
+				}
+				if backoff *= 2; backoff > maxBackoff {
+					backoff = maxBackoff
+				}
+				continue
+			}
+		}
+		backoff = minBackoff
+
+		for _, xs := range res {
+			for _, msg := range xs.Messages {
+				s.apply(msg)
+				cursor = msg.ID // advance per message, not per batch
+				s.setCursor(cursor)
+			}
+		}
+	}
+}
+
 // apply processes a single stream message.
 func (s *Subscriber) apply(msg redis.XMessage) {
 	crn, _ := msg.Values["crn"].(string)
 	tsStr, _ := msg.Values["ts"].(string)
 	kindStr, _ := msg.Values["kind"].(string)
 
+	// DIAGNOSTIC: Confirm the subscriber actually received the message
+	slog.Info("SUBSCRIBER-APPLY", "crn", crn, "ts", tsStr, "kind", kindStr)
+
 	if crn == "" || tsStr == "" {
-		return // Malformed message, skip
+		return
 	}
 
 	ts, err := strconv.ParseInt(tsStr, 10, 64)
@@ -157,20 +229,18 @@ func (s *Subscriber) apply(msg redis.XMessage) {
 		if s.cfg.Mode == ModePayload {
 			payloadStr, ok := msg.Values["payload"].(string)
 			if !ok || payloadStr == "" {
-				// Fallback: if payload is missing in Payload mode, invalidate
-				// so the next Read() heals from the Redis journal.
+				slog.Warn("SUBSCRIBER-INVALIDATE", "crn", crn, "reason", "missing payload")
 				s.local.Invalidate(crn)
 				return
 			}
-			// Version-checked Put: L1 cache automatically rejects older/equal ts.
-			s.local.Put(crn, []byte(payloadStr), ts)
+			// DIAGNOSTIC: Confirm Put was called and whether it succeeded
+			applied := s.local.Put(crn, []byte(payloadStr), ts)
+			slog.Debug("SUBSCRIBER-PUT", "crn", crn, "ts", ts, "applied", applied)
 		} else {
-			// ModeInvalidation: We don't have the payload. Invalidate the local
-			// entry so the next Read() misses L1 and fetches the fresh state from L2.
 			s.local.Invalidate(crn)
 		}
 	case KindTouch:
-		// Deferred per RFC §11.3. LocalTTL handles expiry naturally.
+		// Deferred
 	}
 }
 

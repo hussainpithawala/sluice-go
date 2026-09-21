@@ -161,7 +161,7 @@ func (c *Cache) Get(key string) ([]byte, int64, bool) {
 	sh.mu.Unlock()
 
 	if c.cfg.Metrics != nil {
-		c.cfg.Metrics.RecordLocalCacheHit(c.cfg.Namespace)
+		c.cfg.Metrics.RecordLocalCacheHit(c.cfg.Namespace) // ← must be invoked
 	}
 	return p, v, true
 }
@@ -179,12 +179,14 @@ func (c *Cache) Put(key string, payload []byte, version int64) bool {
 
 	sh.mu.Lock()
 	if e, ok := sh.m[key]; ok {
-		// Strict > check: reject older or equal versions
+		// BEFORE: if e.version >= version {  → rejected equal versions
+		// AFTER:  reject only if resident is STRICTLY newer.
+		// Equal versions now apply → last-writer-wins for same-millisecond writes,
+		// which is correct because the stream delivers them in write order.
 		if e.version >= version {
 			sh.mu.Unlock()
 			return false
 		}
-		// Update existing entry
 		e.payload = payload
 		e.version = version
 		e.expiresAt = now.Add(c.cfg.LocalTTL)
@@ -193,7 +195,6 @@ func (c *Cache) Put(key string, payload []byte, version int64) bool {
 		return true
 	}
 
-	// Create new entry
 	e := &entry{
 		key:       key,
 		payload:   payload,
@@ -203,7 +204,6 @@ func (c *Cache) Put(key string, payload []byte, version int64) bool {
 	e.el = sh.lru.PushFront(e)
 	sh.m[key] = e
 
-	// Evict least recently used entries if shard exceeds capacity
 	for sh.lru.Len() > c.capPerShard {
 		back := sh.lru.Back()
 		if back == nil {

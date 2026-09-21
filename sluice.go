@@ -20,6 +20,7 @@ package sluice
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -185,27 +186,6 @@ func (b *Builder) Build(ctx context.Context) (*Sluice, error) {
 	s := &Sluice{cfg: b.cfg, shield: sh, engine: eng, sk: b.sk, src: b.src, writeContract: b.writeContract, metrics: metrics}
 
 	// ── L1 Local Journal (opt-in, default-off) ────────────────────────────
-	if b.localCacheCfg.Mode != localjournal.LocalCacheOff {
-		if b.localCacheCfg.MaxEntries <= 0 {
-			b.localCacheCfg.MaxEntries = 200_000
-		}
-		if b.localCacheCfg.LocalTTL <= 0 {
-			b.localCacheCfg.LocalTTL = 60 * time.Second
-		}
-		if b.localCacheCfg.Mode == localjournal.LocalCachePushPull {
-			return nil, fmt.Errorf("sluice: LocalCachePushPull is not yet implemented (Phase 2); use LocalCacheLazy")
-		}
-
-		s.local = localjournal.New(localjournal.Config{
-			Namespace:  b.namespace,
-			MaxEntries: b.localCacheCfg.MaxEntries,
-			LocalTTL:   b.localCacheCfg.LocalTTL,
-			Metrics:    s.metrics,
-			// Recorder: s.metrics, // Will wire in Step 2 (MetricsRecorder additions)
-		})
-	}
-
-	// Inside Build(ctx), after shield.New and EnableBatching:
 	// ── L1 Local Journal (opt-in, default-off) ────────────────────────────
 	if b.localCacheCfg.Mode != localjournal.LocalCacheOff {
 		if b.localCacheCfg.MaxEntries <= 0 {
@@ -215,41 +195,44 @@ func (b *Builder) Build(ctx context.Context) (*Sluice, error) {
 			b.localCacheCfg.LocalTTL = 60 * time.Second
 		}
 
+		namespace := s.shield.Namespace()
+
+		// SINGLE instantiation of s.local
 		s.local = localjournal.New(localjournal.Config{
-			Namespace:  b.namespace,
+			Namespace:  namespace,
 			MaxEntries: b.localCacheCfg.MaxEntries,
 			LocalTTL:   b.localCacheCfg.LocalTTL,
 			Metrics:    s.metrics,
 		})
 
 		if b.localCacheCfg.Mode == localjournal.LocalCachePushPull {
-			// Defaults per RFC §5.3.
 			if b.localCacheCfg.Retention <= 0 {
 				b.localCacheCfg.Retention = 200_000
 			}
 
-			// Broadcaster: piggy-backed XADD on every write (Step 2.1).
 			s.shield.EnableBroadcast(shield.BroadcastConfig{
 				Mode:   shield.BroadcastMode(b.localCacheCfg.Broadcast),
 				MaxLen: b.localCacheCfg.Retention,
 			})
 
-			// Subscriber: blocked XREAD loop applying version-checked Puts (Step 2.2).
+			// Subscriber correctly receives the one and only s.local
 			s.broadcastSub = broadcast.NewSubscriber(
 				s.shield.Client(),
-				shield.BroadcastKey(b.namespace),
+				shield.BroadcastKey(namespace),
 				s.local,
-				s.metrics, // satisfies broadcast.MetricsRecorder via interface embedding
+				s.metrics,
 				broadcast.Config{
-					Namespace: b.namespace,
+					Namespace: namespace,
 					Mode:      broadcast.Mode(b.localCacheCfg.Broadcast),
-					Stream:    shield.BroadcastKey(b.namespace),
+					Stream:    shield.BroadcastKey(namespace),
 					MaxLen:    b.localCacheCfg.Retention,
 				},
 			)
 			s.broadcastSub.Start()
 		}
 	}
+	// Inside Build(ctx), after shield.New and EnableBatching:
+	// ── L1 Local Journal (opt-in, default-off) ────────────────────────────
 	if b.cfg.DLQAutoProcess {
 		s.startDLQProcessor()
 	}
@@ -303,37 +286,41 @@ func (s *Sluice) Read(ctx context.Context, correlationKey string) ([]byte, error
 		return nil, ErrLibraryClosed
 	}
 
-	// ── Tier 1: L1 Local Journal (Sub-microsecond) ─────────────────────
+	// ── Tier 1: L1 Local Journal ─────────────────────────────────────────
 	if s.local != nil {
-		if p, _, ok := s.local.Get(correlationKey); ok {
-			// Telemetry (RecordLocalCacheHit) is handled internally by the cache
-			// via the localMetricsAdapter wired in Build().
+		p, _, ok := s.local.Get(correlationKey)
+		if ok {
+			// DIAGNOSTIC: L1 hit — log what we're returning
+			var dbg struct {
+				Priority int `json:"priority"`
+			}
+			_ = json.Unmarshal(p, &dbg)
+			// slog.Info("READ-L1-HIT", "crn", correlationKey, "priority", dbg.Priority, "version", ver)
 			return p, nil
 		}
+		// DIAGNOSTIC: L1 miss — log that we're falling through
+		slog.Debug("READ-L1-MISS", "crn", correlationKey)
 	}
 
-	// ── Tier 2: L2 Redis Journal (Sub-millisecond) ─────────────────────
-	// Uses the new ReadJournal to get the version (ts) for L1 healing.
-	// ── Tier 2: L2 Redis Journal (Sub-millisecond) ─────────────────────
-	// Uses the new ReadJournal to get the version (ts) for L1 healing.
-	tRead := time.Now()
+	// ── Tier 2: L2 Redis Journal ─────────────────────────────────────────
 	jr, err := s.shield.ReadJournal(ctx, correlationKey)
-
-	// Instrument the L2 fallback so observability (and our integration tests)
-	// can track exactly when the read path falls through L1 to Redis.
-	s.metrics.RecordRedisOp(s.cfg.Namespace, "readjournal", time.Since(tRead), err)
-
 	if err != nil {
 		return nil, err
 	}
 
 	if jr.Found {
-		// Heal L1 with the versioned payload
+		// DIAGNOSTIC: log what L2 returned and what version we're healing with
+		var dbg struct {
+			Priority int `json:"priority"`
+		}
+		_ = json.Unmarshal(jr.Payload, &dbg)
+		slog.Info("READ-L2-FOUND", "crn", correlationKey, "priority", dbg.Priority, "journal_version", jr.Version)
+
 		if s.local != nil {
-			s.local.Put(correlationKey, jr.Payload, jr.Version)
+			applied := s.local.Put(correlationKey, jr.Payload, jr.Version)
+			slog.Debug("READ-L2-HEAL", "crn", correlationKey, "journal_version", jr.Version, "applied", applied)
 		}
 
-		// Existing lazy hot-TTL refresh (20% threshold)
 		if s.hotAwareFlush.Load() && jr.PTTL >= 0 && jr.PTTL < s.activityWindow/5 {
 			go func() {
 				bgCtx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
@@ -561,9 +548,9 @@ func (s *Sluice) Write(ctx context.Context, correlationKey string, payload []byt
 
 		// ── L1 Write-Through (Sub-microsecond same-pod consistency) ─────
 		if s.local != nil {
-			s.local.Put(correlationKey, payload, l1Version)
+			applied := s.local.Put(correlationKey, payload, l1Version)
+			slog.Debug("WRITE-THROUGH", "crn", correlationKey, "version", l1Version, "applied", applied)
 		}
-
 		// 2. Index maintenance via pipeline (best-effort, Valkey-safe)
 		if s.cfg.IndexContract != nil {
 			indexes, idxErr := s.cfg.IndexContract(correlationKey, payload)
