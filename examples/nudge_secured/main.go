@@ -63,6 +63,10 @@ func nudgeWriteContract(correlationKey string, rawPayload []byte) (*sluice.Write
 
 type logMetrics struct{ log *slog.Logger }
 
+func (m *logMetrics) RecordBroadcastLag(namespace string, lag time.Duration) {
+	m.log.Info("broadcast-lag", "ns", namespace, "lag_ms", lag.Milliseconds())
+}
+
 func (m *logMetrics) RecordLocalCacheHit(namespace string) {
 	m.log.Info("record-local-cache-hit", "ns", namespace)
 }

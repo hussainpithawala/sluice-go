@@ -102,6 +102,10 @@ func nudgeIndexContract(crn string, payload []byte) (map[string]interface{}, err
 
 type logMetrics struct{ log *slog.Logger }
 
+func (m *logMetrics) RecordBroadcastLag(namespace string, lag time.Duration) {
+	m.log.Warn("broad-cast lag", "ns", namespace, "lag", lag)
+}
+
 func (m *logMetrics) RecordWrite(_ string) {}
 func (m *logMetrics) RecordDegradedWrite(ns string, err error) {
 	m.log.Warn("degraded write", "ns", ns, "err", err)

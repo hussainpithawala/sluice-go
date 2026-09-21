@@ -154,6 +154,10 @@ func (h *DLQTaskHandler) ProcessTask(ctx context.Context, t *asynq.Task) error {
 // logMetrics registers trace counters.
 type logMetrics struct{ log *slog.Logger }
 
+func (m *logMetrics) RecordBroadcastLag(namespace string, lag time.Duration) {
+	m.log.Info("broadcast-lag", "ns", namespace, "lag", lag)
+}
+
 func (m *logMetrics) RecordWarmUp(namespace string, duration time.Duration, err error) {
 	m.log.Info("warm-up", "ns", namespace, "duration", duration.Milliseconds(), "error", err)
 }
