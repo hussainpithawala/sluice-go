@@ -39,6 +39,7 @@ import (
 	"time"
 
 	sluice "github.com/hussainpithawala/sluice-go"
+	"github.com/hussainpithawala/sluice-go/internal/localjournal"
 	"github.com/hussainpithawala/sluice-go/sink/docdb"
 	"go.mongodb.org/mongo-driver/bson"
 )
@@ -79,6 +80,10 @@ func nudgeWriteContract(correlationKey string, rawPayload []byte) (*sluice.Write
 
 type logMetrics struct{ log *slog.Logger }
 
+func (m *logMetrics) RecordBroadcastLag(namespace string, lag time.Duration) {
+	m.log.Info("broadcast-lag", "ns", namespace, "lag", lag)
+}
+
 func (m *logMetrics) RecordWarmUp(namespace string, duration time.Duration, err error) {
 	m.log.Info("warm-up", "ns", namespace, "duration", duration.Milliseconds(), "error", err)
 }
@@ -116,6 +121,18 @@ func (m *logMetrics) RecordDeadLetter(ns, band string, count int) {
 }
 func (m *logMetrics) RecordDLQProcess(ns, strategy string, processed, succeeded, failed int) {
 	m.log.Info("dlq-process", "ns", ns, "strategy", strategy, "processed", processed, "succeeded", succeeded, "failed", failed)
+}
+
+func (m *logMetrics) RecordLocalCacheHit(namespace string) {
+	m.log.Info("record-local-cache-hit", "ns", namespace)
+}
+
+func (m *logMetrics) RecordLocalCacheMiss(namespace string, reason localjournal.MissReason) {
+	m.log.Info("record-local-cache-miss", "ns", namespace, "reason", reason)
+}
+
+func (m *logMetrics) RecordLocalSetSize(namespace string, size int) {
+	m.log.Info("record-local-set-size", "ns", namespace, "size", size)
 }
 
 func simulatedConsumer(ctx context.Context, workerID int, sl *sluice.Sluice, log *slog.Logger, written *atomic.Int64, wg *sync.WaitGroup) {

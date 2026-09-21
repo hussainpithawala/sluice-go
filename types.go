@@ -7,7 +7,9 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/hussainpithawala/sluice-go/internal/broadcast"
 	"github.com/hussainpithawala/sluice-go/internal/engine"
+	"github.com/hussainpithawala/sluice-go/internal/localjournal"
 	"github.com/hussainpithawala/sluice-go/internal/shield"
 	"github.com/hussainpithawala/sluice-go/sink"
 	"github.com/hussainpithawala/sluice-go/source"
@@ -18,25 +20,36 @@ import (
 // Sluice is the main entry point. Safe for concurrent use.
 // Construct via New().Build() — never instantiate directly.
 type Sluice struct {
-	cfg       Config
-	shield    *shield.Shield
-	engine    *engine.Engine
-	sk        sink.FlushSink
-	src       source.Source
-	contract  WriteContract
-	metrics   MetricsRecorder
-	closed    atomic.Bool
-	dlqCancel context.CancelFunc
-	dlqDone   chan struct{}
+	cfg           Config
+	shield        *shield.Shield
+	engine        *engine.Engine
+	sk            sink.FlushSink
+	src           source.Source
+	writeContract WriteContract
+	readContract  ReadContract
+	metrics       MetricsRecorder
+	closed        atomic.Bool
+	dlqCancel     context.CancelFunc
+	dlqDone       chan struct{}
+	// L1 Local Journal (nil if Mode == Off)
+	local          *localjournal.Cache
+	hotAwareFlush  atomic.Bool
+	activityWindow time.Duration
+	broadcastSub   *broadcast.Subscriber
 }
 
 // Builder assembles a Sluice instance with a fluent API.
 type Builder struct {
-	cfg      Config
-	sk       sink.FlushSink
-	src      source.Source
-	contract WriteContract
-	callback OnFlushCallback
+	cfg           Config
+	sk            sink.FlushSink
+	src           source.Source
+	writeContract WriteContract
+	//nolint:unused
+	readContract ReadContract
+	callback     OnFlushCallback
+	//nolint:unused
+	namespace     string
+	localCacheCfg localjournal.LocalCacheConfig
 }
 
 // ─── Configuration ───────────────────────────────────────────────────────────

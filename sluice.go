@@ -27,8 +27,10 @@ import (
 	"log/slog"
 
 	"github.com/cespare/xxhash/v2"
+	"github.com/hussainpithawala/sluice-go/internal/broadcast"
 	"github.com/hussainpithawala/sluice-go/internal/dlq"
 	"github.com/hussainpithawala/sluice-go/internal/engine"
+	"github.com/hussainpithawala/sluice-go/internal/localjournal"
 	"github.com/hussainpithawala/sluice-go/internal/shield"
 	"github.com/hussainpithawala/sluice-go/sink"
 	"github.com/hussainpithawala/sluice-go/source"
@@ -38,7 +40,7 @@ import (
 // New returns a Builder initialised with production-safe defaults.
 // namespace isolates all Redis keys for this instance.
 func New(namespace string) *Builder {
-	return &Builder{cfg: defaultConfig(namespace)}
+	return &Builder{cfg: DefaultConfig(namespace)}
 }
 
 func (b *Builder) WithRedis(rc RedisConfig) *Builder  { b.cfg.Redis = rc; return b }
@@ -54,7 +56,7 @@ func (b *Builder) WithReadContract(rc ReadContract) *Builder { b.cfg.ReadContrac
 
 // WithIndexContract sets the domain function that extracts secondary index fields.
 func (b *Builder) WithIndexContract(ic IndexContract) *Builder { b.cfg.IndexContract = ic; return b }
-func (b *Builder) WithWriteContract(wc WriteContract) *Builder { b.contract = wc; return b }
+func (b *Builder) WithWriteContract(wc WriteContract) *Builder { b.writeContract = wc; return b }
 func (b *Builder) WithFlushWindow(d time.Duration) *Builder    { b.cfg.FlushWindow = d; return b }
 func (b *Builder) WithMaxBatchSize(n int) *Builder             { b.cfg.MaxBatchSize = n; return b }
 func (b *Builder) WithBandCount(n int) *Builder                { b.cfg.BandCount = n; return b }
@@ -82,6 +84,13 @@ func (b *Builder) WithContentDedup(v bool) *Builder {
 	b.cfg.ContentDedup = v
 	return b
 }
+
+// WithLocalCache enables the L1 in-process read tier.
+func (b *Builder) WithLocalCache(cfg localjournal.LocalCacheConfig) *Builder {
+	b.localCacheCfg = cfg
+	return b
+}
+
 func (b *Builder) OnFlush(cb OnFlushCallback) *Builder { b.callback = cb; return b }
 
 // WithBatchedWrites enables pipelined Redis writes. Instead of one Redis
@@ -149,9 +158,10 @@ func (b *Builder) Build(ctx context.Context) (*Sluice, error) {
 			b.callback(keys, pubResult, err)
 		}
 	}
+
 	// Wrap contract to convert public WriteModel to sink.WriteModel
 	wrappedContract := func(correlationKey string, payload []byte) (*sink.WriteModel, error) {
-		wm, err := b.contract(correlationKey, payload)
+		wm, err := b.writeContract(correlationKey, payload)
 		if err != nil {
 			return nil, err
 		}
@@ -172,8 +182,56 @@ func (b *Builder) Build(ctx context.Context) (*Sluice, error) {
 		sh.StartBatcher(ctx)
 	}
 
-	s := &Sluice{cfg: b.cfg, shield: sh, engine: eng, sk: b.sk, src: b.src, contract: b.contract, metrics: metrics}
+	s := &Sluice{cfg: b.cfg, shield: sh, engine: eng, sk: b.sk, src: b.src, writeContract: b.writeContract, metrics: metrics}
 
+	// ── L1 Local Journal (opt-in, default-off) ────────────────────────────
+	// ── L1 Local Journal (opt-in, default-off) ────────────────────────────
+	if b.localCacheCfg.Mode != localjournal.LocalCacheOff {
+		if b.localCacheCfg.MaxEntries <= 0 {
+			b.localCacheCfg.MaxEntries = 200_000
+		}
+		if b.localCacheCfg.LocalTTL <= 0 {
+			b.localCacheCfg.LocalTTL = 60 * time.Second
+		}
+
+		namespace := s.shield.Namespace()
+
+		// SINGLE instantiation of s.local
+		s.local = localjournal.New(localjournal.Config{
+			Namespace:  namespace,
+			MaxEntries: b.localCacheCfg.MaxEntries,
+			LocalTTL:   b.localCacheCfg.LocalTTL,
+			Metrics:    s.metrics,
+		})
+
+		if b.localCacheCfg.Mode == localjournal.LocalCachePushPull {
+			if b.localCacheCfg.Retention <= 0 {
+				b.localCacheCfg.Retention = 200_000
+			}
+
+			s.shield.EnableBroadcast(shield.BroadcastConfig{
+				Mode:   shield.BroadcastMode(b.localCacheCfg.Broadcast),
+				MaxLen: b.localCacheCfg.Retention,
+			})
+
+			// Subscriber correctly receives the one and only s.local
+			s.broadcastSub = broadcast.NewSubscriber(
+				s.shield.Client(),
+				shield.BroadcastKey(namespace),
+				s.local,
+				s.metrics,
+				broadcast.Config{
+					Namespace: namespace,
+					Mode:      broadcast.Mode(b.localCacheCfg.Broadcast),
+					Stream:    shield.BroadcastKey(namespace),
+					MaxLen:    b.localCacheCfg.Retention,
+				},
+			)
+			s.broadcastSub.Start()
+		}
+	}
+	// Inside Build(ctx), after shield.New and EnableBatching:
+	// ── L1 Local Journal (opt-in, default-off) ────────────────────────────
 	if b.cfg.DLQAutoProcess {
 		s.startDLQProcessor()
 	}
@@ -188,7 +246,7 @@ func (b *Builder) validate() error {
 	if b.sk == nil {
 		return ErrMissingSink
 	}
-	if b.contract == nil {
+	if b.writeContract == nil {
 		return ErrMissingContract
 	}
 	if len(b.cfg.Redis.Addrs) == 0 {
@@ -222,10 +280,109 @@ func (s *Sluice) IsHot(ctx context.Context, correlationKey string) (bool, error)
 	return isHot, err
 }
 
-// Read returns current state from the journal.
+func (s *Sluice) Read(ctx context.Context, correlationKey string) ([]byte, error) {
+	if s.closed.Load() {
+		return nil, ErrLibraryClosed
+	}
+
+	// ── Tier 1: L1 Local Journal ─────────────────────────────────────────
+	if s.local != nil {
+		p, _, ok := s.local.Get(correlationKey)
+		if ok {
+			return p, nil
+		}
+	}
+
+	// ── Tier 2: L2 Redis Journal ─────────────────────────────────────────
+	tRead := time.Now()
+	jr, err := s.shield.ReadJournal(ctx, correlationKey)
+	s.metrics.RecordRedisOp(s.cfg.Namespace, "readjournal", time.Since(tRead), err)
+
+	if err != nil {
+		return nil, err
+	}
+
+	if jr.Found {
+		if s.local != nil {
+			s.local.Put(correlationKey, jr.Payload, jr.Version)
+		}
+
+		if s.hotAwareFlush.Load() && jr.PTTL >= 0 && jr.PTTL < s.activityWindow/5 {
+			go func() {
+				bgCtx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+				defer cancel()
+				_ = s.shield.RefreshHotTTL(bgCtx, s.shield.BandFor(correlationKey), []string{correlationKey})
+			}()
+		}
+
+		return jr.Payload, nil
+	}
+
+	// ── Tier 3: L3 Source Fallback (Cold Read) ─────────────────────────
+	if s.src != nil && s.readContract != nil {
+		readModel, err := s.readContract(correlationKey)
+		if err != nil {
+			return nil, fmt.Errorf("read contract: %w", err)
+		}
+		payload, err := s.src.Read(ctx, *readModel)
+		if err != nil {
+			if errors.Is(err, source.ErrRecordNotFound) {
+				return nil, ErrRecordNotFound
+			}
+			return nil, err
+		}
+		return payload, nil
+	}
+
+	return nil, ErrRecordNotFound
+}
+
+// ReadFresh is the strong-consistency escape hatch (RFC §5.8).
+// It bypasses L1 entirely and reads from the Redis journal (L2), falling
+// through to the Source (L3) on a journal miss — identical semantics to
+// v1.0.7 Read(). Use for money-critical reads that cannot tolerate
+// bounded staleness; use Read() for everything else.
+func (s *Sluice) ReadFresh(ctx context.Context, correlationKey string) ([]byte, error) {
+	if s.closed.Load() {
+		return nil, ErrLibraryClosed
+	}
+
+	tRead := time.Now()
+	jr, err := s.shield.ReadJournal(ctx, correlationKey)
+	s.metrics.RecordRedisOp(s.cfg.Namespace, "readfresh", time.Since(tRead), err)
+	if err != nil {
+		return nil, err
+	}
+
+	if jr.Found {
+		// Deliberately do NOT heal L1 here. ReadFresh callers want the
+		// journal's authoritative view; seeding L1 would mask freshness.
+		return jr.Payload, nil
+	}
+
+	// ── L3: Source fallback (identical to Read's cold path) ──────────────
+	if s.src != nil && s.readContract != nil {
+		readModel, err := s.readContract(correlationKey)
+		if err != nil {
+			return nil, fmt.Errorf("read contract: %w", err)
+		}
+		payload, err := s.src.Read(ctx, *readModel)
+		if err != nil {
+			if errors.Is(err, source.ErrRecordNotFound) {
+				return nil, ErrRecordNotFound
+			}
+			return nil, err
+		}
+		return payload, nil
+	}
+
+	return nil, ErrRecordNotFound
+}
+
+// ReadOld returns current state from the journal.
 // Hot correlation_key: sub-millisecond Redis read with lazy TTL refresh.
 // Cold correlation_key: falls back to the configured Source via ReadContract.
-func (s *Sluice) Read(ctx context.Context, correlationKey string) ([]byte, error) {
+func (s *Sluice) ReadOld(ctx context.Context, correlationKey string) ([]byte, error) {
 	if s.closed.Load() {
 		return nil, ErrLibraryClosed
 	}
@@ -323,6 +480,7 @@ func (s *Sluice) HotLoad(ctx context.Context, correlationKey string) ([]byte, er
 //  2. Index Maintenance: Updates secondary SET/ZSET indexes via pipeline.
 //  3. Hot Regime Signaling: Triggers immediate flush if the correlation_key is currently hot.
 //  4. Standard Volume Trigger: Falls back to depth-based flush if not hot/batched.
+
 func (s *Sluice) Write(ctx context.Context, correlationKey string, payload []byte) error {
 	if s.closed.Load() {
 		return ErrLibraryClosed
@@ -332,6 +490,13 @@ func (s *Sluice) Write(ctx context.Context, correlationKey string, payload []byt
 	}
 
 	t := time.Now()
+
+	// Capture L1 version BEFORE the Redis write.
+	// This guarantees l1Version <= journal_ts. If a subsequent ReadJournal heal
+	// or Phase 2 broadcast arrives with the journal's exact ts, it will safely
+	// update L1 without violating the strict (>) version gating.
+	l1Version := t.UnixMilli()
+
 	var written bool
 	var err error
 
@@ -359,12 +524,15 @@ func (s *Sluice) Write(ctx context.Context, correlationKey string, payload []byt
 	if written {
 		s.metrics.RecordWrite(s.cfg.Namespace)
 
+		// ── L1 Write-Through (Sub-microsecond same-pod consistency) ─────
+		if s.local != nil {
+			applied := s.local.Put(correlationKey, payload, l1Version)
+			slog.Debug("WRITE-THROUGH", "crn", correlationKey, "version", l1Version, "applied", applied)
+		}
 		// 2. Index maintenance via pipeline (best-effort, Valkey-safe)
 		if s.cfg.IndexContract != nil {
 			indexes, idxErr := s.cfg.IndexContract(correlationKey, payload)
 			if idxErr == nil && len(indexes) > 0 {
-				// We ignore the error here because index maintenance is eventually
-				// consistent and should not block or fail the primary write path.
 				_ = s.shield.UpdateIndexes(ctx, correlationKey, indexes, s.cfg.ActivityWindow)
 			}
 		}
@@ -477,6 +645,13 @@ func (s *Sluice) Query(ctx context.Context, q Query) ([]QueryResult, error) {
 // DrainAndClose flushes all remaining dirty keys, stops band goroutines,
 // and releases Redis and sink connections. Call exactly once during shutdown.
 func (s *Sluice) DrainAndClose(ctx context.Context) error {
+	// Stop the broadcast subscriber BEFORE the engine drains: no new L1
+	// Puts should arrive while the journal is being flushed to the sink.
+	// Bounded by the subscriber's BlockMS + processing time.
+	if s.broadcastSub != nil {
+		s.broadcastSub.Stop()
+	}
+
 	if !s.closed.CompareAndSwap(false, true) {
 		return nil
 	}
@@ -533,7 +708,7 @@ func (s *Sluice) ProcessDLQ(ctx context.Context, strategy DLQStrategy, opts ...D
 
 	// Wrap the public WriteContract to produce sink.WriteModel.
 	wrappedContract := func(correlationKey string, payload []byte) (*sink.WriteModel, error) {
-		wm, err := s.contract(correlationKey, payload)
+		wm, err := s.writeContract(correlationKey, payload)
 		if err != nil {
 			return nil, err
 		}
@@ -607,7 +782,7 @@ func (s *Sluice) startDLQProcessor() {
 }
 
 func (s *Sluice) degradedWrite(ctx context.Context, correlationKey string, payload []byte) error {
-	wm, err := s.contract(correlationKey, payload)
+	wm, err := s.writeContract(correlationKey, payload)
 	if err != nil {
 		s.metrics.RecordContractError(s.cfg.Namespace, correlationKey, err)
 		return fmt.Errorf("%w: %v", ErrContractViolation, err)
@@ -622,4 +797,29 @@ func (s *Sluice) degradedWrite(ctx context.Context, correlationKey string, paylo
 	s.metrics.RecordDegradedWrite(s.cfg.Namespace, writeErr)
 	s.metrics.RecordRedisOp(s.cfg.Namespace, "degraded_write", time.Since(t), writeErr)
 	return writeErr
+}
+
+// Test methods
+
+// TestConfig is a minimal wiring struct for integration tests that need to
+// inject a pre-built shield and L1 cache without going through the full
+// Build() pipeline (which requires sink, engine, source, etc.).
+//
+// NOT part of the public API contract — guarded by build tag or test-only
+// file if you prefer.
+type TestConfig struct {
+	Namespace string
+	Shield    *shield.Shield
+	Local     *localjournal.Cache
+	Metrics   MetricsRecorder
+}
+
+// NewForTest assembles a Sluice from pre-built dependencies. Test-only.
+func NewForTest(cfg TestConfig) *Sluice {
+	return &Sluice{
+		cfg:     DefaultConfig(cfg.Namespace),
+		shield:  cfg.Shield,
+		local:   cfg.Local,
+		metrics: cfg.Metrics,
+	}
 }
