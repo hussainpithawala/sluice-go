@@ -5,7 +5,34 @@ All notable changes to **sluice** will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.8] - 2026-09-21
 
+### Added
+- **L1 Local Journal (Phase 1 & 2)**: Introduced a production-grade, sharded in-memory LRU cache (`localjournal` package) that sits in front of the Redis journal.
+  - **Write-Through**: Same-pod `Read()` after `Write()` returns in sub-microseconds.
+  - **Cross-Pod Convergence**: Redis Streams broadcast (`sl:{namespace}:bcast`) piggy-backed on the write pipeline ensures peer pods converge within milliseconds.
+  - **Strict Version Gating**: Timestamp-based ordering prevents stale network replays from regressing local state.
+- **`ReadFresh()` Method**: A strong-consistency escape hatch that bypasses the L1 cache entirely, reading directly from the Redis journal (L2) and Source (L3).
+- **Telemetry Additions**: New `MetricsRecorder` methods for L1 observability:
+  - `RecordLocalCacheHit(namespace string)`
+  - `RecordLocalCacheMiss(namespace string, reason MissReason)`
+  - `RecordLocalSetSize(namespace string, size int)`
+  - `RecordBroadcastLag(namespace string, lag time.Duration)`
+- **`LocalCacheConfig` Builder Option**: Opt-in configuration for the L1 tier (`Mode`, `MaxEntries`, `LocalTTL`, `Broadcast`, `Retention`).
+
+### Changed
+- **Version Gate Relaxed**: L1 `Put()` version gate changed from strict `>` to `>=`. Same-millisecond writes now apply (last-writer-wins), fixing cross-pod convergence edge cases on fast hardware.
+- **Namespace Sourcing**: L1 cache and broadcast subscriber now source the namespace directly from `shield.Namespace()` to prevent empty-string key collisions during builder construction.
+- **Broadcast Stream Topology**: Broadcast stream key is now `sl:{namespace}:bcast` (single-slot design) rather than per-band, optimizing for write-rate-only load.
+
+### Fixed
+- **Double L1 Instantiation**: Fixed a critical bug in `Build()` where `s.local` was instantiated twice, causing the broadcast subscriber to update an orphaned cache while `Read()` used an empty one.
+- **Empty Namespace in L1 Wiring**: Fixed an issue where `localjournal.Config.Namespace` was empty due to builder field ordering.
+- **Subscriber Shutdown Timeout**: Fixed `TestSubscriber_StartStop` failing due to a hardcoded 5-second `XREAD BLOCK` timeout. The subscriber now correctly respects the configured `BlockMS` (default 50ms) for fast, clean shutdowns.
+- **Missing L2 Telemetry**: Restored the `RecordRedisOp` telemetry call for L2 fallback reads in `Read()`, fixing `TestL1_OffMode_BehavesLikeV107`.
+
+### Deprecated
+- **`ReadOld()`**: Superseded by the new tiered `Read()` method. Use `ReadFresh()` for strict consistency requirements.
 - [1.0.7] - 2026-09-07
 ### Added
 - Hot/Cold CRN Regimes: Introduced HotLoad(), Read(), and IsHot() for activity-driven TTL management. Active CRNs are pinned in the Redis journal with an extended ActivityWindow TTL (default 4h) for sub-millisecond reads, while inactive CRNs gracefully fall back to the backing Source.

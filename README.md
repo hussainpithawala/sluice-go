@@ -11,7 +11,8 @@
 >
 > Writes are absorbed in Redis and drained in batches. Reads for *active* correlation keys are served
 > from the same journal in sub-millisecond time, falling back to the document store only when the key
-> is cold.
+> is cold. An optional in-process **L1 Local Journal** (v1.0.8) serves the hottest keys straight from
+> pod memory in sub-microsecond time, kept convergent across pods via a Redis Streams broadcast.
 
 ---
 
@@ -282,6 +283,10 @@ payload, err := s.Read(ctx, correlationKey)
 hot, err := s.IsHot(ctx, correlationKey)
 ```
 
+> **With the L1 cache enabled (v1.0.8),** `Read()` consults the in-process [L1 Local Journal](#l1-local-journal)
+> before Redis and may return data up to `LocalTTL` stale. Use `ReadFresh()` for reads that must hit the
+> authoritative journal.
+
 ### TTL mechanics
 
 - **Lazy refresh on read** — when `Read()` hits the journal and the remaining payload TTL has fallen
@@ -302,6 +307,152 @@ hot, err := s.IsHot(ctx, correlationKey)
 `HotLoad` and the cold path of `Read` both require `WithSource()` **and** `WithReadContract()`.
 `Build()` fails with an error if a `ReadContract` is configured without a `Source`; `HotLoad` returns
 `ErrMissingReadContract` if neither is set.
+
+## L1 Local Journal
+
+**Sub-microsecond reads and cross-pod convergence (v1.0.8)**
+
+Sluice v1.0.8 introduces an optional in-process L1 cache that sits in front of the Redis journal. It
+delivers sub-microsecond reads for hot correlation keys while maintaining eventual consistency across
+distributed pods via a Redis Streams broadcast.
+
+| Tier | Store | Role |
+|---|---|---|
+| **L1** | In-process, sharded LRU | Sub-microsecond reads; write-through on `Write()`; bounded by `LocalTTL` |
+| **L2** | Redis journal | Authoritative hot state (see [Hot/Cold regime](#hotcold-regime--the-read-path)) |
+| **L3** | Document store (`Source`) | Cold reads when the key is in neither tier |
+
+### Enabling the L1 cache
+
+The L1 cache is **opt-in**. Enable it with the `WithLocalCache` builder option:
+
+```go
+sl, _ := sluice.New("nudge_inventory").
+    WithRedis(sluice.RedisConfig{Addrs: redisAddrs, ClusterMode: true}).
+    WithSink(sink).
+    WithWriteContract(contract).
+    // Enable L1 Local Journal
+    WithLocalCache(localjournal.LocalCacheConfig{
+        Mode:       localjournal.LocalCachePushPull,
+        MaxEntries: 200_000,          // Global LRU cap (distributed across 256 shards)
+        LocalTTL:   60 * time.Second, // Max staleness bound
+        Broadcast:  shield.BroadcastPayload,
+        Retention:  200_000,          // Stream MAXLEN ~ N
+    }).
+    Build(ctx)
+```
+
+See [Configuration → L1 Local Journal](#l1-local-journal-v108) for the full option reference.
+
+### Architecture
+
+The L1 Local Journal operates across three tiers. The following sequence diagrams illustrate each
+critical path.
+
+#### 1. The write path — zero-cost broadcasting
+
+When a pod writes a payload, the L1 cache is updated immediately (write-through). Simultaneously, the
+broadcast message is piggy-backed onto the **same Redis pipeline** as the journal write, so broadcasting
+adds zero extra network round-trips.
+
+```mermaid
+sequenceDiagram
+    participant App as Application
+    participant S as Sluice (Pod A)
+    participant L1 as L1 Cache
+    participant R as Redis journal
+
+    App->>S: Write(key, payload)
+    S->>L1: Put(key, payload, ts) [Write-Through]
+
+    rect rgb(240, 248, 255)
+        Note over S,R: Single Redis Pipeline (1 Round-Trip)
+        S->>R: EVALSHA (Journal Write)
+        S->>R: XADD (Broadcast Stream)
+    end
+
+    R-->>S: OK
+    S-->>App: nil (Success)
+```
+
+#### 2. Cross-pod convergence
+
+Peer pods run a background `XREAD` subscriber. When Pod A writes, Pod B's subscriber wakes up, applies
+the payload to its local L1 cache, and advances its cursor. The **version gate** ensures that
+out-of-order network replays cannot overwrite newer state.
+
+```mermaid
+sequenceDiagram
+    participant A as Pod A
+    participant RS as Redis Stream
+    participant SUB as Pod B Subscriber
+    participant L1B as Pod B L1
+
+    A->>RS: XADD (ts=100, payload)
+    RS-->>SUB: XREAD (wakes up)
+
+    SUB->>L1B: Put(key, payload, ts=100)
+    Note over L1B: Version Gate:<br/>Is 100 >= existing_ts?
+
+    alt Newer or Equal
+        L1B-->>SUB: Applied (true)
+    else Stale
+        L1B-->>SUB: Rejected (false)
+    end
+```
+
+#### 3. The read path — tiered fallback
+
+`Read()` checks L1 first. On a hit it returns instantly. On a miss (or expiry) it falls through to the
+Redis journal (L2), heals the L1 cache, and returns the payload. If L2 also misses, it falls through to
+the configured `Source` (L3) for a cold read.
+
+```mermaid
+sequenceDiagram
+    participant App as Application
+    participant S as Sluice
+    participant L1 as L1
+    participant L2 as Redis journal (L2)
+    participant L3 as Source (L3)
+
+    App->>S: Read(key)
+    S->>L1: Get(key)
+
+    alt L1 Hit (Sub-µs)
+        L1-->>S: payload
+        S-->>App: payload
+    else L1 Miss / Expired
+        S->>L2: HGET (Journal L2)
+        alt L2 Found
+            L2-->>S: payload, ts
+            S->>L1: Put(key, payload, ts) [Lazy Heal]
+            S-->>App: payload
+        else L2 Miss
+            S->>L3: Read(key) [Cold Path]
+            L3-->>S: payload
+            S-->>App: payload
+        end
+    end
+```
+
+### Strong-consistency escape hatch
+
+For reads that cannot tolerate bounded staleness (financial transactions, checkout flows, compliance
+queries), use `ReadFresh()`. It bypasses the L1 cache entirely and reads directly from the authoritative
+Redis journal, falling through to the `Source` on a journal miss — identical semantics to v1.0.7's
+`Read()`.
+
+```go
+// Bypasses L1 entirely, reads from the Redis journal (L2)
+fresh, err := sl.ReadFresh(ctx, correlationKey)
+```
+
+### Observability
+
+L1 behaviour is surfaced through four additional `MetricsRecorder` methods — see
+[Telemetry](#telemetry).
+
+---
 
 ---
 
@@ -450,6 +601,7 @@ flowchart TD
 | Flush window (max DocumentDB lag) | 250ms (configurable) |
 | Crash recovery | at-least-once via Redis journal |
 | Hot-path `Read()` | sub-millisecond — one pipelined `HGET` + `PTTL` |
+| L1-hit `Read()` (opt-in, v1.0.8) | sub-microsecond — in-process, no network |
 | Cold-path `Read()` | one `FindOne` against the document store |
 | Hot key residency | `ActivityWindow` (4h default), refreshed by read traffic |
 
@@ -783,6 +935,22 @@ payload, _ = s.Read(ctx, correlationKey)
 | `WithActivityWindow(d)` | `4h` | Journal residency for hot correlation keys |
 | `WithHotAwareFlush(bool)` | `true` | Extend payload TTL to `ActivityWindow` after a successful commit |
 
+### L1 Local Journal (v1.0.8)
+
+| Builder method | Default | Description |
+|---|---|---|
+| `WithLocalCache(cfg)` | disabled (`LocalCacheOff`) | Enable the in-process L1 cache in front of the Redis journal |
+
+`localjournal.LocalCacheConfig` fields:
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `Mode` | `LocalCacheMode` | `LocalCacheOff` | Cache mode: `Off`, `Lazy`, `PushPull`, `Invalidation` |
+| `MaxEntries` | `int` | `200_000` | Global LRU cap (distributed across 256 shards) |
+| `LocalTTL` | `time.Duration` | `60s` | Per-entry staleness bound |
+| `Broadcast` | `BroadcastMode` | `BroadcastPayload` | `Payload` (full broadcast, ~1KB/msg) or `Invalidation` (~40B/msg, peers refetch) |
+| `Retention` | `int64` | `200_000` | Broadcast stream `MAXLEN ~ N` (approximate trimming) |
+
 ### DLQ
 
 | Builder method | Default | Description |
@@ -1042,6 +1210,28 @@ RecordHotSetSize(namespace string, size int)
 
 `isHot` on `RecordRead` is the signal to watch: a falling hot-hit ratio means sessions are ageing out
 of the journal before their traffic finishes, and `ActivityWindow` is too short.
+
+### L1 Local Journal metrics (v1.0.8)
+
+Implement these additional methods in your `MetricsRecorder` to observe L1 behaviour in Prometheus,
+Datadog, CloudWatch, or any other monitoring stack:
+
+```go
+type MetricsRecorder interface {
+    // ... existing v1.0.7 methods ...
+
+    // L1 Local Journal
+    RecordLocalCacheHit(namespace string)
+    RecordLocalCacheMiss(namespace string, reason MissReason)
+    RecordLocalSetSize(namespace string, size int)
+
+    // Cross-pod convergence
+    RecordBroadcastLag(namespace string, lag time.Duration)
+}
+```
+
+Watch the L1 hit ratio (`RecordLocalCacheHit` vs `RecordLocalCacheMiss`, broken down by `reason`) to
+size `MaxEntries` and `LocalTTL`, and `RecordBroadcastLag` to see how far peer pods trail a write.
 
 ---
 
