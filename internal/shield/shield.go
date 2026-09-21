@@ -655,7 +655,7 @@ func (s *Shield) enqueueBroadcast(ctx context.Context, pipe redis.Pipeliner, cor
 	}
 
 	// DIAGNOSTIC: Log the exact stream key the broadcaster is using
-	slog.Info("ENQUEUE-BROADCAST", "stream", s.broadcastKey(), "crn", correlationKey, "ts", ts)
+	slog.Debug("ENQUEUE-BROADCAST", "stream", s.broadcastKey(), "crn", correlationKey, "ts", ts)
 
 	// Build field/value pairs for the stream entry.
 	// go-redis XAddArgs.Values accepts []interface{} as alternating k/v pairs.

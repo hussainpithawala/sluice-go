@@ -67,7 +67,7 @@ func (s *Subscriber) Start() {
 	s.ctx, s.cancel = context.WithCancel(context.Background())
 
 	// DIAGNOSTIC: Prove Start() was called and what stream it's watching
-	slog.Info("SUBSCRIBER-STARTING", "stream", s.stream, "namespace", s.cfg.Namespace)
+	slog.Debug("SUBSCRIBER-STARTING", "stream", s.stream, "namespace", s.cfg.Namespace)
 
 	s.wg.Add(2)
 	go s.run(s.ctx)
@@ -87,7 +87,7 @@ func (s *Subscriber) Stop() {
 func (s *Subscriber) runO(ctx context.Context) {
 	defer s.wg.Done()
 	// DIAGNOSTIC: Prove the goroutine actually started running
-	slog.Info("SUBSCRIBER-RUN-ENTERED", "stream", s.stream)
+	slog.Debug("SUBSCRIBER-RUN-ENTERED", "stream", s.stream)
 
 	// Add a panic catcher just in case it's crashing silently
 	defer func() {
@@ -107,7 +107,7 @@ func (s *Subscriber) runO(ctx context.Context) {
 		cursor := s.getCursor()
 
 		// DIAGNOSTIC: Log every time we attempt to read (will log every BlockMS)
-		slog.Info("SUBSCRIBER-LOOP-TICK", "stream", s.stream, "cursor", cursor)
+		slog.Debug("SUBSCRIBER-LOOP-TICK", "stream", s.stream, "cursor", cursor)
 
 		// Use a SHORT block timeout (50ms) instead of a long one.
 		// XREAD BLOCK on Redis Cluster clients can fail to wake up promptly
@@ -158,9 +158,8 @@ func (s *Subscriber) run(ctx context.Context) {
 	defer s.wg.Done()
 
 	const (
-		blockTimeout = 5 * time.Second // bounded, so ctx/shutdown is observed regularly
-		minBackoff   = 100 * time.Millisecond
-		maxBackoff   = 5 * time.Second
+		minBackoff = 100 * time.Millisecond
+		maxBackoff = 5 * time.Second
 	)
 
 	cursor := s.getCursor() // single owner goroutine -> keep it local
@@ -170,32 +169,35 @@ func (s *Subscriber) run(ctx context.Context) {
 		res, err := s.client.XRead(ctx, &redis.XReadArgs{
 			Streams: []string{s.stream, cursor},
 			Count:   100,
-			Block:   blockTimeout, // NEVER 0 (= forever); use -1 for non-blocking
+			Block:   s.cfg.BlockMS, // ← FIX: Use configured BlockMS instead of hardcoded 5s
 		}).Result()
 
 		if err != nil {
-			switch {
-			case errors.Is(err, redis.Nil):
-				// Block timeout elapsed with no data: normal, loop again.
+			// Context cancelled means Stop() was called. Exit cleanly.
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return
+			}
+			// redis.Nil means the Block timeout elapsed with no new messages. This is normal.
+			if errors.Is(err, redis.Nil) {
 				backoff = minBackoff
 				continue
-			case ctx.Err() != nil:
-				return
-			default:
-				slog.Warn("broadcast XREAD error", "stream", s.stream, "err", err)
-				select {
-				case <-ctx.Done():
-					return
-				case <-time.After(backoff):
-				}
-				if backoff *= 2; backoff > maxBackoff {
-					backoff = maxBackoff
-				}
-				continue
 			}
-		}
-		backoff = minBackoff
 
+			// Network blip or stream doesn't exist yet. Log and backoff.
+			slog.Warn("broadcast XREAD error", "stream", s.stream, "err", err)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(backoff):
+			}
+			backoff *= 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
+			continue
+		}
+
+		backoff = minBackoff
 		for _, xs := range res {
 			for _, msg := range xs.Messages {
 				s.apply(msg)
@@ -213,7 +215,7 @@ func (s *Subscriber) apply(msg redis.XMessage) {
 	kindStr, _ := msg.Values["kind"].(string)
 
 	// DIAGNOSTIC: Confirm the subscriber actually received the message
-	slog.Info("SUBSCRIBER-APPLY", "crn", crn, "ts", tsStr, "kind", kindStr)
+	slog.Debug("SUBSCRIBER-APPLY", "crn", crn, "ts", tsStr, "kind", kindStr)
 
 	if crn == "" || tsStr == "" {
 		return
