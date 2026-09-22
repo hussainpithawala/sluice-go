@@ -86,12 +86,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Config Address & Credentials Plumbing**:
   - Updated `RedisConfig` address field (`Addrs`) to accept multiple endpoints without forcing cluster mode inference.
   - Fixed `toInternal()` in `config.go` to properly forward `Network`, `ClusterMode`, and `Username` parameters to `shield.RedisConfig`.
-- **Example Runner Refactoring**: Updated `examples/nudge/main.go` to support cluster configuration via environment variables (`REDIS_ADDRS`, `REDIS_CLUSTER_MODE`), improved shutdown lifecycle error handling, and robust argument validation.
+- **Example Runner Refactoring**: Updated `examples/nudge/documentdb/main.go` to support cluster configuration via environment variables (`REDIS_ADDRS`, `REDIS_CLUSTER_MODE`), improved shutdown lifecycle error handling, and robust argument validation.
 
 ### Fixed
 - **ACL Authentication Silent Fallback**: Fixed an issue in `shield.New()` where `Username` was previously dropped during config conversion, causing connections to fallback silently to the `default` user.
 - **Cross-Slot Execution in Lua Scripts**: Resolved potential `CROSSSLOT` script execution errors by strictly enforcing band hash tag co-location on all related keys in `atomicWriteLua`.
-- **Flaky Integration Tests**: Fixed race conditions in DLQ auto-processor integration tests (`tests/integration/dlq_auto_processor_test.go`) by adding `dlqProcessCounter` metrics tracking instead of polling transient Redis sorted-set depths.
+- **Flaky Integration Tests**: Fixed race conditions in DLQ auto-processor integration tests (`tests/integration/documentdb/dlq_auto_processor_test.go`) by adding `dlqProcessCounter` metrics tracking instead of polling transient Redis sorted-set depths.
 - **Namespace Validation**: Added upfront validation in `shield.New()` to reject namespaces containing `{` or `}` characters that would conflict with Redis Cluster hash tag parsing.
 
 ---
@@ -119,7 +119,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - **Kafka Topic Race Conditions**: Resolved intermittent `Unknown Topic Or Partition` test breaks by engineering an explicit `require.Eventually` barrier that polls broker partition metadata via `ReadPartitions` before proceeding.
-- **Example Crash Path**: Remedied a critical fallback flaw in `examples/nudge/main.go` where initialization connectivity errors failed to halt the runtime environment, ensuring it now correctly exits with `os.Exit(1)`.
+- **Example Crash Path**: Remedied a critical fallback flaw in `examples/nudge/documentdb/main.go` where initialization connectivity errors failed to halt the runtime environment, ensuring it now correctly exits with `os.Exit(1)`.
 
 ### Changed
 - **Linter Engine Update**: Replaced `golangci/golangci-lint-action@v6` inside the CI matrix with an explicit `curl`-based binary installation targeting `v2.4.0` directly to patch local/remote caching drift.
