@@ -12,11 +12,11 @@
 //
 // Run against DynamoDB Local:
 //
-//	DYNAMODB_ENDPOINT=http://localhost:8000 REDIS_ADDRS=localhost:6379 go run ./examples/nudge_dynamodb/main.go
+//	DYNAMODB_ENDPOINT=http://localhost:8000 REDIS_ADDRS=localhost:6379 go run ./examples/nudge/dynamodb/main.go
 //
 // Run against AWS DynamoDB:
 //
-//	AWS_REGION=us-east-1 REDIS_ADDRS=localhost:6379 go run ./examples/nudge_dynamodb/main.go
+//	AWS_REGION=us-east-1 REDIS_ADDRS=localhost:6379 go run ./examples/nudge/dynamodb/main.go
 package main
 
 import (
@@ -149,7 +149,6 @@ func simulatedConsumer(ctx context.Context, workerID int, sl *sluice.Sluice, log
 				seq := written.Add(1)
 				// Use a limited set of keys to demonstrate coalescing in Redis
 				correlationKey := fmt.Sprintf("user#%09d", (workerID*1_000_000)+int(seq%2_000_000))
-
 				payload, _ := json.Marshal(NudgeInventoryPayload{
 					NudgeMasterID: nudgeMasters[seq%int64(len(nudgeMasters))],
 					Channel:       channels[seq%int64(len(channels))],
@@ -158,7 +157,6 @@ func simulatedConsumer(ctx context.Context, workerID int, sl *sluice.Sluice, log
 					ExpiresAt:     time.Now().Add(24 * time.Hour),
 					LastUpdated:   time.Now().UTC(),
 				})
-
 				if err := sl.Write(ctx, correlationKey, payload); err != nil {
 					log.Error("write error", "correlationKey", correlationKey, "err", err)
 				}
@@ -195,9 +193,6 @@ func run(log *slog.Logger) (err error) {
 		log.Info("using local dynamodb endpoint", "endpoint", endpoint)
 		cfg, err = config.LoadDefaultConfig(ctx,
 			config.WithRegion("us-east-1"),
-			config.WithEndpointResolverWithOptions(aws.EndpointResolverWithOptionsFunc(func(service, region string, options ...interface{}) (aws.Endpoint, error) {
-				return aws.Endpoint{URL: endpoint}, nil
-			})),
 			config.WithHTTPClient(httpClient),
 		)
 	} else {
@@ -210,7 +205,13 @@ func run(log *slog.Logger) (err error) {
 		return fmt.Errorf("load aws config: %w", err)
 	}
 
-	client := dynamodb.NewFromConfig(cfg)
+	// Use BaseEndpoint on the service client options instead of the deprecated global resolver
+	client := dynamodb.NewFromConfig(cfg, func(o *dynamodb.Options) {
+		if endpoint != "" {
+			o.BaseEndpoint = aws.String(endpoint)
+		}
+	})
+
 	tableName := "NudgeInventory"
 
 	// --- 2. Ensure Table Exists and is Active ---

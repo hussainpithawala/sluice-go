@@ -62,7 +62,7 @@ fmt:       ## Format all Go source files
 
 test-unit: ## Run unit tests (starts Redis + MongoDB if needed)
 	@$(DC) -f $(DC_FILE) up -d redis mongodb && $(MAKE) _wait-redis && $(MAKE) _wait-mongo
-	$(GOTEST) -v -race -count=1 -timeout=120s ./tests/unit/... 2>&1 | tee /tmp/sluice-unit.log
+	$(GOTEST) -v -race -count=1 -timeout=120s ./sink/... ./source/... ./tests/unit/... 2>&1 | tee /tmp/sluice-unit.log
 
 test-integration: docker-up ## Run integration tests
 	REDIS_ADDR=localhost:6379 MONGO_URI=mongodb://localhost:27017 \

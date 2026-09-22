@@ -35,7 +35,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
-	sluice "github.com/hussainpithawala/sluice-go"
+	"github.com/hussainpithawala/sluice-go"
 	"github.com/hussainpithawala/sluice-go/internal/localjournal"
 	dynsink "github.com/hussainpithawala/sluice-go/sink/dynamodb"
 	"github.com/hussainpithawala/sluice-go/source"
@@ -319,13 +319,14 @@ func run(log *slog.Logger) (err error) {
 
 	if endpoint != "" {
 		log.Info("using local dynamodb endpoint", "endpoint", endpoint)
+		// REPLACE WITH THIS:
 		cfg, err = config.LoadDefaultConfig(ctx,
 			config.WithRegion("us-east-1"),
-			config.WithEndpointResolverWithOptions(aws.EndpointResolverWithOptionsFunc(func(service, region string, options ...interface{}) (aws.Endpoint, error) {
-				return aws.Endpoint{URL: endpoint}, nil
-			})),
 			config.WithHTTPClient(httpClient),
 		)
+		if err != nil {
+			return fmt.Errorf("load aws config: %w", err)
+		}
 	} else {
 		log.Info("using default aws config (production mode)")
 		cfg, err = config.LoadDefaultConfig(ctx, config.WithHTTPClient(httpClient))
@@ -334,7 +335,11 @@ func run(log *slog.Logger) (err error) {
 		return fmt.Errorf("load aws config: %w", err)
 	}
 
-	client := dynamodb.NewFromConfig(cfg)
+	client := dynamodb.NewFromConfig(cfg, func(o *dynamodb.Options) {
+		if endpoint != "" {
+			o.BaseEndpoint = aws.String(endpoint)
+		}
+	})
 	tableName := "NudgeInventoryHotCold"
 
 	// ── Ensure Table Exists ──────────────────────────────────────────────
@@ -383,15 +388,15 @@ func run(log *slog.Logger) (err error) {
 		WithContentDedup(true).            // ← xxHash64 deduplication
 		WithDegradedModeDirect(true).
 		WithMetrics(&logMetrics{log: log}).
-		OnFlush(func(correlation_keys []string, result *sluice.BulkWriteResult, err error) {
+		OnFlush(func(correlationKeys []string, result *sluice.BulkWriteResult, err error) {
 			if err != nil {
-				log.Error("flush failed", "correlation_keys", len(correlation_keys), "err", err)
+				log.Error("flush failed", "correlation_keys", len(correlationKeys), "err", err)
 				return
 			}
 			for _, se := range result.Errors {
 				log.Warn("partial write failure", "correlationKey", se.CorrelationKey, "err", se.Err)
 			}
-			log.Debug("flush complete", "correlation_keys", len(correlation_keys), "upserted", result.UpsertedCount)
+			log.Debug("flush complete", "correlation_keys", len(correlationKeys), "upserted", result.UpsertedCount)
 		}).
 		Build(ctx)
 	if err != nil {

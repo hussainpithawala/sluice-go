@@ -21,15 +21,17 @@ func setupDynamoDBSource(t *testing.T) (*Source, func()) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
+	// Connect to DynamoDB Local (default port 8000)
 	cfg, err := config.LoadDefaultConfig(ctx,
 		config.WithRegion("us-east-1"),
-		config.WithEndpointResolverWithOptions(aws.EndpointResolverWithOptionsFunc(func(service, region string, options ...interface{}) (aws.Endpoint, error) {
-			return aws.Endpoint{URL: "http://localhost:8000"}, nil
-		})),
 	)
 	require.NoError(t, err)
 
-	client := dynamodb.NewFromConfig(cfg)
+	// Use BaseEndpoint on the service client options instead of the deprecated global resolver
+	client := dynamodb.NewFromConfig(cfg, func(o *dynamodb.Options) {
+		o.BaseEndpoint = aws.String("http://localhost:8000")
+	})
+
 	tableName := "test_sluice_source_" + t.Name()
 
 	_, err = client.CreateTable(ctx, &dynamodb.CreateTableInput{

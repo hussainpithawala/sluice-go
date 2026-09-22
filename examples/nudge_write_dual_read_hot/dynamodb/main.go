@@ -1,7 +1,7 @@
 // Package main demonstrates a production-grade nudge inventory consumer
 // using sluice as the write buffer between Kafka/SQS and AWS DynamoDB.
 //
-// It exercises BOTH regimes (dual read path):
+// It exercises BOTH regimes:
 //   - Cold regime: high-velocity bulk writes via Write() → time-drain flush.
 //   - Hot regime:  user-login HotLoad() → sub-ms Read() → sync HTTP responses.
 //
@@ -9,11 +9,11 @@
 //
 // Run against DynamoDB Local:
 //
-//	DYNAMODB_ENDPOINT=http://localhost:8000 REDIS_ADDRS=localhost:6379 go run ./examples/nudge_write_dual_read_hot_dynamodb/main.go
+//	DYNAMODB_ENDPOINT=http://localhost:8000 REDIS_ADDRS=localhost:6379 go run ./examples/nudge_hot_reload_dynamodb/main.go
 //
 // Run against AWS DynamoDB:
 //
-//	AWS_REGION=us-east-1 REDIS_ADDRS=localhost:6379 go run ./examples/nudge_write_dual_read_hot_dynamodb/main.go
+//	AWS_REGION=us-east-1 REDIS_ADDRS=localhost:6379 go run ./examples/nudge_hot_reload_dynamodb/main.go
 package main
 
 import (
@@ -83,8 +83,6 @@ func nudgeWriteContract(correlationKey string, rawPayload []byte) (*sluice.Write
 
 // ─── ReadContract ────────────────────────────────────────────────────────────
 // ReadContract translates a correlation key into a DynamoDB GetItem Key.
-// Used by HotLoad() to warm the Redis journal on user login,
-// and by Read() as a cold-path fallback.
 func nudgeReadContract(correlationKey string) (*source.ReadModel, error) {
 	return &source.ReadModel{
 		Filter: map[string]any{"PK": correlationKey},
@@ -192,11 +190,6 @@ func simulatedConsumer(ctx context.Context, workerID int, sl *sluice.Sluice, log
 }
 
 // ─── Hot Regime: Simulated User Sessions ─────────────────────────────────────
-// Demonstrates the full hot correlation_key lifecycle:
-//  1. User logs in → HotLoad() warms the journal from DynamoDB.
-//  2. User action  → Write() updates the live journal.
-//  3. Sync HTTP    → Read() returns immediately from Redis (sub-ms).
-//  4. Observability → IsHot() confirms the correlation_key is in the hot set.
 func hotRegimeSimulator(ctx context.Context, sl *sluice.Sluice, log *slog.Logger, wg *sync.WaitGroup) {
 	defer wg.Done()
 	ticker := time.NewTicker(3 * time.Second) // Slowed down slightly for DynamoDB Local stability
@@ -220,13 +213,10 @@ func hotRegimeSimulator(ctx context.Context, sl *sluice.Sluice, log *slog.Logger
 			}
 			log.Info("hot regime: pre-login state", "correlationKey", correlationKey, "is_hot", isHot)
 
-			// Step 2: HotLoad — simulates user login.
-			// Loads collections from DynamoDB into the Redis journal.
+			// Step 2: HotLoad — simulates user login. Loads from DynamoDB into Redis.
 			payload, err := sl.HotLoad(ctx, correlationKey)
 			if err != nil {
-				// Expected for brand-new correlation_keys that don't exist in DynamoDB yet.
 				log.Info("hot regime: HotLoad (new correlation_key, writing directly)", "correlationKey", correlationKey, "err", err)
-				// Write directly for new users (cold → hot transition).
 				newPayload, _ := json.Marshal(NudgeInventoryPayload{
 					NudgeMasterID: "nm_welcome_bonus",
 					Channel:       "push",
@@ -316,10 +306,7 @@ func main() {
 }
 
 func run(log *slog.Logger) (err error) {
-	log.Info("sluice dynamodb dual-read example",
-		"version", version, "commit", commit, "built", buildDate,
-		"purpose", "Demonstrates COLD writes (stream) vs HOT writes (sync API) + unified READ + QUERY",
-	)
+	log.Info("sluice dynamodb hot/cold example", "version", version, "commit", commit, "built", buildDate)
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
@@ -334,9 +321,6 @@ func run(log *slog.Logger) (err error) {
 		log.Info("using local dynamodb endpoint", "endpoint", endpoint)
 		cfg, err = config.LoadDefaultConfig(ctx,
 			config.WithRegion("us-east-1"),
-			config.WithEndpointResolverWithOptions(aws.EndpointResolverWithOptionsFunc(func(service, region string, options ...interface{}) (aws.Endpoint, error) {
-				return aws.Endpoint{URL: endpoint}, nil
-			})),
 			config.WithHTTPClient(httpClient),
 		)
 	} else {
@@ -347,8 +331,14 @@ func run(log *slog.Logger) (err error) {
 		return fmt.Errorf("load aws config: %w", err)
 	}
 
-	client := dynamodb.NewFromConfig(cfg)
-	tableName := "NudgeInventoryDualRead"
+	// Use BaseEndpoint on the service client options instead of the deprecated global resolver
+	client := dynamodb.NewFromConfig(cfg, func(o *dynamodb.Options) {
+		if endpoint != "" {
+			o.BaseEndpoint = aws.String(endpoint)
+		}
+	})
+
+	tableName := "NudgeInventoryHotCold"
 
 	// ── Ensure Table Exists ──────────────────────────────────────────────
 	if err := ensureTableExists(ctx, client, tableName, log); err != nil {

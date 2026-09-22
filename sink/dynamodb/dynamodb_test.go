@@ -21,17 +21,20 @@ func setupDynamoDBSink(t *testing.T) (*Sink, func()) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
+	// Connect to DynamoDB Local (default port 8000)
 	cfg, err := config.LoadDefaultConfig(ctx,
 		config.WithRegion("us-east-1"),
-		config.WithEndpointResolverWithOptions(aws.EndpointResolverWithOptionsFunc(func(service, region string, options ...interface{}) (aws.Endpoint, error) {
-			return aws.Endpoint{URL: "http://localhost:8000"}, nil
-		})),
 	)
 	require.NoError(t, err)
 
-	client := dynamodb.NewFromConfig(cfg)
+	// Use BaseEndpoint on the service client options instead of the deprecated global resolver
+	client := dynamodb.NewFromConfig(cfg, func(o *dynamodb.Options) {
+		o.BaseEndpoint = aws.String("http://localhost:8000")
+	})
+
 	tableName := "test_sluice_sink_" + t.Name()
 
+	// Create table
 	_, err = client.CreateTable(ctx, &dynamodb.CreateTableInput{
 		TableName: aws.String(tableName),
 		KeySchema: []types.KeySchemaElement{
@@ -44,6 +47,7 @@ func setupDynamoDBSink(t *testing.T) (*Sink, func()) {
 	})
 	require.NoError(t, err)
 
+	// Wait for table to be active
 	require.Eventually(t, func() bool {
 		res, _ := client.DescribeTable(ctx, &dynamodb.DescribeTableInput{TableName: aws.String(tableName)})
 		return res != nil && res.Table.TableStatus == types.TableStatusActive
