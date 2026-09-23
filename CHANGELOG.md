@@ -1,22 +1,25 @@
 # Changelog
 
-All notable changes to **sluice** will be documented in this file.
+All notable changes to sluice will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.0.8] - 2026-09-21
+## [1.0.8] - 2026-09-23
 
-## [1.0.8] - 2026-09-21
 ### Added
 - **DynamoDB Hybrid Sink/Source Adapter**: Introduced first-class `dynamodb` adapter packages (`sink/dynamodb` and `source/dynamodb`) to position `sluice` as a velocity shield in front of AWS DynamoDB.
 - **Cost & Capacity Optimization**: Leverages `sluice`'s Redis journal for key-level coalescing, flattening write burst curves. This enables predictable, low provisioned WCU baselines without relying on auto-scaling, on-demand pricing, or costly Global Secondary Indexes (GSIs).
 - **Efficient Batching & Throttling Resilience**: `sink/dynamodb` utilizes `BatchWriteItem` with automatic 25-item chunking and built-in exponential backoff for `UnprocessedItems`, ensuring high-throughput ingestion without data loss or throttling failures.
 - **Strongly Consistent Cold Reads**: `source/dynamodb` fulfills the CP (Consistent + Partition Tolerant) requirement for historical lookups by enforcing `ConsistentRead: true` on `GetItem` operations.
-- **Comprehensive Examples**: Added standalone, production-ready examples demonstrating DynamoDB integration across all regimes: `nudge_dynamodb`, `nudge_hot_reload_dynamodb`, `ticker_dlq_dynamodb`, `asynq_dlq_dynamodb`, and `localjournal_pushpull_dynamodb` (split writer/reader).
-- **Unit Test Suite**: Added a full suite of unit tests for both `sink/dynamodb` and `source/dynamodb` utilizing DynamoDB Local, validating chunking, degraded mode, and strong consistency.
-- **Local Testing Infrastructure**: Added `dynamodb-local` service to `docker-compose.yml` for seamless local integration testing alongside Redis/Valkey and MongoDB.
-- L1 Local Journal (Phase 1 & 2): Introduced a production-grade, sharded in-memory LRU cache (`localjournal` package) that sits in front of the Redis journal.
+- **PostgreSQL Hybrid Sink/Source Adapter**: Introduced first-class `postgres` adapter packages (`sink/postgres` and `source/postgres`) to position `sluice` as a velocity shield and connection multiplexer in front of PostgreSQL.
+- **Connection Multiplexing & Transaction Flattening**: `sink/postgres` utilizes `pgxpool` with strict connection bounds and executes multi-row `INSERT ... ON CONFLICT DO UPDATE` statements, eliminating per-row transaction overhead and preventing connection pool saturation.
+- **Advanced Cold Read Projection**: `source/postgres` introduces the `QueryParams` + `Projector` pattern, allowing operators to define complex SQL queries (including JOINs and aggregations) and shape the result into the canonical JSON payload for the Redis journal, keeping `sluice` strictly datastore-agnostic.
+- **Comprehensive Examples**: Added standalone, production-ready examples demonstrating DynamoDB and PostgreSQL integration across all regimes: `nudge_dynamodb`, `nudge_hot_reload_dynamodb`, `ticker_dlq_dynamodb`, `asynq_dlq_dynamodb`, `localjournal_pushpull_dynamodb`, `nudge_postgres`, `nudge_write_dual_read_hot_postgres`, `ticker_dlq_postgres`, `asynq_dlq_postgres`, and `localjournal_pushpull_postgres` (split writer/reader).
+- **Unit Test Suites**: Added full suites of unit tests for both `dynamodb` and `postgres` adapters utilizing their respective local containers (DynamoDB Local, PostgreSQL), validating chunking, degraded mode, strong consistency, and complex projections.
+- **Local Testing Infrastructure**: Added `dynamodb-local` and `postgres` services to `docker-compose.yml` for seamless local integration testing alongside Redis/Valkey and MongoDB.
+- **Generalized Datastore Philosophy**: Updated `README.md` and documentation to emphasize that `sluice` is a generalized velocity shield for *any* datastore, while providing specialized, first-class adapters for DocumentDB, DynamoDB, and PostgreSQL.
+- **L1 Local Journal (Phase 1 & 2)**: Introduced a production-grade, sharded in-memory LRU cache (`localjournal` package) that sits in front of the Redis journal.
   - **Write-Through**: Same-pod `Read()` after `Write()` returns in sub-microseconds.
   - **Cross-Pod Convergence**: Redis Streams broadcast (`sl:{namespace}:bcast`) piggy-backed on the write pipeline ensures peer pods converge within milliseconds.
   - **Strict Version Gating**: Timestamp-based ordering prevents stale network replays from regressing local state.
@@ -30,51 +33,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - **AWS SDK Modernization**: Replaced deprecated global `EndpointResolverWithOptions` with service-specific `BaseEndpoint` configuration across all DynamoDB examples and tests to satisfy `staticcheck` linter rules.
-- Version Gate Relaxed: L1 `Put()` version gate changed from strict `>` to `>=`. Same-millisecond writes now apply (last-writer-wins), fixing cross-pod convergence edge cases on fast hardware.
-- Namespace Sourcing: L1 cache and broadcast subscriber now source the namespace directly from `shield.Namespace()` to prevent empty-string key collisions during builder construction.
-- Broadcast Stream Topology: Broadcast stream key is now `sl:{namespace}:bcast` (single-slot design) rather than per-band, optimizing for write-rate-only load.
+- **Version Gate Relaxed**: L1 `Put()` version gate changed from strict `>` to `>=`. Same-millisecond writes now apply (last-writer-wins), fixing cross-pod convergence edge cases on fast hardware.
+- **Namespace Sourcing**: L1 cache and broadcast subscriber now source the namespace directly from `shield.Namespace()` to prevent empty-string key collisions during builder construction.
+- **Broadcast Stream Topology**: Broadcast stream key is now `sl:{namespace}:bcast` (single-slot design) rather than per-band, optimizing for write-rate-only load.
 
 ### Fixed
-- Double L1 Instantiation: Fixed a critical bug in `Build()` where `s.local` was instantiated twice, causing the broadcast subscriber to update an orphaned cache while `Read()` used an empty one.
-- Empty Namespace in L1 Wiring: Fixed an issue where `localjournal.Config.Namespace` was empty due to builder field ordering.
-- Subscriber Shutdown Timeout: Fixed `TestSubscriber_StartStop` failing due to a hardcoded 5-second `XREAD BLOCK` timeout. The subscriber now correctly respects the configured `BlockMS` (default 50ms) for fast, clean shutdowns.
-- Missing L2 Telemetry: Restored the `RecordRedisOp` telemetry call for L2 fallback reads in `Read()`, fixing `TestL1_OffMode_BehavesLikeV107`.
+- **Double L1 Instantiation**: Fixed a critical bug in `Build()` where `s.local` was instantiated twice, causing the broadcast subscriber to update an orphaned cache while `Read()` used an empty one.
+- **Empty Namespace in L1 Wiring**: Fixed an issue where `localjournal.Config.Namespace` was empty due to builder field ordering.
+- **Subscriber Shutdown Timeout**: Fixed `TestSubscriber_StartStop` failing due to a hardcoded 5-second `XREAD BLOCK` timeout. The subscriber now correctly respects the configured `BlockMS` (default 50ms) for fast, clean shutdowns.
+- **Missing L2 Telemetry**: Restored the `RecordRedisOp` telemetry call for L2 fallback reads in `Read()`, fixing `TestL1_OffMode_BehavesLikeV107`.
 
 ### Deprecated
-- `ReadOld()`: Superseded by the new tiered `Read()` method. Use `ReadFresh()` for strict consistency requirements.
-- [1.0.7] - 2026-09-07
+- **`ReadOld()`**: Superseded by the new tiered `Read()` method. Use `ReadFresh()` for strict consistency requirements.
+
+## [1.0.7] - 2026-09-07
+
 ### Added
-- Hot/Cold CRN Regimes: Introduced HotLoad(), Read(), and IsHot() for activity-driven TTL management. Active CRNs are pinned in the Redis journal with an extended ActivityWindow TTL (default 4h) for sub-millisecond reads, while inactive CRNs gracefully fall back to the backing Source.
-- Source Abstraction: New source.Source interface and source/docdb implementation. The read path is now fully decoupled from the write path, mirroring the sink.FlushSink pattern. NewSourceWithClient() enables connection pool sharing between sink and source.
-- Queryable Journal: Added IndexContract and Query() API for compound lookups against the Redis journal. Maintains secondary equality (SET) and range (ZSET) indexes, resolved safely in Cluster Mode via band-scoped SINTER and in-process range filtering.
-- Exactly-Once Delivery: Added WriteIdempotent() backed by band-scoped Redis SETNX EX (key: sl:{ns}:idem:{band}:{key}) to safely handle Kafka/SQS message replays without polluting the dirty queue.
-- Content Deduplication: Added WithContentDedup(true) builder option to enable xxHash64 payload fingerprinting via a dedicated Valkey-safe Lua script (atomicDedupWriteLua). Identical payloads only refresh the Redis TTL and skip redundant dirty-set queuing and sink writes.
-- DLQ Auto-Processor: Added WithDLQAutoProcess(interval, strategy) builder option to run a background ticker that periodically drains and processes the Dead Letter Queue using configurable strategies (Ignore, Upsert, ReInsert).
-- Pre-Eviction Flusher: Added a background engine goroutine that monitors OldestDirtyScore() per band and force-flushes before Redis KeyTTL expires the payload, preventing silent data loss during extreme ingest spikes.
-- Hot Marker Keys: Introduced sl:{ns}:hot:{band}:{crn} Redis keys with SET NX EX ActivityWindow semantics. IsHot() is a single EXISTS call; HotLoad() sets this marker alongside the payload write.
-- Metrics Expansion: Added RecordWarmUp, RecordRead, and RecordHotSetSize hooks to the MetricsRecorder interface for comprehensive hot/cold regime observability.
-- ReadWithTTL Pipeline: Added ReadWithTTL() to the shield layer, fetching both payload and remaining TTL in a single Redis pipeline round-trip for lazy TTL refresh decisions.
+- **Hot/Cold CRN Regimes**: Introduced `HotLoad()`, `Read()`, and `IsHot()` for activity-driven TTL management. Active CRNs are pinned in the Redis journal with an extended `ActivityWindow` TTL (default 4h) for sub-millisecond reads, while inactive CRNs gracefully fall back to the backing Source.
+- **Source Abstraction**: New `source.Source` interface and `source/docdb` implementation. The read path is now fully decoupled from the write path, mirroring the `sink.FlushSink` pattern. `NewSourceWithClient()` enables connection pool sharing between sink and source.
+- **Queryable Journal**: Added `IndexContract` and `Query()` API for compound lookups against the Redis journal. Maintains secondary equality (`SET`) and range (`ZSET`) indexes, resolved safely in Cluster Mode via band-scoped `SINTER` and in-process range filtering.
+- **Exactly-Once Delivery**: Added `WriteIdempotent()` backed by band-scoped Redis `SETNX EX` (key: `sl:{ns}:idem:{band}:{key}`) to safely handle Kafka/SQS message replays without polluting the dirty queue.
+- **Content Deduplication**: Added `WithContentDedup(true)` builder option to enable xxHash64 payload fingerprinting via a dedicated Valkey-safe Lua script (`atomicDedupWriteLua`). Identical payloads only refresh the Redis TTL and skip redundant dirty-set queuing and sink writes.
+- **DLQ Auto-Processor**: Added `WithDLQAutoProcess(interval, strategy)` builder option to run a background ticker that periodically drains and processes the Dead Letter Queue using configurable strategies (Ignore, Upsert, ReInsert).
+- **Pre-Eviction Flusher**: Added a background engine goroutine that monitors `OldestDirtyScore()` per band and force-flushes before Redis `KeyTTL` expires the payload, preventing silent data loss during extreme ingest spikes.
+- **Hot Marker Keys**: Introduced `sl:{ns}:hot:{band}:{crn}` Redis keys with `SET NX EX ActivityWindow` semantics. `IsHot()` is a single `EXISTS` call; `HotLoad()` sets this marker alongside the payload write.
+- **Metrics Expansion**: Added `RecordWarmUp`, `RecordRead`, and `RecordHotSetSize` hooks to the `MetricsRecorder` interface for comprehensive hot/cold regime observability.
+- **ReadWithTTL Pipeline**: Added `ReadWithTTL()` to the shield layer, fetching both payload and remaining TTL in a single Redis pipeline round-trip for lazy TTL refresh decisions.
 
 ### Changed
-- ReadContract Signature: Updated ReadContract from func(correlationKey string) ([]byte, error) to func(correlationKey string) (*source.ReadModel, error). The caller now returns a datastore-agnostic filter; the Source executes the query. This eliminates direct mongo.Collection references from domain contracts.
-- Lazy TTL Refresh: Replaced fire-and-forget goroutines in the read path with a synchronous, lazy PTTL threshold check. If remaining TTL falls below 20% of ActivityWindow, the TTL is refreshed inline. This prevents goroutine storms at 100K+ TPS reads.
-- Index Maintenance Pipeline: Shifted secondary index updates out of the atomic Lua script and into a Go-side Redis Pipeline (UpdateIndexes()). This eliminates the cjson dependency and guarantees compatibility with Valkey and OSS Redis forks where cjson is unavailable.
-- Domain Leakage Removal: Removed WriteOptions (containing ForceHot, ContentHash, DedupEnabled, IndexesJSON) from the shield layer. The shield is now strictly infrastructure — hot/cold regime decisions, dedup hashing, and index extraction are orchestrated by the Sluice struct.
-- HotLoad TTL Extension: HotLoad() now extends the payload hash TTL to ActivityWindow and sets the hot marker, rather than relying on the default KeyTTL (30s).
-- Type Consolidation: Centralized all public types, interfaces, and contracts (WriteContract, ReadContract, IndexContract, WriteModel, BulkWriteResult, SinkError, Query, QueryResult, DLQStrategy, DLQResult) into types.go for a cleaner, more discoverable API surface.
-- Error Mapping: Read() and HotLoad() now map an internal source.ErrRecordNotFound to the public sluice.ErrRecordNotFound sentinel, preventing internal package error leakage.
+- **ReadContract Signature**: Updated `ReadContract` from `func(correlationKey string) ([]byte, error)` to `func(correlationKey string) (*source.ReadModel, error)`. The caller now returns a datastore-agnostic filter; the Source executes the query. This eliminates direct `mongo.Collection` references from domain contracts.
+- **Lazy TTL Refresh**: Replaced fire-and-forget goroutines in the read path with a synchronous, lazy `PTTL` threshold check. If remaining TTL falls below 20% of `ActivityWindow`, the TTL is refreshed inline. This prevents goroutine storms at 100K+ TPS reads.
+- **Index Maintenance Pipeline**: Shifted secondary index updates out of the atomic Lua script and into a Go-side Redis Pipeline (`UpdateIndexes()`). This eliminates the `cjson` dependency and guarantees compatibility with Valkey and OSS Redis forks where `cjson` is unavailable.
+- **Domain Leakage Removal**: Removed `WriteOptions` (containing `ForceHot`, `ContentHash`, `DedupEnabled`, `IndexesJSON`) from the shield layer. The shield is now strictly infrastructure — hot/cold regime decisions, dedup hashing, and index extraction are orchestrated by the `Sluice` struct.
+- **HotLoad TTL Extension**: `HotLoad()` now extends the payload hash TTL to `ActivityWindow` and sets the hot marker, rather than relying on the default `KeyTTL` (30s).
+- **Type Consolidation**: Centralized all public types, interfaces, and contracts (`WriteContract`, `ReadContract`, `IndexContract`, `WriteModel`, `BulkWriteResult`, `SinkError`, `Query`, `QueryResult`, `DLQStrategy`, `DLQResult`) into `types.go` for a cleaner, more discoverable API surface.
+- **Error Mapping**: `Read()` and `HotLoad()` now map an internal `source.ErrRecordNotFound` to the public `sluice.ErrRecordNotFound` sentinel, preventing internal package error leakage.
 
 ### Fixed
-- Cluster Mode Safety: Secondary index keys (sl:{ns}:idx:{band}:field:value), range index keys (sl:{ns}:ridx:{band}:field), idempotency keys (sl:{ns}:idem:{band}:{key}), and hot marker keys (sl:{ns}:hot:{band}:{crn}) now correctly embed {band} hash tags, completely eliminating CROSSSLOT errors in Redis Cluster and Valkey Cluster environments.
-- Lua Type Mismatches: Formatted millisecond timestamps as strings (fmt.Sprintf("%.0f", ts)) before passing to Lua scripts in both Write() and flushBatch(), resolving ERR Lua redis lib command arguments must be strings or integers errors that caused silent write failures in Redis/Valkey.
-- WriteDedup Script Binding: Fixed WriteDedup() which was incorrectly using atomicWriteLua (4-arg script) instead of the dedicated atomicDedupWriteLua (5-arg script with hash comparison). Deduplication was previously non-functional.
-- Test Isolation (Redis): Fixed the cleanRedisKeys glob pattern from fmt.Sprintf("sl:%s:", ns) to fmt.Sprintf("sl:%s:*", ns), enabling proper key cleanup between test runs and eliminating ErrDuplicateIdempotencyKey false positives.
-- Test Isolation (Kafka): Implemented unique Kafka topic and group ID generation per test run (fmt.Sprintf("topic-%d", time.Now().UnixNano())) to eliminate offset pollution and OffsetOutOfRange errors in CI/CD pipelines.
-- Goroutine Leaks in Tests: Added case <-ctx.Done(): return to SQS and Kafka consumer loops alongside stop channels, preventing orphaned goroutines from triggering 5-minute global test timeouts.
-- Unexported Struct Fields: Fixed sqsEvent.CorrelationKey being lowercase (correlation_key), which caused json.Marshal to silently omit the field and all SQS messages to arrive with empty correlation keys.
-- Return Type Mismatch: Fixed buildIntegrationSluice returning docdb.Sink (value) instead of *docdb.Sink (pointer), resolving compile errors in integration tests.
+- **Cluster Mode Safety**: Secondary index keys (`sl:{ns}:idx:{band}:field:value`), range index keys (`sl:{ns}:ridx:{band}:field`), idempotency keys (`sl:{ns}:idem:{band}:{key}`), and hot marker keys (`sl:{ns}:hot:{band}:{crn}`) now correctly embed `{band}` hash tags, completely eliminating `CROSSSLOT` errors in Redis Cluster and Valkey Cluster environments.
+- **Lua Type Mismatches**: Formatted millisecond timestamps as strings (`fmt.Sprintf("%.0f", ts)`) before passing to Lua scripts in both `Write()` and `flushBatch()`, resolving `ERR Lua redis lib command arguments must be strings or integers` errors that caused silent write failures in Redis/Valkey.
+- **WriteDedup Script Binding**: Fixed `WriteDedup()` which was incorrectly using `atomicWriteLua` (4-arg script) instead of the dedicated `atomicDedupWriteLua` (5-arg script with hash comparison). Deduplication was previously non-functional.
+- **Test Isolation (Redis)**: Fixed the `cleanRedisKeys` glob pattern from `fmt.Sprintf("sl:%s:", ns)` to `fmt.Sprintf("sl:%s:*", ns)`, enabling proper key cleanup between test runs and eliminating `ErrDuplicateIdempotencyKey` false positives.
+- **Test Isolation (Kafka)**: Implemented unique Kafka topic and group ID generation per test run (`fmt.Sprintf("topic-%d", time.Now().UnixNano())`) to eliminate offset pollution and `OffsetOutOfRange` errors in CI/CD pipelines.
+- **Goroutine Leaks in Tests**: Added `case <-ctx.Done(): return` to SQS and Kafka consumer loops alongside stop channels, preventing orphaned goroutines from triggering 5-minute global test timeouts.
+- **Unexported Struct Fields**: Fixed `sqsEvent.CorrelationKey` being lowercase (`correlation_key`), which caused `json.Marshal` to silently omit the field and all SQS messages to arrive with empty correlation keys.
+- **Return Type Mismatch**: Fixed `buildIntegrationSluice` returning `docdb.Sink` (value) instead of `*docdb.Sink` (pointer), resolving compile errors in integration tests.
 
 ## [1.0.2] - 2026-08-21
+
 ### Added
 - **Explicit Cluster Mode Support**: Introduced `ClusterMode` boolean field to `RedisConfig` across root and `shield` packages to explicitly select between standalone (`redis.Client`) and cluster-aware (`redis.ClusterClient`) go-redis clients.
 - **Valkey Cluster Testbed**: Added a 4-shard Valkey 9 cluster environment (`valkey-node-0..3` on ports 7001–7004) and initialization service (`valkey-cluster-init`) to `docker-compose.yml` for testing band/shard distribution.
@@ -94,7 +100,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Flaky Integration Tests**: Fixed race conditions in DLQ auto-processor integration tests (`tests/integration/documentdb/dlq_auto_processor_test.go`) by adding `dlqProcessCounter` metrics tracking instead of polling transient Redis sorted-set depths.
 - **Namespace Validation**: Added upfront validation in `shield.New()` to reject namespaces containing `{` or `}` characters that would conflict with Redis Cluster hash tag parsing.
 
----
 ## [1.0.1] - 2026-06-05
 
 ### Added
@@ -104,7 +109,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Lifecycle Integration**: Integrated background batch worker processes directly with the application's root context topology (`context.Context`). A SIGTERM or explicit service teardown safely intercepts the runtime loop to flush any remaining in-flight memory elements before close.
 - **Data-Race Safety**: Added explicit inner slice memory deep-copy allocations during worker handoffs to guarantee full pointer separation from incoming stream appends.
 - **Observability Enhancement**: Replaced silent error drops during pipeline executions with structural diagnostics leveraging structured `log/slog` reporting.
----
+
 ## [1.0.0] - 2026-06-05
 
 ### Added
@@ -133,29 +138,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [v1.0.0-alpha.1] - 2026-03-27
 
 ### 🚀 New Features
-
-- **Initial release of sluice** — A wide-breadth Redis-shielded write batcher for document stores
-  - Redis as velocity shield for high-velocity write absorption
-  - Band partitioning with FNV-32a hashing (default 16 bands)
-  - Dual-trigger flush: time-based (250ms) or volume-based (batch size threshold)
-  - Degraded mode for direct-to-sink writes when Redis unavailable
-  - Pluggable metrics recorder for Prometheus/Datadog/CloudWatch
-  - Graceful shutdown with `DrainAndClose()`
+- Initial release of **sluice** — A wide-breadth Redis-shielded write batcher for document stores
+- Redis as velocity shield for high-velocity write absorption
+- Band partitioning with FNV-32a hashing (default 16 bands)
+- Dual-trigger flush: time-based (250ms) or volume-based (batch size threshold)
+- Degraded mode for direct-to-sink writes when Redis unavailable
+- Pluggable metrics recorder for Prometheus/Datadog/CloudWatch
+- Graceful shutdown with `DrainAndClose()`
 
 ### 🔧 Improvements
-
 - **Cyclic import resolution** — Refactored internal package structure to eliminate import cycles
   - Moved shared types to `sink` package (lowest dependency)
   - Created internal types in `internal/shield` and `internal/engine`
   - Added type conversion wrappers in main package
-
 - **Makefile enhancements**
   - Added `install-releaser` target for goreleaser auto-installation
   - Added `release` target for full GitHub release creation
   - Added `release-check` target for `.goreleaser.yml` validation
-  - Simplified integration tests (Redis + MongoDB only)
+- **Simplified integration tests** (Redis + MongoDB only)
   - Removed Kafka/LocalStack dependencies
-
 - **Documentation updates**
   - Enhanced README with Mermaid diagrams showing:
     - MongoDB Atlas vs AWS DocumentDB write path comparison
@@ -163,27 +164,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     - Sluice architecture and solution pattern
   - Added detailed configuration examples
   - Updated testing instructions
-
 - **CI/CD improvements**
-  - Updated GitHub Actions workflows (ci.yml, release.yml)
+  - Updated GitHub Actions workflows (`ci.yml`, `release.yml`)
   - Added MongoDB service to unit test jobs
   - Updated golangci-lint to v1.64.8 (compatible with v1 config format)
   - Fixed `.goreleaser.yml` deprecation warnings (`format` → `formats`)
 
 ### 🧹 Cleanup
-
 - **Removed mock sink package** — Tests now use real `docdb.Sink` against actual MongoDB
   - Simplified test infrastructure
   - More realistic test coverage
   - Reduced maintenance burden
-
 - **Removed unused services**
   - Kafka integration tests (no Kafka sink implementation)
   - SQS integration tests (no SQS sink implementation)
   - LocalStack dependencies
 
 ### 📦 Sinks
-
 - **DocumentDB/MongoDB** (`sink/docdb`)
   - Bulk upserts to AWS DocumentDB or MongoDB
   - Connection pooling with configurable min/max pool sizes
@@ -191,15 +188,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Comprehensive error handling for bulk write exceptions
 
 ### 🔒 Security
-
 - Go module dependencies pinned to specific versions
 - CGO disabled for cross-platform builds
 - No sensitive data logged or exposed
 
 ---
 
-## Legend
-
+### Legend
 - **Added** — New features or functionality
 - **Changed** — Changes in existing functionality
 - **Deprecated** — Soon-to-be removed features
@@ -209,7 +204,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Improvements** — Non-breaking enhancements
 - **Cleanup** — Code cleanup and refactoring
 
----
-
-**Links:**
+### Links:
 - [v1.0.0-alpha.1](https://github.com/hussainpithawala/sluice-go/releases/tag/v1.0.0-alpha.1)
