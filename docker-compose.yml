@@ -236,6 +236,24 @@ services:
     networks:
       - sluice
 
+  # --- PostgreSQL for adapter testing ---
+  postgres:
+    image: postgres:16-alpine
+    container_name: sluice_postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: sluice
+      POSTGRES_PASSWORD: sluice
+      POSTGRES_DB: sluice_test
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U sluice -d sluice_test" ]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - sluice
+
   # --- NEW: DynamoDB Local Service ---
   dynamodb-local:
     image: amazon/dynamodb-local:latest
