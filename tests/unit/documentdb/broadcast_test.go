@@ -1,4 +1,4 @@
-package unit
+package documentdb
 
 import (
 	"context"

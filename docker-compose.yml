@@ -236,6 +236,21 @@ services:
     networks:
       - sluice
 
+  # --- NEW: DynamoDB Local Service ---
+  dynamodb-local:
+    image: amazon/dynamodb-local:latest
+    container_name: sluice_dynamodb_local
+    ports:
+      - "8000:8000"
+    command: "-jar DynamoDBLocal.jar -sharedDb -inMemory"
+    healthcheck:
+      test: [ "CMD-SHELL", "curl -sf http://localhost:8000/shell/ || exit 1" ]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - sluice
+
   # --- source: Kafka tap ---
   zookeeper:
     image: confluentinc/cp-zookeeper:7.6.0

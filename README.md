@@ -1132,9 +1132,9 @@ s, _ := sluice.New("nudge_inventory").
 
 Two reference examples show how to drive it externally instead:
 
-**`examples/ticker_dlq/main.go`** — minimal inline scheduler using `time.Ticker`. No extra dependencies. Suitable for single-instance services or CLI tooling where the DLQ run should happen at a fixed cadence inside the same process.
+**`examples/ticker_dlq/documentdb/main.go`** — minimal inline scheduler using `time.Ticker`. No extra dependencies. Suitable for single-instance services or CLI tooling where the DLQ run should happen at a fixed cadence inside the same process.
 
-**`examples/asynq_dlq/main.go`** — production-grade distributed scheduler using [hibiken/asynq](https://github.com/hibiken/asynq). The DLQ task is registered as a cron entry (default: every 2 minutes) and executed by an Asynq worker. Supports multiple replicas, task deduplication via Redis, and structured logging through the `asynqLogger` bridge. The `healBadRecords` atomic flag is toggled before immediate task enqueue to demonstrate end-to-end payload correction without cron lag.
+**`examples/asynq_dlq/documentdb/main.go`** — production-grade distributed scheduler using [hibiken/asynq](https://github.com/hibiken/asynq). The DLQ task is registered as a cron entry (default: every 2 minutes) and executed by an Asynq worker. Supports multiple replicas, task deduplication via Redis, and structured logging through the `asynqLogger` bridge. The `healBadRecords` atomic flag is toggled before immediate task enqueue to demonstrate end-to-end payload correction without cron lag.
 
 ---
 
@@ -1262,8 +1262,8 @@ make coverage           # HTML coverage report
 make check              # pre-commit: tidy + vet + lint + unit tests
 ```
 
-Hot/cold regime coverage lives in `tests/unit/hot_features_test.go` and
-`tests/integration/hot_features_test.go` — `HotLoad`/`Read`, `WriteIdempotent`, content dedup, and
+Hot/cold regime coverage lives in `tests/unit/documentdb/hot_features_test.go` and
+`tests/integration/documentdb/hot_features_test.go` — `HotLoad`/`Read`, `WriteIdempotent`, content dedup, and
 compound `Query`.
 
 ---
@@ -1303,7 +1303,7 @@ go run ./examples/asynq_dlq/main.go
 make docker-down
 ```
 
-`examples/nudge_hot_reload/main.go` runs both regimes side by side: eight cold-path bulk consumers
+`examples/nudge_hot_reload/documentdb/main.go` runs both regimes side by side: eight cold-path bulk consumers
 driving the flush engine, plus a hot-path simulator that logs in a synthetic user every two seconds
 and reports observed `Read()` latency in microseconds. It defaults to the 4-shard Valkey cluster
 (`localhost:7001-7004`) from `docker-compose.yml`.

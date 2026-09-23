@@ -7,12 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [1.0.8] - 2026-09-21
 
+## [1.0.8] - 2026-09-21
 ### Added
-- **L1 Local Journal (Phase 1 & 2)**: Introduced a production-grade, sharded in-memory LRU cache (`localjournal` package) that sits in front of the Redis journal.
+- **DynamoDB Hybrid Sink/Source Adapter**: Introduced first-class `dynamodb` adapter packages (`sink/dynamodb` and `source/dynamodb`) to position `sluice` as a velocity shield in front of AWS DynamoDB.
+- **Cost & Capacity Optimization**: Leverages `sluice`'s Redis journal for key-level coalescing, flattening write burst curves. This enables predictable, low provisioned WCU baselines without relying on auto-scaling, on-demand pricing, or costly Global Secondary Indexes (GSIs).
+- **Efficient Batching & Throttling Resilience**: `sink/dynamodb` utilizes `BatchWriteItem` with automatic 25-item chunking and built-in exponential backoff for `UnprocessedItems`, ensuring high-throughput ingestion without data loss or throttling failures.
+- **Strongly Consistent Cold Reads**: `source/dynamodb` fulfills the CP (Consistent + Partition Tolerant) requirement for historical lookups by enforcing `ConsistentRead: true` on `GetItem` operations.
+- **Comprehensive Examples**: Added standalone, production-ready examples demonstrating DynamoDB integration across all regimes: `nudge_dynamodb`, `nudge_hot_reload_dynamodb`, `ticker_dlq_dynamodb`, `asynq_dlq_dynamodb`, and `localjournal_pushpull_dynamodb` (split writer/reader).
+- **Unit Test Suite**: Added a full suite of unit tests for both `sink/dynamodb` and `source/dynamodb` utilizing DynamoDB Local, validating chunking, degraded mode, and strong consistency.
+- **Local Testing Infrastructure**: Added `dynamodb-local` service to `docker-compose.yml` for seamless local integration testing alongside Redis/Valkey and MongoDB.
+- L1 Local Journal (Phase 1 & 2): Introduced a production-grade, sharded in-memory LRU cache (`localjournal` package) that sits in front of the Redis journal.
   - **Write-Through**: Same-pod `Read()` after `Write()` returns in sub-microseconds.
   - **Cross-Pod Convergence**: Redis Streams broadcast (`sl:{namespace}:bcast`) piggy-backed on the write pipeline ensures peer pods converge within milliseconds.
   - **Strict Version Gating**: Timestamp-based ordering prevents stale network replays from regressing local state.
-- **`ReadFresh()` Method**: A strong-consistency escape hatch that bypasses the L1 cache entirely, reading directly from the Redis journal (L2) and Source (L3).
+  - **`ReadFresh()` Method**: A strong-consistency escape hatch that bypasses the L1 cache entirely, reading directly from the Redis journal (L2) and Source (L3).
 - **Telemetry Additions**: New `MetricsRecorder` methods for L1 observability:
   - `RecordLocalCacheHit(namespace string)`
   - `RecordLocalCacheMiss(namespace string, reason MissReason)`
@@ -21,18 +29,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`LocalCacheConfig` Builder Option**: Opt-in configuration for the L1 tier (`Mode`, `MaxEntries`, `LocalTTL`, `Broadcast`, `Retention`).
 
 ### Changed
-- **Version Gate Relaxed**: L1 `Put()` version gate changed from strict `>` to `>=`. Same-millisecond writes now apply (last-writer-wins), fixing cross-pod convergence edge cases on fast hardware.
-- **Namespace Sourcing**: L1 cache and broadcast subscriber now source the namespace directly from `shield.Namespace()` to prevent empty-string key collisions during builder construction.
-- **Broadcast Stream Topology**: Broadcast stream key is now `sl:{namespace}:bcast` (single-slot design) rather than per-band, optimizing for write-rate-only load.
+- **AWS SDK Modernization**: Replaced deprecated global `EndpointResolverWithOptions` with service-specific `BaseEndpoint` configuration across all DynamoDB examples and tests to satisfy `staticcheck` linter rules.
+- Version Gate Relaxed: L1 `Put()` version gate changed from strict `>` to `>=`. Same-millisecond writes now apply (last-writer-wins), fixing cross-pod convergence edge cases on fast hardware.
+- Namespace Sourcing: L1 cache and broadcast subscriber now source the namespace directly from `shield.Namespace()` to prevent empty-string key collisions during builder construction.
+- Broadcast Stream Topology: Broadcast stream key is now `sl:{namespace}:bcast` (single-slot design) rather than per-band, optimizing for write-rate-only load.
 
 ### Fixed
-- **Double L1 Instantiation**: Fixed a critical bug in `Build()` where `s.local` was instantiated twice, causing the broadcast subscriber to update an orphaned cache while `Read()` used an empty one.
-- **Empty Namespace in L1 Wiring**: Fixed an issue where `localjournal.Config.Namespace` was empty due to builder field ordering.
-- **Subscriber Shutdown Timeout**: Fixed `TestSubscriber_StartStop` failing due to a hardcoded 5-second `XREAD BLOCK` timeout. The subscriber now correctly respects the configured `BlockMS` (default 50ms) for fast, clean shutdowns.
-- **Missing L2 Telemetry**: Restored the `RecordRedisOp` telemetry call for L2 fallback reads in `Read()`, fixing `TestL1_OffMode_BehavesLikeV107`.
+- Double L1 Instantiation: Fixed a critical bug in `Build()` where `s.local` was instantiated twice, causing the broadcast subscriber to update an orphaned cache while `Read()` used an empty one.
+- Empty Namespace in L1 Wiring: Fixed an issue where `localjournal.Config.Namespace` was empty due to builder field ordering.
+- Subscriber Shutdown Timeout: Fixed `TestSubscriber_StartStop` failing due to a hardcoded 5-second `XREAD BLOCK` timeout. The subscriber now correctly respects the configured `BlockMS` (default 50ms) for fast, clean shutdowns.
+- Missing L2 Telemetry: Restored the `RecordRedisOp` telemetry call for L2 fallback reads in `Read()`, fixing `TestL1_OffMode_BehavesLikeV107`.
 
 ### Deprecated
-- **`ReadOld()`**: Superseded by the new tiered `Read()` method. Use `ReadFresh()` for strict consistency requirements.
+- `ReadOld()`: Superseded by the new tiered `Read()` method. Use `ReadFresh()` for strict consistency requirements.
 - [1.0.7] - 2026-09-07
 ### Added
 - Hot/Cold CRN Regimes: Introduced HotLoad(), Read(), and IsHot() for activity-driven TTL management. Active CRNs are pinned in the Redis journal with an extended ActivityWindow TTL (default 4h) for sub-millisecond reads, while inactive CRNs gracefully fall back to the backing Source.
@@ -77,12 +86,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Config Address & Credentials Plumbing**:
   - Updated `RedisConfig` address field (`Addrs`) to accept multiple endpoints without forcing cluster mode inference.
   - Fixed `toInternal()` in `config.go` to properly forward `Network`, `ClusterMode`, and `Username` parameters to `shield.RedisConfig`.
-- **Example Runner Refactoring**: Updated `examples/nudge/main.go` to support cluster configuration via environment variables (`REDIS_ADDRS`, `REDIS_CLUSTER_MODE`), improved shutdown lifecycle error handling, and robust argument validation.
+- **Example Runner Refactoring**: Updated `examples/nudge/documentdb/main.go` to support cluster configuration via environment variables (`REDIS_ADDRS`, `REDIS_CLUSTER_MODE`), improved shutdown lifecycle error handling, and robust argument validation.
 
 ### Fixed
 - **ACL Authentication Silent Fallback**: Fixed an issue in `shield.New()` where `Username` was previously dropped during config conversion, causing connections to fallback silently to the `default` user.
 - **Cross-Slot Execution in Lua Scripts**: Resolved potential `CROSSSLOT` script execution errors by strictly enforcing band hash tag co-location on all related keys in `atomicWriteLua`.
-- **Flaky Integration Tests**: Fixed race conditions in DLQ auto-processor integration tests (`tests/integration/dlq_auto_processor_test.go`) by adding `dlqProcessCounter` metrics tracking instead of polling transient Redis sorted-set depths.
+- **Flaky Integration Tests**: Fixed race conditions in DLQ auto-processor integration tests (`tests/integration/documentdb/dlq_auto_processor_test.go`) by adding `dlqProcessCounter` metrics tracking instead of polling transient Redis sorted-set depths.
 - **Namespace Validation**: Added upfront validation in `shield.New()` to reject namespaces containing `{` or `}` characters that would conflict with Redis Cluster hash tag parsing.
 
 ---
@@ -110,7 +119,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - **Kafka Topic Race Conditions**: Resolved intermittent `Unknown Topic Or Partition` test breaks by engineering an explicit `require.Eventually` barrier that polls broker partition metadata via `ReadPartitions` before proceeding.
-- **Example Crash Path**: Remedied a critical fallback flaw in `examples/nudge/main.go` where initialization connectivity errors failed to halt the runtime environment, ensuring it now correctly exits with `os.Exit(1)`.
+- **Example Crash Path**: Remedied a critical fallback flaw in `examples/nudge/documentdb/main.go` where initialization connectivity errors failed to halt the runtime environment, ensuring it now correctly exits with `os.Exit(1)`.
 
 ### Changed
 - **Linter Engine Update**: Replaced `golangci/golangci-lint-action@v6` inside the CI matrix with an explicit `curl`-based binary installation targeting `v2.4.0` directly to patch local/remote caching drift.
