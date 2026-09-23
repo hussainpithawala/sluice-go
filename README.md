@@ -5,14 +5,19 @@
 [![Go Version](https://img.shields.io/badge/go-1.25-blue)](https://go.dev)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-> **Wide-breadth Redis-shielded write batcher and hot-state journal for document stores.**
-> Built for ad-tech platforms where millions of customers receive nudges, bids, and inventory updates
-> at rates that no single document store primary can absorb directly.
+> **A volume scaling platform for your datastore — not just a write shield.**
 >
-> Writes are absorbed in Redis and drained in batches. Reads for *active* correlation keys are served
-> from the same journal in sub-millisecond time, falling back to the document store only when the key
-> is cold. An optional in-process **L1 Local Journal** (v1.0.8) serves the hottest keys straight from
-> pod memory in sub-microsecond time, kept convergent across pods via a Redis Streams broadcast.
+> `sluice` sits in front of any backing store and absorbs bursty, uncoordinated writes in Redis, draining
+> them as a handful of efficient batches so no single store primary ever feels 100K individual writes/sec.
+> Active correlation keys live in that same journal as a **hot read/write path** — read and written back
+> in sub-millisecond time without touching the store at all — and an internal broadcast pushes the
+> hottest keys further still, into an in-process **L1 Local Journal** (v1.0.8), for sub-microsecond reads
+> kept convergent across pods via Redis Streams.
+>
+> One mechanism, scaling write *and* read volume for whatever sits behind it. `sluice` is datastore-agnostic
+> by design, with first-class adapters for **AWS DocumentDB / MongoDB**, **AWS DynamoDB**, and
+> **PostgreSQL** — each exploiting the journal to dissolve that store's specific bottleneck: index I/O,
+> WCU pricing, or connection/transaction overhead.
 
 ---
 
@@ -20,18 +25,18 @@
 
 Modern ad-roll platforms process inventory update events at 10K–100K TPS from SQS queues and Kafka
 topics. Each event is a single incoherent write — one document, one customer, one update — arriving
-unbatched and uncoordinated. Sending each directly to AWS DocumentDB means:
+unbatched and uncoordinated. Sending each directly to the DataStore means:
 
 - Every write hits the single primary node individually
 - Every index multiplies the I/O cost per write
-- Connection pools saturate under spikes (DocumentDB hard-caps connections per instance class)
+- Connection pools saturate under spikes (many DataStores hard-cap connections per instance class)
 - 100,000 events for 80,000 unique customers becomes 100,000 individual round-trips instead of ~100 BulkWrite calls
 
 ```mermaid
 flowchart LR
     SQS([SQS Queue])
     KAF([Kafka Topics])
-    DB[(AWS DocumentDB)]
+    DB[(DataStore)]
 
     SQS -->|individual write per event| DB
     KAF -->|individual write per event| DB
@@ -43,11 +48,11 @@ flowchart LR
 
 ## How sluice solves it
 
-sluice introduces a **write journal in Redis** between your consumers and the document store.
+sluice introduces a **write journal in Redis** between your consumers and the DataStore.
 Every event is written atomically to Redis — sub-millisecond — and acknowledged immediately.
 Background goroutines drain the journal in configurable windows and assemble efficient `BulkWrite` calls.
 
-**100,000 events/sec → ~100 BulkWrite calls/sec — a 1,000× reduction in document store I/O.**
+**100,000 events/sec → ~100 BulkWrite calls/sec — a 1,000× reduction in DataStore I/O.**
 
 ```mermaid
 flowchart TD
@@ -56,7 +61,7 @@ flowchart TD
     CON["Consumer Workers — stateless, correlation_key-hash routed"]
     RED[("Redis Cluster — Velocity Shield")]
     ENG["Batch Flusher Engine — 16 bands, 250ms window"]
-    DB[("AWS DocumentDB — Long-Term Store")]
+    DB[("DataStore — Long-Term Store")]
 
     SQS --> CON
     KAF --> CON
@@ -81,7 +86,7 @@ read surface until the next flush lands:
 |---|---|
 | Read-optimised — avoids re-computation | Write-optimised — absorbs write velocity, then serves reads off the absorbed state |
 | TTL = staleness budget for reads | TTL = crash-recovery safety net, extended to a session window for hot keys |
-| Cache miss → go to DB | Journal miss → key already flushed, so the document store is authoritative |
+| Cache miss → go to DB | Journal miss → key already flushed, so the DataStore is authoritative |
 | Eviction under pressure loses data | Deduplication under pressure is intentional |
 
 For every event, sluice executes a single atomic Lua script — three Redis operations in one round-trip:
@@ -134,7 +139,7 @@ flowchart LR
         D3["correlationKey_003 — score = ts"]
     end
 
-    subgraph BW ["DocumentDB BulkWrite — 1 call"]
+    subgraph BW ["DataStore BulkWrite — 1 call"]
         B1[upsert correlationKey_001]
         B2[upsert correlationKey_002]
         B3[upsert correlationKey_003]
@@ -173,7 +178,7 @@ stateDiagram-v2
     Draining --> Reading : ZRANGEBYSCORE fetch dirty keys
     Reading --> Fetching : pipeline HMGET read all payloads in one round-trip
     Fetching --> Building : apply WriteContract per key
-    Building --> Writing : BulkWrite to DocumentDB ordered=false
+    Building --> Writing : BulkWrite to DataStore ordered=false
     Writing --> Cleanup : ZREM confirmed keys from dirty set
     Cleanup --> Refresh : HotAwareFlush — extend TTL on committed keys
     Refresh --> Idle : goroutine sleeps until next trigger
@@ -181,7 +186,7 @@ stateDiagram-v2
 
 | Trigger | Fires when | Purpose |
 |---|---|---|
-| Time | `FlushWindow` elapses | Caps document store staleness |
+| Time | `FlushWindow` elapses | Caps DataStore staleness |
 | Volume | Dirty queue depth ≥ `MaxBatchSize` | Prevents Redis memory pressure during spikes |
 | Pre-eviction | Oldest dirty key is within 5s of `KeyTTL` expiry | Prevents silent data loss if a payload would expire before being flushed |
 | Hot | `Write()` lands on a correlation_key with an active hot marker (requires `HotAwareFlush`) | Keeps the store current for keys being read synchronously |
@@ -197,7 +202,7 @@ signalling any band whose oldest dirty key is approaching expiry. It is disabled
 sequenceDiagram
     participant E as Flush engine
     participant R as Redis
-    participant D as DocumentDB
+    participant D as DataStore
 
     E->>R: ZRANGEBYSCORE dirty:band LIMIT 0 1000
     R-->>E: correlationKey_001, correlationKey_002, correlationKey_003 ...
@@ -216,7 +221,7 @@ sequenceDiagram
     Note over E,D: Upsert semantics make re-flush safe — last write wins.
 ```
 
-Keys are removed from the dirty set only after DocumentDB confirms the write. If the flusher crashes
+Keys are removed from the dirty set only after the DataStore confirms the write. If the flusher crashes
 after `BulkWrite` but before `ZREM`, those keys are re-flushed on the next cycle. Because every sink
 operation is an upsert, re-flushing is always safe.
 
@@ -227,7 +232,7 @@ operation is an upsert, re-flushing is always safe.
 A wide-breadth stream is not uniformly wide. At any moment a small subset of correlation keys is
 *active* — a user is logged in, a session is open, an HTTP handler is about to read the same key it
 just wrote. sluice keeps those keys resident in the journal and serves them without touching the
-document store.
+DataStore.
 
 | | Cold correlation_key | Hot correlation_key |
 |---|---|---|
@@ -242,16 +247,16 @@ sequenceDiagram
     participant A as Application
     participant S as sluice
     participant R as Redis journal
-    participant D as DocumentDB
+    participant D as DataStore
 
     Note over A,D: User logs in — promote the key to hot
     A->>S: HotLoad(ctx, correlationKey)
-    S->>D: ReadContract → Source.Read (FindOne)
-    D-->>S: document bytes
+    S->>D: ReadContract → Source.Read
+    D-->>S: record bytes
     S->>R: HSET payload + SET hot marker (TTL = ActivityWindow)
     S-->>A: payload
 
-    Note over A,D: Session traffic — DocumentDB is never read
+    Note over A,D: Session traffic — DataStore is never read
     A->>S: Write(ctx, correlationKey, payload)
     S->>R: atomic HSET + ZADD
     S->>S: key is hot → signal immediate flush
@@ -320,7 +325,7 @@ distributed pods via a Redis Streams broadcast.
 |---|---|---|
 | **L1** | In-process, sharded LRU | Sub-microsecond reads; write-through on `Write()`; bounded by `LocalTTL` |
 | **L2** | Redis journal | Authoritative hot state (see [Hot/Cold regime](#hotcold-regime--the-read-path)) |
-| **L3** | Document store (`Source`) | Cold reads when the key is in neither tier |
+| **L3** | DataStore (`Source`) | Cold reads when the key is in neither tier |
 
 ### Enabling the L1 cache
 
@@ -490,7 +495,7 @@ flowchart TD
 ```
 
 A deduplicated write refreshes the payload TTL and returns `nil` to the caller — but skips the
-dirty-set insertion, index maintenance, and volume signalling entirely. The document store never
+dirty-set insertion, index maintenance, and volume signalling entirely. The DataStore never
 sees a write it already has. Disabled by default, since it costs one extra hash field per key.
 
 ---
@@ -499,7 +504,7 @@ sees a write it already has. Disabled by default, since it costs one extra hash 
 
 `WithIndexContract` lets the caller project index fields out of each payload. sluice maintains them
 in Redis as the write lands, and `Query()` answers compound lookups against the journal without
-touching the document store.
+touching the DataStore.
 
 ```go
 func nudgeIndexContract(correlationKey string, payload []byte) (map[string]interface{}, error) {
@@ -540,7 +545,7 @@ intersection never crosses a cluster slot. Equality filters are intersected in R
 are then applied with a `ZSCORE` check per candidate. At least one equality filter is required.
 
 > `Query` sees only what is currently resident in the journal — hot keys plus in-flight writes. It is
-> a live-state lookup, not a replacement for querying the document store.
+> a live-state lookup, not a replacement for querying the DataStore.
 
 ---
 
@@ -596,13 +601,13 @@ flowchart TD
 | Peak spike | 100K events/sec |
 | Unique correlation_keys at peak (wide-breadth) | ~80–90K/sec |
 | Redis resident keys (transit buffer) | ~25K at peak |
-| DocumentDB BulkWrite calls/sec | ~100–130 |
+| DataStore BulkWrite calls/sec | ~100–130 |
 | I/O reduction vs individual writes | **~1,000x** |
-| Flush window (max DocumentDB lag) | 250ms (configurable) |
+| Flush window (max DataStore lag) | 250ms (configurable) |
 | Crash recovery | at-least-once via Redis journal |
 | Hot-path `Read()` | sub-millisecond — one pipelined `HGET` + `PTTL` |
 | L1-hit `Read()` (opt-in, v1.0.8) | sub-microsecond — in-process, no network |
-| Cold-path `Read()` | one `FindOne` against the document store |
+| Cold-path `Read()` | one `Source.Read` against the DataStore |
 | Hot key residency | `ActivityWindow` (4h default), refreshed by read traffic |
 
 Resident-key figures assume `WithHotAwareFlush(false)` — a pure transit buffer. With the hot regime
@@ -705,11 +710,11 @@ flowchart TD
 
 
 %% ============================================================
-%% DOCUMENT STORE
+%% DATASTORE
 %% ============================================================
 
-  subgraph Store["DOCUMENT STORE"]
-    DB[("AWS DocumentDB<br/>nudge_inventory")]
+  subgraph Store["DATASTORE"]
+    DB[("DataStore<br/>nudge_inventory")]
   end
 
 
@@ -912,9 +917,9 @@ payload, _ = s.Read(ctx, correlationKey)
 | Builder method | Default | Description |
 |---|---|---|
 | `WithRedis(cfg)` | — | **Required.** Redis/Valkey connectivity; set `ClusterMode` for CME |
-| `WithSink(s)` | — | **Required.** Write-side document store (`sink.FlushSink`) |
+| `WithSink(s)` | — | **Required.** Write-side DataStore (`sink.FlushSink`) |
 | `WithWriteContract(fn)` | — | **Required.** Translates a payload into a `WriteModel` |
-| `WithFlushWindow(d)` | `250ms` | Maximum dirty key age before flush — caps DocumentDB staleness |
+| `WithFlushWindow(d)` | `250ms` | Maximum dirty key age before flush — caps DataStore staleness |
 | `WithMaxBatchSize(n)` | `1000` | Keys per BulkWrite call; also the volume trigger threshold |
 | `WithBandCount(n)` | `16` | Parallel flush goroutines — one per dirty-set partition |
 | `WithKeyTTL(d)` | `30s` | In-flight payload TTL — crash recovery net and pre-eviction bound |
@@ -929,7 +934,7 @@ payload, _ = s.Read(ctx, correlationKey)
 
 | Builder method | Default | Description |
 |---|---|---|
-| `WithSource(s)` | nil | Read-side document store (`source.Source`) — required with `WithReadContract` |
+| `WithSource(s)` | nil | Read-side DataStore (`source.Source`) — required with `WithReadContract` |
 | `WithReadContract(fn)` | nil | Translates a correlation key into a `source.ReadModel` for `HotLoad` / cold `Read` |
 | `WithIndexContract(fn)` | nil | Projects secondary index fields from a payload — enables `Query()` |
 | `WithActivityWindow(d)` | `4h` | Journal residency for hot correlation keys |
@@ -1152,6 +1157,11 @@ type FlushSink interface {
 | Package | Target |
 |---|---|
 | `sink/docdb` | AWS DocumentDB · MongoDB |
+| `sink/dynamodb` | AWS DynamoDB — `BatchWriteItem`, 25-item chunking, `UnprocessedItems` backoff |
+| `sink/postgres` | PostgreSQL — multi-row `INSERT ... ON CONFLICT DO UPDATE`, or `COPY` for append-only contracts |
+
+See [DynamoDB adapter](#dynamodb-adapter) and [PostgreSQL adapter](#postgresql-adapter) below for the
+cost model and configuration each one targets.
 
 ---
 
@@ -1176,6 +1186,8 @@ type ReadModel struct {
 | Package | Target |
 |---|---|
 | `source/docdb` | AWS DocumentDB · MongoDB (`FindOne`, result marshalled to JSON bytes) |
+| `source/dynamodb` | AWS DynamoDB — `GetItem` with `ConsistentRead: true` |
+| `source/postgres` | PostgreSQL — `QueryParams` + `Projector`, prepared `SELECT` against the primary |
 
 `source/docdb` offers two constructors: `NewSource(ctx, Config)` opens its own connection pool, and
 `NewSourceWithClient(client, db, collection)` shares an existing `*mongo.Client` — pass `sink.Client()`
@@ -1183,6 +1195,75 @@ to run both paths over one pool.
 
 `source.ErrRecordNotFound` is translated to the public `sluice.ErrRecordNotFound` by `Read` and
 `HotLoad`, so callers never need to import the `source` package for error handling.
+
+---
+
+## DynamoDB adapter
+
+`adapter/dynamodb` (RFC: `hybrid-dynamo.md`) positions `sluice` in front of DynamoDB as a **cost and
+capacity flattener**. DynamoDB is never connection-bound — the problem is WCU spend: DAX doesn't cache
+writes, GSIs multiply WCU cost per index, and `TransactWriteItems` carries a 2x WCU penalty. `sluice`
+removes all three:
+
+| DynamoDB cost driver | Without `sluice` | With `sluice` |
+|---|---|---|
+| Ingestion rate | 100K individual writes/sec | 100K writes to Redis (sub-ms) |
+| DynamoDB write rate | 100K WCU/sec (peak) | ~100 `BatchWriteItem` calls/sec, ~4K WCU/sec (steady) |
+| GSI WCU cost | multiplies linearly per index | 0 — secondary indexes live in Redis (`WithIndexContract`) |
+| Idempotency cost | 2x via `TransactWriteItems` | 0 — Redis `SETNX` (`WriteIdempotent`) |
+| Capacity model | On-Demand or Provisioned + Auto-Scaling | Low, flat Provisioned Capacity |
+
+**Write path:** `dynamodb.BatchWriteItem` (25 items/batch, 16MB limit), exponential backoff with jitter
+on `UnprocessedItems`, and pre-flush validation against DynamoDB's 400KB item limit — oversized payloads
+route to the DLQ with `ErrPayloadTooLarge`.
+
+**Read path:** `GetItem` / `BatchGetItem` with `ConsistentRead: true` enforced — a cold read immediately
+after a flush must see the flushed state, since `sluice` already acknowledged the write at the Redis layer.
+
+**CAP positioning:** write path is AP (Redis absorbs and acks; DynamoDB partitions/throttling hold in the
+journal or DLQ); cold read path is CP (`ConsistentRead: true` guarantees strict consistency).
+
+---
+
+## PostgreSQL adapter
+
+`adapter/postgres` (RFC: `postgres-hybrid-adapter.md`) reuses the same `WriteContract` /
+`ReadContract` / `WithIndexContract` interfaces for structural consistency with the DynamoDB adapter,
+but targets a structurally different bottleneck: PostgreSQL has no per-request pricing — its limits are
+**connection pool saturation, per-transaction overhead, synchronous index write amplification, and
+MVCC bloat**, not WCU cost.
+
+Two independent, non-interchangeable savings levers apply:
+- **Batching** (statement-count reduction) — always on: one multi-row upsert replaces thousands of
+  `BEGIN`/`COMMIT` round-trips.
+- **Coalescing** (row-count reduction) — workload-dependent: only reduces WAL volume and MVCC bloat
+  when many writes in a flush window target the same key.
+
+**Write path — two modes, selectable per namespace:**
+
+| Mode | Mechanism | Use when |
+|---|---|---|
+| Mode A — Bulk Upsert (default) | `INSERT ... VALUES (...), (...) ON CONFLICT (pk) DO UPDATE ... WHERE EXCLUDED.ts > t.ts` | General upsert workloads; default `MaxBatchSize` 1000, typically tuned 200–500 |
+| Mode B — `COPY` Append (opt-in) | `pgx.CopyFrom` into an unlogged staging table, then `INSERT ... SELECT ... ON CONFLICT DO NOTHING` | Insert-only contracts with upstream-guaranteed key uniqueness — 5–10x over bulk upsert |
+
+Connection handling uses a fixed `pgxpool.Pool` (`MinConns=5`, `MaxConns=30`), replacing hundreds of
+direct writer connections. Postgres errors are routed by class — permanent (`23505`, `23502`, `42P01`,
+etc.) go straight to the DLQ; transient errors shrink either the batch-size axis (`57014`, `53200`) or
+the concurrency axis (`53300`), or fall back to pure backoff with jitter (`40001`, `40P01`).
+
+**Read path:** prepared `SELECT ... WHERE correlation_key = $1` against the primary, with
+`pg_is_in_recovery()` probed both at `Build` and in `pgxpool.AfterConnect` so every physical connection
+is verified — including ones grown or recycled after startup.
+
+**Schema boundary:** `sluice` never auto-creates tables, emits DDL, or manages migrations. The
+`WriteContract` / `ReadContract` / `IndexContract` / optional `PostgresProjector` define the data shape
+`sluice` expects; provisioning the physical table, indexes, and partitions is strictly the operator's
+responsibility via standard migration tooling. A schema mismatch fails fast (`42P01` / `42703`) and
+routes to the DLQ rather than attempting to self-heal the schema.
+
+**CAP positioning:** write path is AP (Redis absorbs writes, acks immediately; Postgres updates
+asynchronously); cold read path is CP (`READ COMMITTED` against the primary, enforced at runtime rather
+than assumed).
 
 ---
 
@@ -1255,8 +1336,8 @@ All sentinel errors are comparable with `errors.Is`.
 ## Running tests
 
 ```bash
-make test-unit          # unit tests — Redis + MongoDB auto-started via Docker
-make test-integration   # full stack: Redis + MongoDB + Kafka + LocalStack
+make test-unit          # unit tests — Redis + MongoDB + DynamoDB Local + PostgreSQL auto-started via Docker
+make test-integration   # full stack: Redis + MongoDB + DynamoDB Local + PostgreSQL + Kafka + LocalStack
 make test-all           # unit + integration, then tear down
 make coverage           # HTML coverage report
 make check              # pre-commit: tidy + vet + lint + unit tests
@@ -1264,7 +1345,9 @@ make check              # pre-commit: tidy + vet + lint + unit tests
 
 Hot/cold regime coverage lives in `tests/unit/documentdb/hot_features_test.go` and
 `tests/integration/documentdb/hot_features_test.go` — `HotLoad`/`Read`, `WriteIdempotent`, content dedup, and
-compound `Query`.
+compound `Query`. `tests/unit/dynamodb` and `tests/unit/postgres` cover chunking/batching, degraded mode,
+strong consistency, and (for Postgres) complex projections — against DynamoDB Local and a real PostgreSQL
+container respectively.
 
 ---
 
@@ -1300,8 +1383,34 @@ MONGO_URI=mongodb://localhost:27017 \
 REDIS_ADDR=localhost:6379 \
 go run ./examples/asynq_dlq/main.go
 
+# DynamoDB adapter — basic write + flush (DynamoDB Local)
+DYNAMODB_ENDPOINT=http://localhost:8000 \
+REDIS_ADDR=localhost:6379 \
+go run ./examples/nudge_dynamodb/main.go
+
+# DynamoDB adapter — hot/cold regime, Query via Redis-side indexes
+DYNAMODB_ENDPOINT=http://localhost:8000 \
+REDIS_ADDR=localhost:6379 \
+go run ./examples/nudge_hot_reload_dynamodb/main.go
+
+# PostgreSQL adapter — basic write + flush (Mode A bulk upsert)
+POSTGRES_DSN=postgres://sluice:sluice@localhost:5432/sluice?sslmode=disable \
+REDIS_ADDR=localhost:6379 \
+go run ./examples/nudge_postgres/main.go
+
+# PostgreSQL adapter — hot/cold regime, split writer/reader pools
+POSTGRES_DSN=postgres://sluice:sluice@localhost:5432/sluice?sslmode=disable \
+REDIS_ADDR=localhost:6379 \
+go run ./examples/nudge_write_dual_read_hot_postgres/main.go
+
 make docker-down
 ```
+
+`docker-compose.yml` runs `dynamodb-local` and `postgres` services alongside Redis/Valkey and MongoDB,
+so the examples above need no external AWS account or managed database. DLQ and Local Journal examples
+have DynamoDB and PostgreSQL counterparts too: `ticker_dlq_dynamodb`, `asynq_dlq_dynamodb`,
+`localjournal_pushpull_dynamodb`, `ticker_dlq_postgres`, `asynq_dlq_postgres`, and
+`localjournal_pushpull_postgres`.
 
 `examples/nudge_hot_reload/documentdb/main.go` runs both regimes side by side: eight cold-path bulk consumers
 driving the flush engine, plus a hot-path simulator that logs in a synthetic user every two seconds
