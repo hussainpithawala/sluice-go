@@ -60,6 +60,108 @@ func setupDynamoDBSource(t *testing.T) (*Source, func()) {
 	return s, cleanup
 }
 
+func TestDynamoDBSource_ReadBulk_Success(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion("us-east-1"))
+	require.NoError(t, err)
+
+	client := dynamodb.NewFromConfig(cfg, func(o *dynamodb.Options) {
+		o.BaseEndpoint = aws.String("http://localhost:8000")
+	})
+
+	tableName := "test_source_bulk_" + t.Name()
+	_, err = client.CreateTable(ctx, &dynamodb.CreateTableInput{
+		TableName: aws.String(tableName),
+		KeySchema: []types.KeySchemaElement{
+			{AttributeName: aws.String("PK"), KeyType: types.KeyTypeHash},
+			{AttributeName: aws.String("SK"), KeyType: types.KeyTypeRange},
+		},
+		AttributeDefinitions: []types.AttributeDefinition{
+			{AttributeName: aws.String("PK"), AttributeType: types.ScalarAttributeTypeS},
+			{AttributeName: aws.String("SK"), AttributeType: types.ScalarAttributeTypeS},
+		},
+		BillingMode: types.BillingModePayPerRequest,
+	})
+	require.NoError(t, err)
+	defer func() { _, _ = client.DeleteTable(ctx, &dynamodb.DeleteTableInput{TableName: aws.String(tableName)}) }()
+
+	require.Eventually(t, func() bool {
+		res, _ := client.DescribeTable(ctx, &dynamodb.DescribeTableInput{TableName: aws.String(tableName)})
+		return res != nil && res.Table.TableStatus == types.TableStatusActive
+	}, 10*time.Second, 500*time.Millisecond)
+
+	// Seed data
+	_, err = client.PutItem(ctx, &dynamodb.PutItemInput{
+		TableName: aws.String(tableName),
+		Item: map[string]types.AttributeValue{
+			"PK":   &types.AttributeValueMemberS{Value: "user_123"},
+			"SK":   &types.AttributeValueMemberS{Value: "item_1"},
+			"Name": &types.AttributeValueMemberS{Value: "Alice"},
+		},
+	})
+	require.NoError(t, err)
+
+	_, err = client.PutItem(ctx, &dynamodb.PutItemInput{
+		TableName: aws.String(tableName),
+		Item: map[string]types.AttributeValue{
+			"PK":   &types.AttributeValueMemberS{Value: "user_123"},
+			"SK":   &types.AttributeValueMemberS{Value: "item_2"},
+			"Name": &types.AttributeValueMemberS{Value: "Bob"},
+		},
+	})
+	require.NoError(t, err)
+
+	s := NewSource(client, tableName)
+
+	model := source.BulkReadModel{
+		Query: DynamoBulkReadModel{
+			Input: &dynamodb.QueryInput{
+				TableName:              aws.String(tableName),
+				KeyConditionExpression: aws.String("PK = :pk"),
+				ExpressionAttributeValues: map[string]types.AttributeValue{
+					":pk": &types.AttributeValueMemberS{Value: "user_123"},
+				},
+			},
+			Projector: func(items []map[string]types.AttributeValue) ([]source.BulkReadResult, error) {
+				var results []source.BulkReadResult
+				for _, item := range items {
+					var sk string
+					var name string
+					_ = attributevalue.Unmarshal(item["SK"], &sk)
+					_ = attributevalue.Unmarshal(item["Name"], &name)
+
+					payload, _ := json.Marshal(map[string]any{"name": name})
+					results = append(results, source.BulkReadResult{
+						CorrelationKey: sk,
+						Payload:        payload,
+					})
+				}
+				return results, nil
+			},
+		},
+	}
+
+	results, err := s.ReadBulk(ctx, model)
+	require.NoError(t, err)
+	assert.Len(t, results, 2)
+
+	// Verify one of the results
+	found := false
+	for _, r := range results {
+		if r.CorrelationKey == "item_1" {
+			var payload map[string]any
+			err := json.Unmarshal(r.Payload, &payload)
+			require.NoError(t, err)
+			assert.Equal(t, "Alice", payload["name"])
+			found = true
+		}
+	}
+	assert.True(t, found)
+}
+
 func TestDynamoDBSource_Read_Success(t *testing.T) {
 	t.Parallel()
 	s, cleanup := setupDynamoDBSource(t)
