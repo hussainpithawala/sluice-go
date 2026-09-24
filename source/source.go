@@ -23,6 +23,8 @@ type Source interface {
 	// Read fetches the raw JSON/document bytes for the given ReadModel.
 	// Returns ErrRecordNotFound if the document does not exist.
 	Read(ctx context.Context, model ReadModel) ([]byte, error)
+	// ReadBulk executes a set-based query and returns multiple hydrated results.
+	ReadBulk(ctx context.Context, model BulkReadModel) ([]BulkReadResult, error)
 
 	Ping(ctx context.Context) error
 	Close(ctx context.Context) error

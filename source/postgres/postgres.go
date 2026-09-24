@@ -15,34 +15,8 @@ import (
 	"fmt"
 
 	"github.com/hussainpithawala/sluice-go/source"
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
-
-// QueryParams defines the execution plan for a cold read in PostgreSQL.
-// It is designed to be passed via source.ReadModel.Filter.
-//
-// Best Practice: Use Postgres-native JSON aggregation functions
-// (e.g., json_build_object, json_agg) to return a single, fully-formed
-// JSON payload per correlation key directly from the database.
-type QueryParams struct {
-	// Query is the SQL statement to execute.
-	// Example: "SELECT json_build_object('id', u.id, 'name', u.name) FROM users u WHERE u.id = $1"
-	Query string
-
-	// Args are the parameters to bind to the query (e.g., []any{correlationKey}).
-	Args []any
-
-	// Projector transforms the resulting pgx.Row into the canonical []byte
-	// payload that will be stored in the Redis L2 journal and L1 cache.
-	// If the query returns no rows, the projector should return source.ErrRecordNotFound.
-	Projector func(row pgx.Row) ([]byte, error)
-}
-
-// Source implements source.Source for PostgreSQL.
-type Source struct {
-	pool *pgxpool.Pool
-}
 
 // New connects to PostgreSQL and returns a ready Source.
 func New(ctx context.Context, connString string) (*Source, error) {
@@ -89,13 +63,41 @@ func (s *Source) Read(ctx context.Context, model source.ReadModel) ([]byte, erro
 	return params.Projector(row)
 }
 
+// ReadBulk executes the SQL query defined in PostgresBulkReadModel and delegates
+// the result shaping entirely to the operator's Projector function.
+func (s *Source) ReadBulk(ctx context.Context, model source.BulkReadModel) ([]source.BulkReadResult, error) {
+	pgModel, ok := model.Query.(PostgresBulkReadModel)
+	if !ok {
+		return nil, fmt.Errorf("postgres source requires Query to be postgres.PostgresBulkReadModel")
+	}
+
+	if pgModel.Query == "" {
+		return nil, fmt.Errorf("postgres source requires a non-empty SQL Query")
+	}
+
+	if pgModel.Projector == nil {
+		return nil, fmt.Errorf("postgres source requires a non-nil Projector function")
+	}
+
+	// Execute the query using the strictly bounded pgxpool
+	rows, err := s.pool.Query(ctx, pgModel.Query, pgModel.Args...)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: bulk read query execution failed: %w", err)
+	}
+	// Note: The Projector is responsible for calling rows.Close() if it returns early,
+	// but we defer it here as a safety net to prevent connection leaks.
+	defer rows.Close()
+
+	return pgModel.Projector(rows)
+}
+
 // Ping verifies connectivity to PostgreSQL.
 func (s *Source) Ping(ctx context.Context) error {
 	return s.pool.Ping(ctx)
 }
 
 // Close closes the connection pool.
-func (s *Source) Close(ctx context.Context) error {
+func (s *Source) Close(_ context.Context) error {
 	s.pool.Close()
 	return nil
 }

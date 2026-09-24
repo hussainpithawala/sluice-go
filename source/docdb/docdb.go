@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/hussainpithawala/sluice-go/source"
@@ -87,6 +88,38 @@ func (s *Source) Read(ctx context.Context, model source.ReadModel) ([]byte, erro
 		return nil, fmt.Errorf("sluice/source/docdb: marshal read result: %w", err)
 	}
 	return b, nil
+}
+
+// ReadBulk executes the Find query defined in DocDBBulkReadModel and delegates
+// the result shaping entirely to the operator's Projector function.
+func (s *Source) ReadBulk(ctx context.Context, model source.BulkReadModel) ([]source.BulkReadResult, error) {
+	mongoModel, ok := model.Query.(DocDBBulkReadModel)
+	if !ok {
+		return nil, fmt.Errorf("docdb source requires Query to be docdb.DocDBBulkReadModel")
+	}
+
+	if mongoModel.Filter == nil {
+		return nil, fmt.Errorf("docdb source requires a non-nil Filter")
+	}
+
+	if mongoModel.Projector == nil {
+		return nil, fmt.Errorf("docdb source requires a non-nil Projector function")
+	}
+
+	// Execute the Find query using the collection
+	cursor, err := s.collection.Find(ctx, mongoModel.Filter, mongoModel.Options)
+	if err != nil {
+		return nil, fmt.Errorf("docdb: bulk read find execution failed: %w", err)
+	}
+	// Safety net to prevent cursor/connection leaks
+	defer func(cursor *mongo.Cursor, ctx context.Context) {
+		err := cursor.Close(ctx)
+		if err != nil {
+			slog.Debug("error while closing the docdb source cursor", "err", err)
+		}
+	}(cursor, ctx)
+
+	return mongoModel.Projector(cursor)
 }
 
 func (s *Source) Ping(ctx context.Context) error  { return s.client.Ping(ctx, readpref.Primary()) }
