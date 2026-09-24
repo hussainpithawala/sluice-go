@@ -3,6 +3,8 @@ package docdb
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"log/slog"
 	"testing"
 	"time"
 
@@ -48,7 +50,12 @@ func TestDocDBSource_ReadBulk_Success(t *testing.T) {
 
 	client, err := mongo.Connect(ctx, options.Client().ApplyURI(testMongoURI))
 	require.NoError(t, err)
-	defer client.Disconnect(ctx)
+	defer func(client *mongo.Client, ctx context.Context) {
+		err := client.Disconnect(ctx)
+		if err != nil {
+			slog.Error(fmt.Sprintf("Error while disconnecting client %s", err))
+		}
+	}(client, ctx)
 
 	dbName := "test_sluice_source_bulk_" + t.Name()
 	collName := "test_collection"
@@ -60,7 +67,12 @@ func TestDocDBSource_ReadBulk_Success(t *testing.T) {
 		bson.M{"_id": "item_2", "user_id": "user_123", "name": "Bob"},
 	})
 	require.NoError(t, err)
-	defer client.Database(dbName).Drop(ctx)
+	defer func(database *mongo.Database, ctx context.Context) {
+		err := database.Drop(ctx)
+		if err != nil {
+			slog.Error(fmt.Sprintf("Error during dropping the database %s %e", database.Name(), err))
+		}
+	}(client.Database(dbName), ctx)
 
 	s := NewSourceWithClient(client, dbName, collName)
 

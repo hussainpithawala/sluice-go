@@ -57,19 +57,25 @@ func (b *Builder) WithSource(s source.Source) *Builder { b.src = s; return b }
 func (b *Builder) WithReadContract(rc ReadContract) *Builder { b.cfg.ReadContract = rc; return b }
 
 // WithIndexContract sets the domain function that extracts secondary index fields.
-func (b *Builder) WithIndexContract(ic IndexContract) *Builder { b.cfg.IndexContract = ic; return b }
+func (b *Builder) WithIndexContract(ic IndexContract) *Builder {
+	b.indexContract = ic
+	b.cfg.IndexContract = ic
+	return b
+}
 
 // Builder methods for BulkContracts
 
 // WithReadBulkContract configures the bulk read execution plan translator.
 func (b *Builder) WithReadBulkContract(fn ReadBulkContract) *Builder {
 	b.readBulkContract = fn
+	b.cfg.ReadBulkContract = fn
 	return b
 }
 
 // WithIndexBulkContract configures the bulk secondary index extractor.
 func (b *Builder) WithIndexBulkContract(fn IndexBulkContract) *Builder {
 	b.indexBulkContract = fn
+	b.cfg.IndexBulkContract = fn
 	return b
 }
 
@@ -324,7 +330,7 @@ func (s *Sluice) Read(ctx context.Context, correlationKey string) ([]byte, error
 			s.local.Put(correlationKey, jr.Payload, jr.Version)
 		}
 
-		if s.hotAwareFlush.Load() && jr.PTTL >= 0 && jr.PTTL < s.activityWindow/5 {
+		if s.hotAwareFlush.Load() && jr.PTTL >= 0 && jr.PTTL < s.cfg.ActivityWindow/5 {
 			go func() {
 				bgCtx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 				defer cancel()
@@ -335,6 +341,7 @@ func (s *Sluice) Read(ctx context.Context, correlationKey string) ([]byte, error
 		return jr.Payload, nil
 	}
 
+	// ── Tier 3: L3 Source Fallback (Cold Read) ─────────────────────────
 	// ── Tier 3: L3 Source Fallback (Cold Read) ─────────────────────────
 	if s.src != nil && s.readContract != nil {
 		readModel, err := s.readContract(correlationKey)
@@ -348,9 +355,44 @@ func (s *Sluice) Read(ctx context.Context, correlationKey string) ([]byte, error
 			}
 			return nil, err
 		}
+
+		// ── Asynchronous Read-Through Cache Hydration ─────────────────
+		// Return payload immediately to prioritize fast cold reads.
+		// Hydration of L2, L1, and Indexes happens in the background.
+		go func() {
+			bgCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+
+			currentTs := float64(time.Now().UnixMilli())
+
+			// 1. Hydrate L2 Redis Journal (best-effort)
+			// The shield's version gate ensures this won't overwrite a newer concurrent Write().
+			if err := s.shield.Write(bgCtx, correlationKey, payload); err != nil {
+				if s.metrics != nil {
+					s.metrics.RecordRedisOp(s.cfg.Namespace, "write_hydration", 0, err)
+				}
+			}
+
+			// 2. Hydrate L1 Local Cache
+			if s.local != nil {
+				s.local.Put(correlationKey, payload, int64(currentTs))
+			}
+
+			// 3. Hydrate Secondary Indexes (best-effort, eventually consistent)
+			if s.indexContract != nil {
+				indexFields, idxErr := s.indexContract(correlationKey, payload)
+				if idxErr == nil && len(indexFields) > 0 {
+					if err := s.shield.UpdateIndexes(bgCtx, correlationKey, indexFields, s.cfg.ActivityWindow); err != nil {
+						if s.metrics != nil {
+							s.metrics.RecordRedisOp(s.cfg.Namespace, "updateindexes_hydration", 0, err)
+						}
+					}
+				}
+			}
+		}()
+
 		return payload, nil
 	}
-
 	return nil, ErrRecordNotFound
 }
 
@@ -359,6 +401,9 @@ func (s *Sluice) Read(ctx context.Context, correlationKey string) ([]byte, error
 // through to the Source (L3) on a journal miss — identical semantics to
 // v1.0.7 Read(). Use for money-critical reads that cannot tolerate
 // bounded staleness; use Read() for everything else.
+// ReadFresh is the strong-consistency escape hatch (RFC §5.8).
+// It bypasses L1 entirely and reads from the Redis journal (L2), falling
+// through to the Source (L3) on a journal miss.
 func (s *Sluice) ReadFresh(ctx context.Context, correlationKey string) ([]byte, error) {
 	if s.closed.Load() {
 		return nil, ErrLibraryClosed
@@ -377,7 +422,8 @@ func (s *Sluice) ReadFresh(ctx context.Context, correlationKey string) ([]byte, 
 		return jr.Payload, nil
 	}
 
-	// ── L3: Source fallback (identical to Read's cold path) ──────────────
+	// ── L3: Source fallback ─────────────────────────────────────────────
+	// ── L3: Source fallback ─────────────────────────────────────────────
 	if s.src != nil && s.readContract != nil {
 		readModel, err := s.readContract(correlationKey)
 		if err != nil {
@@ -390,15 +436,42 @@ func (s *Sluice) ReadFresh(ctx context.Context, correlationKey string) ([]byte, 
 			}
 			return nil, err
 		}
+
+		// ── Asynchronous Read-Through Cache Hydration (L2 + Index only) ─────────────────
+		go func() {
+			bgCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+
+			// 1. Hydrate L2 Redis Journal (best-effort)
+			if err := s.shield.Write(bgCtx, correlationKey, payload); err != nil {
+				if s.metrics != nil {
+					s.metrics.RecordRedisOp(s.cfg.Namespace, "write_hydration", 0, err)
+				}
+			}
+
+			// 2. Hydrate Secondary Indexes (best-effort, eventually consistent)
+			if s.indexContract != nil {
+				indexFields, idxErr := s.indexContract(correlationKey, payload)
+				if idxErr == nil && len(indexFields) > 0 {
+					if err := s.shield.UpdateIndexes(bgCtx, correlationKey, indexFields, s.cfg.ActivityWindow); err != nil {
+						if s.metrics != nil {
+							s.metrics.RecordRedisOp(s.cfg.Namespace, "updateindexes_hydration", 0, err)
+						}
+					}
+				}
+			}
+		}()
+
 		return payload, nil
 	}
-
 	return nil, ErrRecordNotFound
 }
 
 // ReadOld returns current state from the journal.
 // Hot correlation_key: sub-millisecond Redis read with lazy TTL refresh.
 // Cold correlation_key: falls back to the configured Source via ReadContract.
+// ReadOld returns current state from the journal.
+// Deprecated: Superseded by the new tiered Read() method.
 func (s *Sluice) ReadOld(ctx context.Context, correlationKey string) ([]byte, error) {
 	if s.closed.Load() {
 		return nil, ErrLibraryClosed
@@ -410,8 +483,6 @@ func (s *Sluice) ReadOld(ctx context.Context, correlationKey string) ([]byte, er
 	// Hot path: found in Redis journal
 	if err == nil && payload != nil {
 		s.metrics.RecordRead(s.cfg.Namespace, time.Since(t), true, nil)
-
-		// Lazy refresh: if remaining TTL is < 20% of ActivityWindow, refresh it synchronously.
 		threshold := s.cfg.ActivityWindow / 5
 		if pttl > 0 && pttl < threshold {
 			_ = s.shield.SetHotMarker(ctx, correlationKey, s.cfg.ActivityWindow)
@@ -421,25 +492,50 @@ func (s *Sluice) ReadOld(ctx context.Context, correlationKey string) ([]byte, er
 	}
 
 	// Cold path: fallback to the backing datastore via Source
+	// Cold path: fallback to the backing datastore via Source
 	if s.cfg.ReadContract != nil && s.src != nil {
-		// 1. Caller defines the datastore-agnostic filter
 		model, modelErr := s.cfg.ReadContract(correlationKey)
 		if modelErr != nil {
 			s.metrics.RecordRead(s.cfg.Namespace, time.Since(t), false, modelErr)
 			return nil, modelErr
 		}
 
-		// 2. Source executes the query and returns raw bytes
 		srcPayload, srcErr := s.src.Read(ctx, *model)
 		s.metrics.RecordRead(s.cfg.Namespace, time.Since(t), false, srcErr)
-
 		if srcErr != nil {
-			// Map internal source error to public sluice sentinel error
 			if errors.Is(srcErr, source.ErrRecordNotFound) {
 				return nil, ErrRecordNotFound
 			}
 			return nil, srcErr
 		}
+
+		// ── Asynchronous Read-Through Cache Hydration ─────────────────
+		go func() {
+			bgCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+
+			currentTs := float64(time.Now().UnixMilli())
+
+			if err := s.shield.Write(bgCtx, correlationKey, srcPayload); err != nil {
+				if s.metrics != nil {
+					s.metrics.RecordRedisOp(s.cfg.Namespace, "write_hydration", 0, err)
+				}
+			}
+			if s.local != nil {
+				s.local.Put(correlationKey, srcPayload, int64(currentTs))
+			}
+			if s.cfg.IndexContract != nil {
+				indexFields, idxErr := s.cfg.IndexContract(correlationKey, srcPayload)
+				if idxErr == nil && len(indexFields) > 0 {
+					if err := s.shield.UpdateIndexes(bgCtx, correlationKey, indexFields, s.cfg.ActivityWindow); err != nil {
+						if s.metrics != nil {
+							s.metrics.RecordRedisOp(s.cfg.Namespace, "updateindexes_hydration", 0, err)
+						}
+					}
+				}
+			}
+		}()
+
 		return srcPayload, nil
 	}
 
@@ -448,44 +544,71 @@ func (s *Sluice) ReadOld(ctx context.Context, correlationKey string) ([]byte, er
 }
 
 // HotLoad activates a correlation_key on user login.
-// Loads the document from the Source into the Redis journal and sets the hot marker.
-func (s *Sluice) HotLoad(ctx context.Context, correlationKey string) ([]byte, error) {
+// It synchronously sets the hot marker (the "command") and asynchronously
+// hydrates the payload from the Source into the L2/L1 journals (the "side effect").
+// The caller should NOT block on payload hydration — this is a fire-and-forget operation.
+func (s *Sluice) HotLoad(ctx context.Context, correlationKey string) error {
 	if s.closed.Load() {
-		return nil, ErrLibraryClosed
+		return ErrLibraryClosed
 	}
 	if s.src == nil || s.cfg.ReadContract == nil {
-		return nil, ErrMissingReadContract
+		return ErrMissingReadContract
 	}
 
-	t := time.Now()
-
-	// 1. Caller defines the filter
-	model, err := s.cfg.ReadContract(correlationKey)
-	if err != nil {
-		s.metrics.RecordWarmUp(s.cfg.Namespace, time.Since(t), err)
-		return nil, err
-	}
-
-	// 2. Source executes the query
-	payload, err := s.src.Read(ctx, *model)
-	s.metrics.RecordWarmUp(s.cfg.Namespace, time.Since(t), err)
-	if err != nil {
-		// Map internal source error to public sluice sentinel error
-		if errors.Is(err, source.ErrRecordNotFound) {
-			return nil, ErrRecordNotFound
-		}
-		return nil, err
-	}
-
-	// 3. Write to Redis journal and set the hot marker
-	if err := s.shield.Write(ctx, correlationKey, payload); err != nil {
-		return nil, err
-	}
+	// 1. SYNCHRONOUS: Set the hot marker immediately.
+	//    This is the actual "command" — it tells the flush engine that this
+	//    key is now hot, so subsequent Write() calls will trigger immediate flushes.
+	//    This is a single Redis SET NX EX — sub-millisecond.
 	if err := s.shield.SetHotMarker(ctx, correlationKey, s.cfg.ActivityWindow); err != nil {
-		return nil, err
+		return fmt.Errorf("hotload: failed to set hot marker: %w", err)
 	}
 
-	return payload, nil
+	// 2. ASYNCHRONOUS: Hydrate the payload from Source → L2 → L1 → Indexes.
+	//    This is a side effect, not the primary objective. The caller should
+	//    not wait for this. If it fails, the next Read() will simply do a cold
+	//    read from the Source, which is graceful degradation.
+	go func() {
+		bgCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		t := time.Now()
+
+		// 2a. Read from Source (cold read)
+		model, err := s.cfg.ReadContract(correlationKey)
+		if err != nil {
+			s.metrics.RecordWarmUp(s.cfg.Namespace, time.Since(t), err)
+			return
+		}
+
+		payload, err := s.src.Read(bgCtx, *model)
+		s.metrics.RecordWarmUp(s.cfg.Namespace, time.Since(t), err)
+		if err != nil {
+			return // Source miss or error — graceful degradation
+		}
+
+		// 2b. Hydrate L2 Redis Journal
+		if err := s.shield.Write(bgCtx, correlationKey, payload); err != nil {
+			if s.metrics != nil {
+				s.metrics.RecordRedisOp(s.cfg.Namespace, "hotload_hydration", 0, err)
+			}
+			return
+		}
+
+		// 2c. Hydrate L1 Local Cache
+		if s.local != nil {
+			s.local.Put(correlationKey, payload, time.Now().UnixMilli())
+		}
+
+		// 2d. Hydrate Secondary Indexes (best-effort)
+		if s.cfg.IndexContract != nil {
+			indexFields, idxErr := s.cfg.IndexContract(correlationKey, payload)
+			if idxErr == nil && len(indexFields) > 0 {
+				_ = s.shield.UpdateIndexes(bgCtx, correlationKey, indexFields, s.cfg.ActivityWindow)
+			}
+		}
+	}()
+
+	return nil
 }
 
 // Write buffers payload under correlationKey in Redis and returns immediately.

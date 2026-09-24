@@ -20,23 +20,24 @@ import (
 // Sluice is the main entry point. Safe for concurrent use.
 // Construct via New().Build() — never instantiate directly.
 type Sluice struct {
-	cfg              Config
-	shield           *shield.Shield
-	engine           *engine.Engine
-	sk               sink.FlushSink
-	src              source.Source
-	writeContract    WriteContract
-	readContract     ReadContract
-	readBulkContract ReadBulkContract
-	metrics          MetricsRecorder
-	closed           atomic.Bool
-	dlqCancel        context.CancelFunc
-	dlqDone          chan struct{}
+	cfg               Config
+	shield            *shield.Shield
+	engine            *engine.Engine
+	sk                sink.FlushSink
+	src               source.Source
+	writeContract     WriteContract
+	readContract      ReadContract
+	indexContract     IndexContract
+	readBulkContract  ReadBulkContract
+	indexBulkContract IndexBulkContract
+	metrics           MetricsRecorder
+	closed            atomic.Bool
+	dlqCancel         context.CancelFunc
+	dlqDone           chan struct{}
 	// L1 Local Journal (nil if Mode == Off)
-	local          *localjournal.Cache
-	hotAwareFlush  atomic.Bool
-	activityWindow time.Duration
-	broadcastSub   *broadcast.Subscriber
+	local         *localjournal.Cache
+	hotAwareFlush atomic.Bool
+	broadcastSub  *broadcast.Subscriber
 }
 
 // Builder assembles a Sluice instance with a fluent API.
@@ -46,8 +47,9 @@ type Builder struct {
 	src           source.Source
 	writeContract WriteContract
 	//nolint:unused
-	readContract ReadContract
-	callback     OnFlushCallback
+	readContract  ReadContract
+	indexContract IndexContract
+	callback      OnFlushCallback
 	//nolint:unused
 	namespace     string
 	localCacheCfg localjournal.LocalCacheConfig

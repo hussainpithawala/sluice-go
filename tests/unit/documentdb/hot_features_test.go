@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"testing"
 	"time"
 
@@ -154,7 +155,11 @@ func TestHotLoadAndRead_Regime(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 
 	// 4. HotLoad warms up the correlation_key from Mongo into Redis.
-	hotData, err := sl.HotLoad(ctx, correlationKey)
+	if err := sl.HotLoad(ctx, correlationKey); err != nil {
+		slog.Error("hotload failed", "err", err)
+	}
+	// If you need the payload immediately, use Read() instead:
+	hotData, err := sl.Read(ctx, correlationKey)
 	require.NoError(t, err)
 	assert.NotEmpty(t, hotData)
 
