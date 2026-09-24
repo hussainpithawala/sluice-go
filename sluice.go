@@ -50,12 +50,29 @@ func (b *Builder) WithSink(s sink.FlushSink) *Builder { b.sk = s; return b }
 // Required if WithReadContract is used.
 func (b *Builder) WithSource(s source.Source) *Builder { b.src = s; return b }
 
+// Builder Methods for single Key Contracts
+
 // WithReadContract sets the domain function that translates a correlation key
 // into a datastore-agnostic ReadModel for the Source to execute.
 func (b *Builder) WithReadContract(rc ReadContract) *Builder { b.cfg.ReadContract = rc; return b }
 
 // WithIndexContract sets the domain function that extracts secondary index fields.
 func (b *Builder) WithIndexContract(ic IndexContract) *Builder { b.cfg.IndexContract = ic; return b }
+
+// Builder methods for BulkContracts
+
+// WithReadBulkContract configures the bulk read execution plan translator.
+func (b *Builder) WithReadBulkContract(fn ReadBulkContract) *Builder {
+	b.readBulkContract = fn
+	return b
+}
+
+// WithIndexBulkContract configures the bulk secondary index extractor.
+func (b *Builder) WithIndexBulkContract(fn IndexBulkContract) *Builder {
+	b.indexBulkContract = fn
+	return b
+}
+
 func (b *Builder) WithWriteContract(wc WriteContract) *Builder { b.writeContract = wc; return b }
 func (b *Builder) WithFlushWindow(d time.Duration) *Builder    { b.cfg.FlushWindow = d; return b }
 func (b *Builder) WithMaxBatchSize(n int) *Builder             { b.cfg.MaxBatchSize = n; return b }
