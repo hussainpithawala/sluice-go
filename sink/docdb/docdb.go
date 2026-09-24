@@ -1,4 +1,4 @@
-// Package docdb provides a FlushSink implementation for AWS DocumentDB and MongoDB.
+// Package documentdb provides a FlushSink implementation for AWS DocumentDB and MongoDB.
 package docdb
 
 import (
@@ -59,13 +59,13 @@ func New(ctx context.Context, cfg Config) (*Sink, error) {
 
 	client, err := mongo.Connect(ctx, opts)
 	if err != nil {
-		return nil, fmt.Errorf("sluice/docdb: connect: %w", err)
+		return nil, fmt.Errorf("sluice/documentdb: connect: %w", err)
 	}
 	pingCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	if err := client.Ping(pingCtx, readpref.Primary()); err != nil {
 		_ = client.Disconnect(ctx)
-		return nil, fmt.Errorf("sluice/docdb: initial ping: %w", err)
+		return nil, fmt.Errorf("sluice/documentdb: initial ping: %w", err)
 	}
 	return &Sink{
 		client:     client,
@@ -123,7 +123,7 @@ func (s *Sink) BulkWrite(ctx context.Context, models []sink.WriteModel) (*sink.B
 			// The engine partitions errors by Code to decide the next action.
 			return result, nil
 		}
-		return nil, fmt.Errorf("sluice/docdb: bulkwrite: %w", err)
+		return nil, fmt.Errorf("sluice/documentdb: bulkwrite: %w", err)
 	}
 
 	return &sink.BulkWriteResult{
@@ -142,7 +142,7 @@ func (s *Sink) Write(ctx context.Context, model sink.WriteModel) error {
 		options.Update().SetUpsert(upsert),
 	)
 	if err != nil {
-		return fmt.Errorf("sluice/docdb: single write: %w", err)
+		return fmt.Errorf("sluice/documentdb: single write: %w", err)
 	}
 	return nil
 }
@@ -151,7 +151,7 @@ func (s *Sink) Ping(ctx context.Context) error  { return s.client.Ping(ctx, read
 func (s *Sink) Close(ctx context.Context) error { return s.client.Disconnect(ctx) }
 
 // Client returns the underlying mongo.Client, allowing it to be shared
-// with source/docdb.Source to maintain a single connection pool.
+// with source/documentdb.Source to maintain a single connection pool.
 func (s *Sink) Client() *mongo.Client {
 	return s.client
 }
