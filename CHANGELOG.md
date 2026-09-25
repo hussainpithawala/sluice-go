@@ -8,6 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [1.0.8] - 2026-09-23
 
 ### Added
+- **Set-Based Cache Pre-Warming (`ReadBulk`)**: Introduced `ReadBulkContract` and `IndexBulkContract` to collapse N+1 queries into a single LTS execution, atomically hydrating the L1/L2 journals and secondary indexes in a single Redis pipeline.
+- **Bulk Read Core Interfaces**: Added `source.BulkReadModel`, `source.BulkReadResult`, `ReadBulkContract`, and `IndexBulkContract` to the `source` and root `sluice` packages.
+- **`ReadBulk` and `ReadBulkWithTTL` Methods**: Added to the `Sluice` struct for set-based working-set hydration. Returns `map[string][]byte` (and optional TTL map) for all items in the working set.
+- **Adapter-Specific Bulk Execution Plans**:
+  - `source/postgres`: `PostgresBulkReadModel` with `pgx.Rows` streaming projection.
+  - `source/docdb`: `DocDBBulkReadModel` with `mongo.Cursor` iteration and `FindOptions` (Sort, Limit).
+  - `source/dynamodb`: `DynamoBulkReadModel` with native `dynamodb.QueryInput` for Partition Key targeting.
+- **Shield Bulk Pipeline Methods**: Added `BulkWriteJournal`, `BulkUpdateIndexes`, and `BulkGetTTL` to the `shield` package for single-round-trip Redis hydration.
+- **Unified Platform Architecture**: `sluice` is now a flexible platform where any combination of operations can coexist. No mutual exclusion enforcement at build time; each operation validates its own dependencies at call time.
+- **Reader-Only Topology**: `Sink` and `WriteContract` are now optional. Calling `Write()` on a read-only instance returns `ErrWriteNotConfigured`. Enables stateless API gateway and bulk pre-warmer deployment patterns.
+- **Asynchronous Read-Through Hydration**: Cold reads (`Read`, `ReadFresh`, `ReadOld`) now spawn a background goroutine to hydrate L2, L1, and indexes after returning the payload, eliminating cold-read latency penalties.
+- **Fire-and-Forget `HotLoad`**: `HotLoad` now returns `error` (not `([]byte, error)`). It synchronously sets the hot marker and asynchronously hydrates the payload, ensuring login handlers are never blocked.
+- **Pre-Query Timestamp Discipline**: `ReadBulk` captures `bulkTs` before the LTS query, ensuring concurrent `Write()` operations with newer timestamps win the version gate, preserving causal consistency.
 - **DynamoDB Hybrid Sink/Source Adapter**: Introduced first-class `dynamodb` adapter packages (`sink/dynamodb` and `source/dynamodb`) to position `sluice` as a velocity shield in front of AWS DynamoDB.
 - **Cost & Capacity Optimization**: Leverages `sluice`'s Redis journal for key-level coalescing, flattening write burst curves. This enables predictable, low provisioned WCU baselines without relying on auto-scaling, on-demand pricing, or costly Global Secondary Indexes (GSIs).
 - **Efficient Batching & Throttling Resilience**: `sink/dynamodb` utilizes `BatchWriteItem` with automatic 25-item chunking and built-in exponential backoff for `UnprocessedItems`, ensuring high-throughput ingestion without data loss or throttling failures.
@@ -36,15 +49,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Version Gate Relaxed**: L1 `Put()` version gate changed from strict `>` to `>=`. Same-millisecond writes now apply (last-writer-wins), fixing cross-pod convergence edge cases on fast hardware.
 - **Namespace Sourcing**: L1 cache and broadcast subscriber now source the namespace directly from `shield.Namespace()` to prevent empty-string key collisions during builder construction.
 - **Broadcast Stream Topology**: Broadcast stream key is now `sl:{namespace}:bcast` (single-slot design) rather than per-band, optimizing for write-rate-only load.
+- **`HotLoad` Signature**: Changed from `HotLoad(ctx, correlationKey) ([]byte, error)` to `HotLoad(ctx, correlationKey) error`. Callers needing the payload immediately should call `Read()` after `HotLoad()`.
+- **`Build()` Validation**: Relaxed to allow `Sink`/`WriteContract` omission. Read-path validation remains strict (`WithReadContract` requires `WithSource`).
+- **`Source` Interface**: Extended with `ReadBulk(ctx, BulkReadModel) ([]BulkReadResult, error)`.
+- **All Examples Updated**: Updated all `nudge_hot_reload`, `nudge_write_dual_read_hot`, and `localjournal_pushpull` examples to reflect the new fire-and-forget `HotLoad` signature.
 
 ### Fixed
 - **Double L1 Instantiation**: Fixed a critical bug in `Build()` where `s.local` was instantiated twice, causing the broadcast subscriber to update an orphaned cache while `Read()` used an empty one.
 - **Empty Namespace in L1 Wiring**: Fixed an issue where `localjournal.Config.Namespace` was empty due to builder field ordering.
 - **Subscriber Shutdown Timeout**: Fixed `TestSubscriber_StartStop` failing due to a hardcoded 5-second `XREAD BLOCK` timeout. The subscriber now correctly respects the configured `BlockMS` (default 50ms) for fast, clean shutdowns.
 - **Missing L2 Telemetry**: Restored the `RecordRedisOp` telemetry call for L2 fallback reads in `Read()`, fixing `TestL1_OffMode_BehavesLikeV107`.
+  **Integration Test Isolation**: Fixed `TestPushPull_EndToEnd_TwoPods` and `TestHotLoad_EmitsSeedBroadcast` to properly isolate MongoDB databases while sharing the Redis broadcast stream namespace.
+- **Test Dummy Removal**: Replaced dummy sinks/sources in integration tests with real `docdb.Sink`/`docdb.Source` to ensure production code paths are exercised.
 
 ### Deprecated
 - **`ReadOld()`**: Superseded by the new tiered `Read()` method. Use `ReadFresh()` for strict consistency requirements.
+- **`HotLoad` Payload Return**: The previous `([]byte, error)` return signature is deprecated. Use `HotLoad` + `Read` for the same functionality.
 
 ## [1.0.7] - 2026-09-07
 
