@@ -3,6 +3,8 @@ package documentdb
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"log/slog"
 	"os"
 	"strconv"
 	"sync/atomic"
@@ -23,6 +25,8 @@ import (
 	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
+const defaultMongoUrl = "mongodb://localhost:27017"
+
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
 // buildRealTestSluice wires a REAL Sluice instance with a real DocumentDB sink/source
@@ -38,7 +42,7 @@ func buildRealTestSluice(t *testing.T, sluiceNamespace string, dbSuffix string, 
 
 	mongoURI := os.Getenv("MONGO_URI")
 	if mongoURI == "" {
-		mongoURI = "mongodb://localhost:27017"
+		mongoURI = defaultMongoUrl
 	}
 
 	dbName := "sluice_phase2_test_" + dbSuffix
@@ -170,7 +174,12 @@ func TestReadFresh_BypassesL1(t *testing.T) {
 		Addrs: []string{l1RedisAddr()}, ClusterMode: false, DB: l1TestDB,
 	}, namespace, 16, 30*time.Second, 4*time.Hour)
 	require.NoError(t, err)
-	defer sh.Close()
+	defer func(sh *shield.Shield) {
+		err := sh.Close()
+		if err != nil {
+			slog.Error(fmt.Sprintf("Problem while closing shield %e", err))
+		}
+	}(sh)
 
 	require.NoError(t, sh.Write(ctx, key, freshPayload))
 
@@ -198,7 +207,7 @@ func TestHotLoad_EmitsSeedBroadcast(t *testing.T) {
 
 	mongoURI := os.Getenv("MONGO_URI")
 	if mongoURI == "" {
-		mongoURI = "mongodb://localhost:27017"
+		mongoURI = defaultMongoUrl
 	}
 	dbName := "sluice_phase2_test_hotload_db"
 	collName := "nudge_inventory"
@@ -253,13 +262,23 @@ func TestHotLoad_EmitsSeedBroadcast(t *testing.T) {
 		defer shutCancel()
 		_ = s.DrainAndClose(shutCtx)
 		_ = sk.Client().Database(dbName).Drop(context.Background())
-		_ = sk.Close(context.Background())
+		err = sk.Close(context.Background())
+		if err != nil {
+			slog.Error(fmt.Sprintf("Problem while closing sink %e", err))
+		}
 	}()
 
 	// Verify broadcast stream using a separate shield client
 	sh, err := shield.New(shield.RedisConfig{Addrs: []string{l1RedisAddr()}, ClusterMode: false, DB: l1TestDB}, namespace, 16, 30*time.Second, 4*time.Hour)
 	require.NoError(t, err)
-	defer sh.Close()
+	defer func(sh *shield.Shield) {
+		err := sh.Close()
+		if err != nil {
+			if err != nil {
+				slog.Error(fmt.Sprintf("Problem while closing shield %e", err))
+			}
+		}
+	}(sh)
 
 	// HotLoad is now a fire-and-forget command (returns only error)
 	err = s.HotLoad(ctx, key)
@@ -333,7 +352,7 @@ func TestPushPull_EndToEnd_TwoPods(t *testing.T) {
 	// Install a Redis-read spy on Pod B BEFORE the final read.
 	var redisReads int64
 	recB.redisOpHook = func(op string) {
-		if op == "read" || op == "readjournal" || op == "readfresh" {
+		if op == OpRead || op == OpReadJournal || op == OpReadFresh {
 			atomic.AddInt64(&redisReads, 1)
 		}
 	}

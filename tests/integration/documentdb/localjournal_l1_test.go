@@ -3,6 +3,8 @@ package documentdb
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"log/slog"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -25,6 +27,9 @@ import (
 // countingRecorder is a minimal MetricsRecorder that counts L1 events.
 // It satisfies the embedded localjournal.MetricsRecorder interface and
 // stubs every other method so it compiles against the full interface.
+
+const nudgeInventory = "nudge_inventory"
+
 type countingRecorder struct {
 	mu                    sync.Mutex
 	hits                  int
@@ -117,7 +122,7 @@ func buildTestSluice(t *testing.T, namespace string, mode localjournal.LocalCach
 	}
 
 	dbName := "sluice_l1_test_" + namespace
-	collName := "nudge_inventory"
+	collName := nudgeInventory
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -220,7 +225,12 @@ func verifyJournalPayload(t *testing.T, namespace, key string, expectedPayload [
 		Addrs: []string{l1RedisAddr()}, ClusterMode: false, DB: l1TestDB,
 	}, namespace, 16, 30*time.Second, 4*time.Hour)
 	require.NoError(t, err)
-	defer verifyShield.Close()
+	defer func(verifyShield *shield.Shield) {
+		err := verifyShield.Close()
+		if err != nil {
+			slog.Error(fmt.Sprintf("Problem while closing shield %e", err))
+		}
+	}(verifyShield)
 
 	jr, err := verifyShield.ReadJournal(ctx, key)
 	require.NoError(t, err)
@@ -245,7 +255,7 @@ func TestL1_WriteThenRead_HitsL1(t *testing.T) {
 
 	var redisReads int64
 	rec.redisOpHook = func(op string) {
-		if op == "read" || op == "readjournal" {
+		if op == OpRead || op == OpReadJournal {
 			atomic.AddInt64(&redisReads, 1)
 		}
 	}
@@ -283,7 +293,7 @@ func TestL1_SecondRead_AlsoHitsL1(t *testing.T) {
 
 	var redisReads int64
 	rec.redisOpHook = func(op string) {
-		if op == "read" || op == "readjournal" {
+		if op == OpRead || op == OpReadJournal {
 			atomic.AddInt64(&redisReads, 1)
 		}
 	}
