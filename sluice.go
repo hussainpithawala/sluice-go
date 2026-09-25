@@ -148,64 +148,80 @@ func (b *Builder) Build(ctx context.Context) (*Sluice, error) {
 	if err := b.validate(); err != nil {
 		return nil, err
 	}
+
 	metrics := b.cfg.Metrics
 	if metrics == nil {
 		metrics = &noopMetrics{}
-	}
-	if err := b.sk.Ping(ctx); err != nil {
-		return nil, fmt.Errorf("sluice: sink ping failed: %w", err)
-	}
-
-	if b.cfg.ReadContract != nil && b.src == nil {
-		return nil, errors.New("sluice: WithSource() is required when WithReadContract() is used")
 	}
 
 	sh, err := shield.New(b.cfg.Redis.toInternal(), b.cfg.Namespace, b.cfg.BandCount, b.cfg.KeyTTL, b.cfg.ActivityWindow)
 	if err != nil {
 		return nil, err
 	}
-	// Wrap callback to convert internal types to public types
+
+	var eng *engine.Engine
 	var wrappedCb engine.OnFlushCallback
-	if b.callback != nil {
-		wrappedCb = func(keys []string, result *sink.BulkWriteResult, err error) {
-			pubResult := &BulkWriteResult{
-				InsertedCount: result.InsertedCount,
-				MatchedCount:  result.MatchedCount,
-				ModifiedCount: result.ModifiedCount,
-				UpsertedCount: result.UpsertedCount,
-				Errors:        make([]SinkError, len(result.Errors)),
+
+	// ── WRITE PATH: Only initialize if both Sink and WriteContract are present ──
+	// No mutual exclusion enforcement. If only one is provided, the engine
+	// simply won't start, and Write() will return ErrWriteNotConfigured at call time.
+	if b.sk != nil && b.writeContract != nil {
+		if err := b.sk.Ping(ctx); err != nil {
+			return nil, fmt.Errorf("sluice: sink ping failed: %w", err)
+		}
+
+		if b.callback != nil {
+			wrappedCb = func(keys []string, result *sink.BulkWriteResult, err error) {
+				pubResult := &BulkWriteResult{
+					InsertedCount: result.InsertedCount,
+					MatchedCount:  result.MatchedCount,
+					ModifiedCount: result.ModifiedCount,
+					UpsertedCount: result.UpsertedCount,
+					Errors:        make([]SinkError, len(result.Errors)),
+				}
+				for i, se := range result.Errors {
+					pubResult.Errors[i] = SinkError{CorrelationKey: se.CorrelationKey, Code: se.Code, Err: se.Err}
+				}
+				b.callback(keys, pubResult, err)
 			}
-			for i, se := range result.Errors {
-				pubResult.Errors[i] = SinkError{CorrelationKey: se.CorrelationKey, Code: se.Code, Err: se.Err}
+		}
+
+		wrappedContract := func(correlationKey string, payload []byte) (*sink.WriteModel, error) {
+			wm, err := b.writeContract(correlationKey, payload)
+			if err != nil {
+				return nil, err
 			}
-			b.callback(keys, pubResult, err)
+			return &sink.WriteModel{
+				CorrelationKey: "",
+				Filter:         wm.Filter,
+				Update:         wm.Update,
+				Upsert:         wm.Upsert,
+			}, nil
+		}
+
+		eng = engine.New(b.cfg.toInternal(), sh, b.sk, wrappedContract, metrics, wrappedCb)
+		eng.Start()
+
+		if b.cfg.BatchedWrites {
+			sh.EnableBatching(b.cfg.WriteBatchSize, b.cfg.WriteBatchWindow)
+			sh.SetVolumeSignaler(func(band int) { eng.SignalVolume(band) })
+			sh.StartBatcher(ctx)
 		}
 	}
 
-	// Wrap contract to convert public WriteModel to sink.WriteModel
-	wrappedContract := func(correlationKey string, payload []byte) (*sink.WriteModel, error) {
-		wm, err := b.writeContract(correlationKey, payload)
-		if err != nil {
-			return nil, err
-		}
-		return &sink.WriteModel{
-			CorrelationKey: "", // not used in flush path
-			Filter:         wm.Filter,
-			Update:         wm.Update,
-			Upsert:         wm.Upsert,
-		}, nil
+	s := &Sluice{
+		cfg:               b.cfg,
+		shield:            sh,
+		engine:            eng, // nil if write path not configured
+		sk:                b.sk,
+		src:               b.src,
+		writeContract:     b.writeContract,
+		readContract:      b.readContract,
+		indexContract:     b.indexContract,
+		readBulkContract:  b.readBulkContract,
+		indexBulkContract: b.indexBulkContract,
+		metrics:           metrics,
 	}
-	eng := engine.New(b.cfg.toInternal(), sh, b.sk, wrappedContract, metrics, wrappedCb)
-	eng.Start()
-
-	// Enable batched writes if configured.
-	if b.cfg.BatchedWrites {
-		sh.EnableBatching(b.cfg.WriteBatchSize, b.cfg.WriteBatchWindow)
-		sh.SetVolumeSignaler(func(band int) { eng.SignalVolume(band) })
-		sh.StartBatcher(ctx)
-	}
-
-	s := &Sluice{cfg: b.cfg, shield: sh, engine: eng, sk: b.sk, src: b.src, writeContract: b.writeContract, metrics: metrics}
 
 	// ── L1 Local Journal (opt-in, default-off) ────────────────────────────
 	// ── L1 Local Journal (opt-in, default-off) ────────────────────────────
@@ -233,7 +249,7 @@ func (b *Builder) Build(ctx context.Context) (*Sluice, error) {
 			}
 
 			s.shield.EnableBroadcast(shield.BroadcastConfig{
-				Mode:   shield.BroadcastMode(b.localCacheCfg.Broadcast),
+				Mode:   b.localCacheCfg.Broadcast,
 				MaxLen: b.localCacheCfg.Retention,
 			})
 
@@ -265,12 +281,6 @@ func (b *Builder) Build(ctx context.Context) (*Sluice, error) {
 func (b *Builder) validate() error {
 	if b.cfg.Namespace == "" {
 		return ErrMissingNamespace
-	}
-	if b.sk == nil {
-		return ErrMissingSink
-	}
-	if b.writeContract == nil {
-		return ErrMissingContract
 	}
 	if len(b.cfg.Redis.Addrs) == 0 {
 		return ErrMissingRedis
@@ -551,7 +561,10 @@ func (s *Sluice) HotLoad(ctx context.Context, correlationKey string) error {
 	if s.closed.Load() {
 		return ErrLibraryClosed
 	}
-	if s.src == nil || s.cfg.ReadContract == nil {
+	if s.src == nil {
+		return ErrMissingSource
+	}
+	if s.cfg.ReadContract == nil {
 		return ErrMissingReadContract
 	}
 
@@ -624,6 +637,12 @@ func (s *Sluice) HotLoad(ctx context.Context, correlationKey string) error {
 func (s *Sluice) Write(ctx context.Context, correlationKey string, payload []byte) error {
 	if s.closed.Load() {
 		return ErrLibraryClosed
+	}
+	if s.writeContract == nil {
+		return ErrMissingWriteContract
+	}
+	if s.sk == nil {
+		return ErrMissingSink
 	}
 	if correlationKey == "" {
 		return ErrEmptyCorrelationKey
@@ -709,6 +728,13 @@ func (s *Sluice) WriteIdempotent(ctx context.Context, correlationKey string, pay
 	if s.closed.Load() {
 		return ErrLibraryClosed
 	}
+	if s.writeContract == nil {
+		return ErrMissingWriteContract
+	}
+	if s.sk == nil {
+		return ErrMissingSink
+	}
+
 	if correlationKey == "" || idempotencyKey == "" {
 		return ErrEmptyCorrelationKey
 	}
@@ -785,13 +811,9 @@ func (s *Sluice) Query(ctx context.Context, q Query) ([]QueryResult, error) {
 // DrainAndClose flushes all remaining dirty keys, stops band goroutines,
 // and releases Redis and sink connections. Call exactly once during shutdown.
 func (s *Sluice) DrainAndClose(ctx context.Context) error {
-	// Stop the broadcast subscriber BEFORE the engine drains: no new L1
-	// Puts should arrive while the journal is being flushed to the sink.
-	// Bounded by the subscriber's BlockMS + processing time.
 	if s.broadcastSub != nil {
 		s.broadcastSub.Stop()
 	}
-
 	if !s.closed.CompareAndSwap(false, true) {
 		return nil
 	}
@@ -799,13 +821,22 @@ func (s *Sluice) DrainAndClose(ctx context.Context) error {
 		s.dlqCancel()
 		<-s.dlqDone
 	}
-	// Stop the batcher first so all in-flight writes land in Redis before drain.
-	s.shield.StopBatcher()
-	s.engine.DrainAndStop()
+
+	if s.engine != nil {
+		if s.cfg.BatchedWrites {
+			s.shield.StopBatcher()
+		}
+		s.engine.DrainAndStop()
+	}
+
 	if err := s.shield.Close(); err != nil {
 		return fmt.Errorf("sluice: redis close: %w", err)
 	}
-	return s.sk.Close(ctx)
+
+	if s.sk != nil {
+		return s.sk.Close(ctx)
+	}
+	return nil
 }
 
 // ── DLQ Processing ──────────────────────────────────────────────────────────
@@ -839,6 +870,13 @@ func DefaultKeyMutator(oldKey string) string {
 func (s *Sluice) ProcessDLQ(ctx context.Context, strategy DLQStrategy, opts ...DLQOption) (*DLQResult, error) {
 	if s.closed.Load() {
 		return nil, ErrLibraryClosed
+	}
+
+	if s.writeContract == nil {
+		return nil, ErrMissingWriteContract
+	}
+	if s.sk == nil {
+		return nil, ErrMissingSink
 	}
 
 	o := &dlqOptions{maxBatchSize: s.cfg.MaxBatchSize}

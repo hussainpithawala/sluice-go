@@ -43,9 +43,13 @@ func main() {
 	client, err := mongo.Connect(ctx, options.Client().ApplyURI(mongoURI))
 	if err != nil {
 		log.Error("failed to connect to mongo", "err", err)
-		os.Exit(1)
 	}
-	defer client.Disconnect(ctx)
+	defer func(client *mongo.Client, ctx context.Context) {
+		err := client.Disconnect(ctx)
+		if err != nil {
+			slog.Error(fmt.Sprintf("An error occurred while disconnecting the client %e", err))
+		}
+	}(client, ctx)
 
 	coll := client.Database(dbName).Collection(collName)
 	_ = coll.Drop(ctx)
@@ -64,13 +68,17 @@ func main() {
 	_, _ = coll.InsertMany(ctx, docs)
 	log.Info("seeded 5 campaigns for user_123")
 
-	// 2. Initialize Sluice
 	sk, err := docdb.New(ctx, docdb.Config{
 		URI: mongoURI, Database: dbName, Collection: collName,
 		MaxPoolSize: 100, MinPoolSize: 10,
 	})
+	if err != nil {
+		slog.Error(fmt.Sprintf("Error while creating the doc-db sink %e", err))
+	}
+
 	src := sourcedocdb.NewSourceWithClient(client, dbName, collName)
 
+	// 2. Initialize Sluice
 	sl, err := sluice.New("bulk_read_demo").
 		WithRedis(sluice.RedisConfig{Addrs: []string{getEnv("REDIS_ADDRS", "localhost:6379")}}).
 		WithSink(sk).
@@ -120,9 +128,13 @@ func main() {
 		Build(ctx)
 	if err != nil {
 		log.Error("failed to build sluice", "err", err)
-		os.Exit(1)
 	}
-	defer sl.DrainAndClose(ctx)
+	defer func(sl *sluice.Sluice, ctx context.Context) {
+		err := sl.DrainAndClose(ctx)
+		if err != nil {
+			slog.Error(fmt.Sprintf("An error occurred while sluice drain-and-close %e", err))
+		}
+	}(sl, ctx)
 
 	// 3. Execute Bulk Read
 	log.Info("executing ReadBulk for user_123...")
@@ -130,7 +142,6 @@ func main() {
 	payloads, err := sl.ReadBulk(ctx, "user_123")
 	if err != nil {
 		log.Error("ReadBulk failed", "err", err)
-		os.Exit(1)
 	}
 	log.Info("ReadBulk completed", "duration_ms", time.Since(start).Milliseconds(), "items_loaded", len(payloads))
 

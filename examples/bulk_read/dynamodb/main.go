@@ -134,9 +134,13 @@ func main() {
 		Build(ctx)
 	if err != nil {
 		log.Error("failed to build sluice", "err", err)
-		os.Exit(1)
 	}
-	defer sl.DrainAndClose(ctx)
+	defer func(sl *sluice.Sluice, ctx context.Context) {
+		err := sl.DrainAndClose(ctx)
+		if err != nil {
+			slog.Error(fmt.Sprintf("An error occurred while sluice drain-and-close %e", err))
+		}
+	}(sl, ctx)
 
 	// 3. Execute Bulk Read
 	log.Info("executing ReadBulk for user_123...")
@@ -144,7 +148,6 @@ func main() {
 	payloads, err := sl.ReadBulk(ctx, "user_123")
 	if err != nil {
 		log.Error("ReadBulk failed", "err", err)
-		os.Exit(1)
 	}
 	log.Info("ReadBulk completed", "duration_ms", time.Since(start).Milliseconds(), "items_loaded", len(payloads))
 

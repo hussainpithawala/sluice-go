@@ -2,8 +2,7 @@ package documentdb
 
 import (
 	"context"
-	"log"
-	"log/slog"
+	"encoding/json"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -13,12 +12,16 @@ import (
 	"github.com/hussainpithawala/sluice-go"
 	"github.com/hussainpithawala/sluice-go/internal/localjournal"
 	"github.com/hussainpithawala/sluice-go/internal/shield"
+	"github.com/hussainpithawala/sluice-go/sink/docdb"
+	"github.com/hussainpithawala/sluice-go/source"
+	sourcedocdb "github.com/hussainpithawala/sluice-go/source/docdb"
+	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.mongodb.org/mongo-driver/bson"
 )
 
 // ── Test Doubles ────────────────────────────────────────────────────────────
-
 // countingRecorder is a minimal MetricsRecorder that counts L1 events.
 // It satisfies the embedded localjournal.MetricsRecorder interface and
 // stubs every other method so it compiles against the full interface.
@@ -44,12 +47,14 @@ func (r *countingRecorder) RecordLocalCacheHit(string) {
 	r.hits++
 	r.mu.Unlock()
 }
+
 func (r *countingRecorder) RecordLocalCacheMiss(_ string, reason localjournal.MissReason) {
 	r.mu.Lock()
 	r.misses++
 	r.missReasons[string(reason)]++
 	r.mu.Unlock()
 }
+
 func (r *countingRecorder) RecordLocalSetSize(string, int) {
 	r.mu.Lock()
 	r.setSizeCalls++
@@ -91,7 +96,6 @@ func (r *countingRecorder) snapshot() (hits, misses int) {
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
-
 const l1TestDB = 15
 
 func l1RedisAddr() string {
@@ -101,53 +105,128 @@ func l1RedisAddr() string {
 	return "localhost:6379"
 }
 
-// buildTestSluice wires a minimal Sluice with a real shield (Redis on DB 15)
-// and an L1 cache. Adjust the field names to match your actual Sluice struct —
-// the public surface exercised here is only Write() and Read().
-func buildTestSluice(t *testing.T, namespace string, mode localjournal.LocalCacheMode, ttl time.Duration) (*sluice.Sluice, *countingRecorder, *shield.Shield) {
+// buildTestSluice wires a REAL Sluice instance with a real DocumentDB sink/source
+// and an L1 cache. It uses the production Builder path to ensure no assumptions
+// are invalidated by test-specific wiring.
+func buildTestSluice(t *testing.T, namespace string, mode localjournal.LocalCacheMode, ttl time.Duration) (*sluice.Sluice, *countingRecorder) {
 	t.Helper()
 
-	sh, err := shield.New(shield.RedisConfig{
-		Addrs:        []string{l1RedisAddr()},
-		ClusterMode:  false,
-		DB:           l1TestDB,
-		DialTimeout:  5 * time.Second,
-		ReadTimeout:  3 * time.Second,
-		WriteTimeout: 3 * time.Second,
-		PoolSize:     10,
-	}, namespace, 16, 30*time.Second, 4*time.Hour)
-	require.NoError(t, err, "shield.New")
+	mongoURI := os.Getenv("MONGO_URI")
+	if mongoURI == "" {
+		mongoURI = "mongodb://localhost:27017"
+	}
 
-	// Isolate: wipe the dedicated test DB
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	dbName := "sluice_l1_test_" + namespace
+	collName := "nudge_inventory"
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	require.NoError(t, sh.Client().FlushDB(ctx).Err())
 
+	// 1. Setup Real DocumentDB Sink
+	sk, err := docdb.New(ctx, docdb.Config{
+		URI:         mongoURI,
+		Database:    dbName,
+		Collection:  collName,
+		MaxPoolSize: 10,
+		MinPoolSize: 2,
+	})
+	require.NoError(t, err, "docdb.New sink")
+
+	// 2. Setup Real DocumentDB Source (sharing the same client)
+	src := sourcedocdb.NewSourceWithClient(sk.Client(), dbName, collName)
+
+	// 3. Define Real Contracts
+	writeContract := func(correlationKey string, payload []byte) (*sluice.WriteModel, error) {
+		var doc map[string]any
+		if err := json.Unmarshal(payload, &doc); err != nil {
+			// Fallback for raw byte payloads used in tests
+			doc = map[string]any{"raw": string(payload)}
+		}
+		return &sluice.WriteModel{
+			Filter: bson.D{{Key: "_id", Value: correlationKey}},
+			Update: bson.D{{Key: "$set", Value: doc}},
+			Upsert: true,
+		}, nil
+	}
+
+	readContract := func(correlationKey string) (*source.ReadModel, error) {
+		return &source.ReadModel{
+			Filter: bson.D{{Key: "_id", Value: correlationKey}},
+		}, nil
+	}
+
+	// 4. Setup Metrics Recorder
 	rec := newCountingRecorder()
 
-	var local *localjournal.Cache
+	// 5. Isolate Redis DB before building
+	redisClient := redis.NewClient(&redis.Options{Addr: l1RedisAddr(), DB: l1TestDB})
+	require.NoError(t, redisClient.FlushDB(ctx).Err())
+	_ = redisClient.Close()
+
+	// 6. Build Sluice using the PRODUCTION Builder path
+	builder := sluice.New(namespace).
+		WithRedis(sluice.RedisConfig{
+			Addrs:        []string{l1RedisAddr()},
+			ClusterMode:  false,
+			DB:           l1TestDB,
+			DialTimeout:  5 * time.Second,
+			ReadTimeout:  3 * time.Second,
+			WriteTimeout: 3 * time.Second,
+			PoolSize:     10,
+		}).
+		WithSink(sk).
+		WithSource(src).
+		WithWriteContract(writeContract).
+		WithReadContract(readContract).
+		WithFlushWindow(250 * time.Millisecond).
+		WithMaxBatchSize(1000).
+		WithBandCount(16).
+		WithKeyTTL(30 * time.Second).
+		WithActivityWindow(4 * time.Hour).
+		WithMetrics(rec)
+
 	if mode != localjournal.LocalCacheOff {
-		local = localjournal.New(localjournal.Config{
-			Namespace:  namespace,
+		builder = builder.WithLocalCache(localjournal.LocalCacheConfig{
+			Mode:       mode,
 			MaxEntries: 1024,
 			LocalTTL:   ttl,
-			Metrics:    rec,
 		})
 	}
 
-	// Construct via your builder if Build() supports injecting a pre-built
-	// shield; otherwise assemble the struct directly. The fields below must
-	// match your sluice.Sluice definition:
+	sl, err := builder.Build(ctx)
+	require.NoError(t, err, "sluice.Build")
 
-	s := sluice.NewForTest(sluice.TestConfig{
-		Namespace: namespace,
-		Shield:    sh,
-		Local:     local,
-		Metrics:   rec,
-		// HotAwareFlush, ActivityWindow etc. default to safe zero values
+	// Cleanup
+	t.Cleanup(func() {
+		shutCtx, shutCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer shutCancel()
+		_ = sl.DrainAndClose(shutCtx)
+
+		// Drop the test MongoDB database
+		_ = sk.Client().Database(dbName).Drop(context.Background())
+		_ = sk.Close(context.Background())
 	})
 
-	return s, rec, sh
+	return sl, rec
+}
+
+// verifyJournalPayload uses a temporary shield instance to verify the L2 journal state.
+func verifyJournalPayload(t *testing.T, namespace, key string, expectedPayload []byte) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	verifyShield, err := shield.New(shield.RedisConfig{
+		Addrs: []string{l1RedisAddr()}, ClusterMode: false, DB: l1TestDB,
+	}, namespace, 16, 30*time.Second, 4*time.Hour)
+	require.NoError(t, err)
+	defer verifyShield.Close()
+
+	jr, err := verifyShield.ReadJournal(ctx, key)
+	require.NoError(t, err)
+	require.True(t, jr.Found, "payload must be journaled in L2")
+	assert.Equal(t, expectedPayload, jr.Payload)
+	assert.Positive(t, jr.Version, "journal must carry a UnixMilli version")
 }
 
 // ── The Proof ───────────────────────────────────────────────────────────────
@@ -159,22 +238,11 @@ func buildTestSluice(t *testing.T, namespace string, mode localjournal.LocalCach
 //     a. RecordLocalCacheHit fires exactly once.
 //     b. NO Redis "read"-class op fires (ReadJournal is never called).
 //     c. The returned payload is byte-identical to what was written.
-//
-// This is the strongest form of the assertion: a positive metric signal AND
-// a negative network signal, both observed independently.
 func TestL1_WriteThenRead_HitsL1(t *testing.T) {
-	s, rec, sh := buildTestSluice(t, "test_l1_write_read", localjournal.LocalCacheLazy, 60*time.Second)
-	defer func(sh *shield.Shield) {
-		err := sh.Close()
-		if err != nil {
-			slog.Info("close the shield")
-		}
-	}(sh)
-
+	s, rec := buildTestSluice(t, "test_l1_write_read", localjournal.LocalCacheLazy, 60*time.Second)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	// Spy: count every Redis op classified as a read.
 	var redisReads int64
 	rec.redisOpHook = func(op string) {
 		if op == "read" || op == "readjournal" {
@@ -189,11 +257,7 @@ func TestL1_WriteThenRead_HitsL1(t *testing.T) {
 	require.NoError(t, s.Write(ctx, key, payload), "Write must succeed")
 
 	// Sanity: the write reached Redis (the source of truth)
-	jr, err := sh.ReadJournal(ctx, key)
-	require.NoError(t, err)
-	require.True(t, jr.Found, "payload must be journaled in L2")
-	require.Equal(t, payload, jr.Payload)
-	require.Positive(t, jr.Version, "journal must carry a UnixMilli version")
+	verifyJournalPayload(t, "test_l1_write_read", key, payload)
 
 	// ── Act 2: Read (should hit L1, never touch Redis) ───────────────────
 	got, err := s.Read(ctx, key)
@@ -213,14 +277,7 @@ func TestL1_WriteThenRead_HitsL1(t *testing.T) {
 // TestL1_SecondRead_AlsoHitsL1 proves repeated reads stay in L1 and that the
 // hit counter monotonically increments (no silent fall-through).
 func TestL1_SecondRead_AlsoHitsL1(t *testing.T) {
-	s, rec, sh := buildTestSluice(t, "test_l1_repeat_read", localjournal.LocalCacheLazy, 60*time.Second)
-	defer func(sh *shield.Shield) {
-		err := sh.Close()
-		if err != nil {
-			slog.Info("Unable to close")
-		}
-	}(sh)
-
+	s, rec := buildTestSluice(t, "test_l1_repeat_read", localjournal.LocalCacheLazy, 60*time.Second)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -248,14 +305,7 @@ func TestL1_SecondRead_AlsoHitsL1(t *testing.T) {
 // TestL1_OffMode_BehavesLikeV107 proves the zero-behaviour-change guarantee:
 // with Mode=Off, every Read falls through to L2 and no L1 metric ever fires.
 func TestL1_OffMode_BehavesLikeV107(t *testing.T) {
-	s, rec, sh := buildTestSluice(t, "test_l1_off", localjournal.LocalCacheOff, 0)
-	defer func(sh *shield.Shield) {
-		err := sh.Close()
-		if err != nil {
-			log.Fatal("Unable to close the suite")
-		}
-	}(sh)
-
+	s, rec := buildTestSluice(t, "test_l1_off", localjournal.LocalCacheOff, 0)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -283,14 +333,7 @@ func TestL1_OffMode_BehavesLikeV107(t *testing.T) {
 // when an L1 entry expires, Read() falls through to ReadJournal, re-heals L1
 // with the journal's authoritative version, and subsequent reads hit L1 again.
 func TestL1_TTLExpiry_FallsThroughToL2AndHeals(t *testing.T) {
-	s, rec, sh := buildTestSluice(t, "test_l1_expiry", localjournal.LocalCacheLazy, 50*time.Millisecond)
-	defer func(sh *shield.Shield) {
-		err := sh.Close()
-		if err != nil {
-			slog.Info("Unable to close")
-		}
-	}(sh)
-
+	s, rec := buildTestSluice(t, "test_l1_expiry", localjournal.LocalCacheLazy, 50*time.Millisecond)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -350,6 +393,7 @@ func TestL1_StaleVersion_RejectedByPut(t *testing.T) {
 
 	// Older version must be rejected
 	assert.False(t, cache.Put(key, []byte("old"), 100), "v100 must be rejected")
+
 	// Equal version must also be rejected (strict >)
 	assert.False(t, cache.Put(key, []byte("same"), 200), "equal version rejected")
 

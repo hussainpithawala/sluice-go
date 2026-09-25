@@ -44,12 +44,16 @@ func main() {
 	pool, err := pgxpool.New(ctx, postgresURI)
 	if err != nil {
 		log.Error("failed to connect to postgres", "err", err)
-		os.Exit(1)
 	}
 	defer pool.Close()
 
 	// Create table and seed data
-	_, _ = pool.Exec(ctx, fmt.Sprintf(`DROP TABLE IF EXISTS %s`, tableName))
+	_, err = pool.Exec(ctx, fmt.Sprintf(`DROP TABLE IF EXISTS %s`, tableName))
+	if err != nil {
+		slog.Error(fmt.Sprintf("Error while dropping table %s", tableName))
+		return
+	}
+
 	_, err = pool.Exec(ctx, fmt.Sprintf(`
 		CREATE TABLE %s (
 			id TEXT PRIMARY KEY,
@@ -60,6 +64,11 @@ func main() {
 		)
 	`, tableName))
 
+	if err != nil {
+		slog.Error(fmt.Sprintf("Error while creating table %s", tableName))
+		return
+	}
+
 	// Seed 5 campaigns for user_123
 	for i := 1; i <= 5; i++ {
 		_, _ = pool.Exec(ctx, fmt.Sprintf(`
@@ -69,8 +78,13 @@ func main() {
 	}
 	log.Info("seeded 5 campaigns for user_123")
 
+	collectionName := "nudge_inventory"
 	// 2. Initialize Sluice
-	sk, err := pgsink.New(ctx, pgsink.DefaultConfig(postgresURI, "nudge_inventory"))
+	sk, err := pgsink.New(ctx, pgsink.DefaultConfig(postgresURI, collectionName))
+	if err != nil {
+		slog.Error(fmt.Sprintf("Error while preparing the sink %s", collectionName))
+		return
+	}
 	src := pgsource.NewSourceWithPool(pool)
 
 	sl, err := sluice.New("bulk_read_demo").
@@ -124,9 +138,13 @@ func main() {
 		Build(ctx)
 	if err != nil {
 		log.Error("failed to build sluice", "err", err)
-		os.Exit(1)
 	}
-	defer sl.DrainAndClose(ctx)
+	defer func(sl *sluice.Sluice, ctx context.Context) {
+		err := sl.DrainAndClose(ctx)
+		if err != nil {
+			slog.Error(fmt.Sprintf("An error occurred while sluice drain-and-close %e", err))
+		}
+	}(sl, ctx)
 
 	// 3. Execute Bulk Read
 	log.Info("executing ReadBulk for user_123...")
@@ -134,7 +152,6 @@ func main() {
 	payloads, err := sl.ReadBulk(ctx, "user_123")
 	if err != nil {
 		log.Error("ReadBulk failed", "err", err)
-		os.Exit(1)
 	}
 	log.Info("ReadBulk completed", "duration_ms", time.Since(start).Milliseconds(), "items_loaded", len(payloads))
 
