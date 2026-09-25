@@ -69,6 +69,49 @@ test-integration: docker-up ## Run integration tests
 	$(GOTEST) -v -race -count=1 -timeout=300s -tags=integration \
 		./tests/integration/... 2>&1 | tee /tmp/sluice-integration.log
 
+# List all discoverable examples (excluding separate reader/writer processes)
+.PHONY: list-examples
+list-examples:
+	@echo "📋 Discoverable examples:"
+	@find examples -name "main.go" -type f | grep -v "/reader/" | grep -v "/writer/" | sort | sed 's/\/main.go//'
+
+# Run all examples sequentially with default local environment variables.
+# Note: Some examples (like nudge) run indefinitely until interrupted (SIGINT/Ctrl+C).
+# Press Ctrl+C to stop the current example.
+.PHONY: run-examples
+run-examples:
+	@echo "🚀 Running all examples in ./examples/..."
+	@export MONGO_URI=$${MONGO_URI:-mongodb://localhost:27017}; \
+	export DYNAMODB_ENDPOINT=$${DYNAMODB_ENDPOINT:-http://localhost:8000}; \
+	export POSTGRES_URI=$${POSTGRES_URI:-postgres://sluice:sluice@localhost:5432/sluice_test?sslmode=disable}; \
+	export REDIS_ADDR=$${REDIS_ADDR:-localhost:6379}; \
+	export REDIS_ADDRS=$${REDIS_ADDRS:-localhost:6379}; \
+	export REDIS_CLUSTER_MODE=$${REDIS_CLUSTER_MODE:-false}; \
+	for f in $$(find examples -name "main.go" -type f | grep -v "/reader/" | grep -v "/writer/" | sort); do \
+		dir=$$(dirname "$$f"); \
+		echo ""; \
+		echo "======================================================================"; \
+		echo "▶️  Running: $$dir"; \
+		echo "======================================================================"; \
+		go run "./$$dir" || exit 1; \
+	done
+
+# Run a specific example directory.
+# Usage: make run-example DIR=examples/nudge/documentdb
+.PHONY: run-example
+run-example:
+ifndef DIR
+	$(error DIR is not set. Usage: make run-example DIR=examples/nudge/documentdb)
+endif
+	@echo "▶️  Running: $(DIR)"
+	@MONGO_URI=$${MONGO_URI:-mongodb://localhost:27017} \
+	DYNAMODB_ENDPOINT=$${DYNAMODB_ENDPOINT:-http://localhost:8000} \
+	POSTGRES_URI=$${POSTGRES_URI:-postgres://sluice:sluice@localhost:5432/sluice_test?sslmode=disable} \
+	REDIS_ADDR=$${REDIS_ADDR:-localhost:6379} \
+	REDIS_ADDRS=$${REDIS_ADDRS:-localhost:6379} \
+	REDIS_CLUSTER_MODE=$${REDIS_CLUSTER_MODE:-false} \
+	go run "./$(DIR)"
+
 test-all: test-unit test-integration ## Run unit + integration then tear down
 	@$(MAKE) docker-down && printf "$(GREEN)▶ All tests passed.$(RESET)\n"
 
