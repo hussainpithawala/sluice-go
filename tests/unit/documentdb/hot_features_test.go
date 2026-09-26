@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/hussainpithawala/sluice-go/source"
+	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.mongodb.org/mongo-driver/bson"
@@ -262,4 +263,153 @@ func TestQuery_CompoundIndexes(t *testing.T) {
 	// Should find correlationKey_q3 (priority 3) but not correlationKey_q1 (priority 1).
 	assert.Len(t, results, 1)
 	assert.Equal(t, "correlationKey_q3", results[0].CorrelationKey)
+}
+
+// ─── Read-through hydration ──────────────────────────────────────────────────
+
+const hydrationBandCount = 2 // matches WithBandCount in the builders below
+
+// journalKeyExists reports whether the payload hash for key exists in any band.
+func journalKeyExists(t *testing.T, rc *redis.Client, ns, key string) bool {
+	t.Helper()
+	for band := 0; band < hydrationBandCount; band++ {
+		n, err := rc.Exists(context.Background(), shield.PayloadKey(ns, band, key)).Result()
+		require.NoError(t, err)
+		if n > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// isDirty reports whether key is pending flush in any band's dirty set.
+func isDirty(t *testing.T, rc *redis.Client, ns, key string) bool {
+	t.Helper()
+	for band := 0; band < hydrationBandCount; band++ {
+		_, err := rc.ZScore(context.Background(), shield.DirtyKey(ns, band), key).Result()
+		if err == nil {
+			return true
+		}
+		require.ErrorIs(t, err, redis.Nil)
+	}
+	return false
+}
+
+// TestRead_ColdFallbackHydratesWithoutDirtying proves a journal miss falls back
+// to the Source via WithReadContract, and that background hydration seeds the
+// journal without marking the key dirty (no write-back to the sink).
+func TestRead_ColdFallbackHydratesWithoutDirtying(t *testing.T) {
+	const ns = "cold_fallback_unit"
+	rc := redisClient(t)
+	ctx := context.Background()
+	cleanRedisKeys(t, rc, ns)
+	t.Cleanup(func() { cleanRedisKeys(t, rc, ns) })
+
+	coll := mongoCollectionForHotTest(t, "cold_fallback_docs")
+	sl := buildHotSluice(t, ns, coll)
+
+	const key = "cold_only_in_store"
+	_, err := coll.InsertOne(ctx, bson.M{"_id": key, "value": "from-store", "channel": "push", "priority": 1})
+	require.NoError(t, err)
+
+	payload, err := sl.Read(ctx, key)
+	require.NoError(t, err, "a journal miss must fall back to the Source")
+	assert.Contains(t, string(payload), "from-store")
+
+	require.Eventually(t, func() bool { return journalKeyExists(t, rc, ns, key) },
+		2*time.Second, 20*time.Millisecond, "cold read must hydrate the journal")
+	assert.False(t, isDirty(t, rc, ns, key), "hydrated keys must not be flushed back to the sink")
+
+	fresh, err := sl.ReadFresh(ctx, key)
+	require.NoError(t, err)
+	assert.Equal(t, payload, fresh, "subsequent reads are served from the hydrated journal")
+}
+
+// buildBulkSluice constructs a sluice instance with a DocumentDB ReadBulkContract
+// that loads every document for an owner, and a long flush window so writes stay
+// pending for the duration of the test.
+func buildBulkSluice(t *testing.T, ns string, coll *mongo.Collection) *sluice.Sluice {
+	t.Helper()
+	ctx := context.Background()
+	sk, err := docdb.New(ctx, docdb.Config{
+		URI: testMongoURI, Database: testDatabase, Collection: coll.Name(),
+		MaxPoolSize: 10, MinPoolSize: 1,
+	})
+	require.NoError(t, err)
+	src := sourcedocdb.NewSourceWithClient(sk.Client(), testDatabase, coll.Name())
+
+	sl, err := sluice.New(ns).
+		WithRedis(sluice.RedisConfig{Addrs: []string{testRedisAddr}}).
+		WithSink(sk).
+		WithSource(src).
+		WithWriteContract(hotContract).
+		WithReadBulkContract(func(owner string) (*source.BulkReadModel, error) {
+			return &source.BulkReadModel{Query: sourcedocdb.DocDBBulkReadModel{
+				Filter: bson.M{"owner": owner},
+				Projector: func(cursor *mongo.Cursor) ([]source.BulkReadResult, error) {
+					var out []source.BulkReadResult
+					for cursor.Next(ctx) {
+						var doc bson.M
+						if err := cursor.Decode(&doc); err != nil {
+							return nil, err
+						}
+						p, err := bson.MarshalExtJSON(doc, false, false)
+						if err != nil {
+							return nil, err
+						}
+						out = append(out, source.BulkReadResult{CorrelationKey: doc["_id"].(string), Payload: p})
+					}
+					return out, cursor.Err()
+				},
+			}}, nil
+		}).
+		WithFlushWindow(time.Minute).
+		WithMaxBatchSize(1000).
+		WithBandCount(hydrationBandCount).
+		WithKeyTTL(2 * time.Minute).
+		Build(ctx)
+	require.NoError(t, err)
+
+	t.Cleanup(func() {
+		closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = sl.DrainAndClose(closeCtx)
+	})
+	return sl
+}
+
+// TestReadBulk_PreservesPendingWrite proves ReadBulk never overwrites a journal
+// entry with stale store data: a pending Write() wins and is returned, while
+// journal misses are hydrated without being marked dirty.
+func TestReadBulk_PreservesPendingWrite(t *testing.T) {
+	const ns = "bulk_pending_unit"
+	rc := redisClient(t)
+	ctx := context.Background()
+	cleanRedisKeys(t, rc, ns)
+	t.Cleanup(func() { cleanRedisKeys(t, rc, ns) })
+
+	coll := mongoCollectionForHotTest(t, "bulk_pending_docs")
+	sl := buildBulkSluice(t, ns, coll)
+
+	_, err := coll.InsertMany(ctx, []interface{}{
+		bson.M{"_id": "bulk_written", "owner": "u1", "value": "stale"},
+		bson.M{"_id": "bulk_store_only", "owner": "u1", "value": "from-store"},
+	})
+	require.NoError(t, err)
+
+	pending := mustHotPayload(t, "fresh", "push", 9)
+	require.NoError(t, sl.Write(ctx, "bulk_written", pending))
+
+	payloads, err := sl.ReadBulk(ctx, "u1")
+	require.NoError(t, err)
+	require.Len(t, payloads, 2)
+	assert.Equal(t, pending, payloads["bulk_written"], "a pending write must win over stale store data")
+	assert.Contains(t, string(payloads["bulk_store_only"]), "from-store")
+
+	got, err := sl.ReadFresh(ctx, "bulk_written")
+	require.NoError(t, err)
+	assert.Equal(t, pending, got, "the journal must still hold the pending write")
+
+	assert.True(t, isDirty(t, rc, ns, "bulk_written"), "the pending write must stay dirty")
+	assert.False(t, isDirty(t, rc, ns, "bulk_store_only"), "bulk-hydrated keys must not be flushed back to the sink")
 }

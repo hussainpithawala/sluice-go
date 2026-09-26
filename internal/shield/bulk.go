@@ -8,35 +8,6 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// BulkJournalItem represents a single item to be written to the journal in bulk.
-type BulkJournalItem struct {
-	CorrelationKey string
-	Payload        []byte
-}
-
-// BulkWriteJournal writes multiple payloads to the Redis journal in a single pipeline.
-// It sets the payload, timestamp, and extends the TTL to the provided duration.
-func (s *Shield) BulkWriteJournal(ctx context.Context, items []BulkJournalItem, ts float64, ttl time.Duration) error {
-	if len(items) == 0 {
-		return nil
-	}
-
-	pipe := s.client.Pipeline()
-	for _, item := range items {
-		band := s.BandFor(item.CorrelationKey)
-		key := PayloadKey(s.namespace, band, item.CorrelationKey)
-
-		pipe.HSet(ctx, key, map[string]interface{}{
-			"p":  item.Payload,
-			"ts": ts,
-		})
-		pipe.Expire(ctx, key, ttl)
-	}
-
-	_, err := pipe.Exec(ctx)
-	return err
-}
-
 // BulkIndexItem represents the index fields for a single correlation key.
 type BulkIndexItem struct {
 	CorrelationKey string

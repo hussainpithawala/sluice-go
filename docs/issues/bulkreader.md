@@ -80,7 +80,7 @@ When the application calls `sluice.ReadBulk(ctx, "user_123")`:
 2. **L3 Bulk Fallback:** `sluice` invokes the `ReadBulkContract("user_123")` and the adapter executes the `Query` with `Args` exactly once.
 3. **Projection:** The `Projector` iterates over the rows, building a `[]source.BulkReadResult`.
 4. **Atomic Journal Hydration (Shield Delegation):** `sluice` takes the returned slice and delegates all Redis operations to the `shield` package:
-    * Calls `shield.BulkWriteJournal` to write all payloads to the L2 Redis journal via a single pipeline, using the **pre-query `bulkTs`** as the version timestamp.
+    * Calls `shield.BulkHydrateJournal` to hydrate the L2 Redis journal via a single pipeline, using the **pre-query `bulkTs`** as the version timestamp. Hydration only fills journal misses and never marks keys dirty; keys already in the journal keep their (newer) entry, which is returned to the caller instead of the store payload.
     * Calls `shield.BulkUpdateIndexes` (if `IndexBulkContract` is configured) to pipeline all `SADD`/`ZADD` operations to Redis in one go.
 5. **L1 Hydration:** Writes all payloads to the L1 local cache using the same `bulkTs`.
 6. **Return:** `sluice` returns a `map[string][]byte` to the caller, containing the fully hydrated working set.
@@ -138,7 +138,7 @@ Configured with only `Source`, `ReadBulkContract`, and `IndexBulkContract`. Runs
 2. **Pre-Query Timestamp Discipline:** `ReadBulk` must use the timestamp captured *before* the LTS query execution for L1/L2 hydration. This preserves causality with concurrent `Write()` operations.
 3. **Fire-and-Forget `HotLoad`:** `HotLoad` returns `error` (not `([]byte, error)`). It is a command to promote a key to hot status, not a query. Callers needing the payload immediately should call `Read()` after `HotLoad()`.
 4. **Asynchronous Read-Through Hydration:** Cold reads and `HotLoad` hydrate the L1/L2 journals and indexes asynchronously to prevent blocking the critical read path. Index maintenance remains best-effort and eventually consistent.
-5. **Strict Shield Delegation:** The core `Sluice` struct acts purely as an orchestrator. All Redis key formatting, hashing, and pipeline execution for bulk operations are strictly delegated to the `shield` package (`BulkWriteJournal`, `BulkUpdateIndexes`, `BulkGetTTL`).
+5. **Strict Shield Delegation:** The core `Sluice` struct acts purely as an orchestrator. All Redis key formatting, hashing, and pipeline execution for bulk operations are strictly delegated to the `shield` package (`BulkHydrateJournal`, `BulkUpdateIndexes`, `BulkGetTTL`).
 6. **No Unbounded Result Sets (Operator Responsibility):** `sluice` will not enforce hard limits on the `Projector` output. It is the operator's responsibility to bound their queries (e.g., `LIMIT 50`) and size their Redis `MaxEntries` accordingly.
 7. **Datastore Agnosticism Preserved:** The core `sluice` engine will never parse SQL or NoSQL query languages. It only sees `[]byte` payloads and `correlationKey`s. The adapter-specific `Projector` handles all datastore shaping.
 
@@ -159,7 +159,7 @@ Configured with only `Source`, `ReadBulkContract`, and `IndexBulkContract`. Runs
     * Implemented `dynamodbattribute` unmarshaling in `source/dynamodb`.
 
 * **Phase 3: Redis Pipeline Optimization & Shield Delegation ✅**
-    * Refactored the internal `shield` layer to support bulk `MSET` (`BulkWriteJournal`), bulk `SADD`/`ZADD` (`BulkUpdateIndexes`), and bulk `PTTL` (`BulkGetTTL`) pipelines.
+    * Refactored the internal `shield` layer to support bulk journal hydration (`BulkHydrateJournal`), bulk `SADD`/`ZADD` (`BulkUpdateIndexes`), and bulk `PTTL` (`BulkGetTTL`) pipelines.
     * Ensured `sluice_bulk.go` strictly delegates all Redis key formatting and pipeline execution to the `shield` package.
 
 * **Phase 4: Functional Examples ✅**

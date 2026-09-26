@@ -122,6 +122,9 @@ type Shield struct {
 	writeScript    *redis.Script
 	writeScriptSHA string // pre-loaded SHA; used by flushBatch to avoid sending script text each time
 
+	hydrateScript    *redis.Script
+	hydrateScriptSHA string // pre-loaded SHA; used by BulkHydrateJournal pipelines
+
 	// Batching fields — all nil/zero when batching is disabled.
 	batchCh        chan writeEntry
 	batchSize      int
@@ -147,6 +150,47 @@ type JournalRead struct {
 // atomicWriteLua handles content deduplication atomically without cjson.
 // Returns 0 if deduplicated (TTL refreshed), 1 if written.
 const atomicWriteLua = `redis.call('HSET', KEYS[1], 'p', ARGV[1], 'ts', ARGV[2]) redis.call('EXPIRE', KEYS[1], tonumber(ARGV[4])) redis.call('ZADD', KEYS[2], ARGV[2], ARGV[3]) return 1`
+
+// hydrateLua seeds the journal with a payload read from the Source, without
+// marking the key dirty (store data must never be flushed back to the sink).
+//
+// KEYS[1]=payload hash
+// ARGV[1]=payload, ARGV[2]=hydration ts (captured BEFORE the Source read),
+// ARGV[3]=ttl in ms
+//
+// Hydration only fills a journal miss. Every write lands in the journal
+// before the store, so an existing entry — pending flush, flushed, or
+// dead-lettered — is always at least as new as anything read from the
+// store, including a Write() that landed while the Source read was in flight.
+// A timestamp comparison alone is not enough: a flush can commit (clearing
+// the dirty marker) between the Source read and this script. The existing
+// entry is left untouched apart from an extend-only TTL bump.
+// Returns {1} if written, or {0, current payload, current ts} if skipped.
+const hydrateLua = `
+local ttl = tonumber(ARGV[3])
+local cur = redis.call('HMGET', KEYS[1], 'p', 'ts')
+if cur[1] then
+    local pttl = redis.call('PTTL', KEYS[1])
+    if pttl >= 0 and pttl < ttl then
+        redis.call('PEXPIRE', KEYS[1], ttl)
+    end
+    return {0, cur[1], cur[2] or '0'}
+end
+redis.call('HSET', KEYS[1], 'p', ARGV[1], 'ts', ARGV[2])
+redis.call('HDEL', KEYS[1], 'h')
+redis.call('PEXPIRE', KEYS[1], ttl)
+return {1}
+`
+
+// HydrateResult reports the outcome of a journal hydration.
+type HydrateResult struct {
+	// Written is true when the Source payload was stored in the journal.
+	Written bool
+	// Payload and Version are the journal's effective state after the call:
+	// the hydrated payload when Written, otherwise the newer entry that won.
+	Payload []byte
+	Version int64
+}
 
 const atomicDedupWriteLua = `
 local payloadKey = KEYS[1]

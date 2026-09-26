@@ -6,10 +6,13 @@ import (
 	"time"
 
 	"github.com/hussainpithawala/sluice-go/internal/shield"
+	"github.com/hussainpithawala/sluice-go/source"
 )
 
 // ReadBulk executes a set-based read operation, hydrating the L1/L2 journals
-// for all returned items in a single atomic Redis pipeline.
+// for all returned items in a single Redis pipeline. For keys already present
+// in the journal, the journal payload is returned instead of the Source
+// payload, preserving read-your-writes.
 func (s *Sluice) ReadBulk(ctx context.Context, lookupKey string) (map[string][]byte, error) {
 	payloads, _, err := s.ReadBulkWithTTL(ctx, lookupKey)
 	return payloads, err
@@ -35,7 +38,10 @@ func (s *Sluice) ReadBulkWithTTL(ctx context.Context, lookupKey string) (map[str
 		return nil, nil, fmt.Errorf("sluice: read bulk contract failed: %w", err)
 	}
 
-	// 2. Execute the adapter-specific bulk read
+	// 2. Execute the adapter-specific bulk read. The hydration ts is captured
+	//    BEFORE the query so any Write() landing while it is in flight carries
+	//    a newer ts and wins the L1 version gate.
+	bulkTs := time.Now().UnixMilli()
 	results, err := s.src.ReadBulk(ctx, *bulkModel)
 	if err != nil {
 		return nil, nil, fmt.Errorf("sluice: source read bulk failed: %w", err)
@@ -46,13 +52,10 @@ func (s *Sluice) ReadBulkWithTTL(ctx context.Context, lookupKey string) (map[str
 	}
 
 	// 3. Prepare data for bulk journal hydration
-	currentTs := float64(time.Now().UnixMilli())
 	journalItems := make([]shield.BulkJournalItem, 0, len(results))
-	payloadMap := make(map[string][]byte, len(results))
 	correlationKeys := make([]string, 0, len(results))
 
 	for _, res := range results {
-		payloadMap[res.CorrelationKey] = res.Payload
 		correlationKeys = append(correlationKeys, res.CorrelationKey)
 		journalItems = append(journalItems, shield.BulkJournalItem{
 			CorrelationKey: res.CorrelationKey,
@@ -60,15 +63,30 @@ func (s *Sluice) ReadBulkWithTTL(ctx context.Context, lookupKey string) (map[str
 		})
 	}
 
-	// 4. Delegate bulk L2 Journal hydration to the shield package
-	err = s.shield.BulkWriteJournal(ctx, journalItems, currentTs, s.cfg.ActivityWindow)
+	// 4. Delegate bulk L2 hydration to the shield package. Only journal misses
+	//    are filled; keys already in the journal (pending flush, flushed, or
+	//    dead-lettered) keep that newer entry, which is what we return and
+	//    mirror into L1.
+	hydrated, err := s.shield.BulkHydrateJournal(ctx, journalItems, bulkTs)
 	if err != nil {
 		return nil, nil, fmt.Errorf("sluice: bulk journal hydration failed: %w", err)
 	}
 
-	// 5. Delegate bulk secondary index updates to the shield package (if configured)
-	if s.indexBulkContract != nil {
-		indexMap, err := s.indexBulkContract(results)
+	payloadMap := make(map[string][]byte, len(results))
+	written := make([]source.BulkReadResult, 0, len(results))
+	for i, res := range results {
+		hr := hydrated[i]
+		payloadMap[res.CorrelationKey] = hr.Payload
+		if hr.Written {
+			written = append(written, res)
+		}
+	}
+
+	// 5. Delegate bulk secondary index updates to the shield package (if configured).
+	//    Only freshly hydrated items are indexed; winning journal entries were
+	//    already indexed by the write path.
+	if s.indexBulkContract != nil && len(written) > 0 {
+		indexMap, err := s.indexBulkContract(written)
 		if err != nil {
 			if s.metrics != nil {
 				s.metrics.RecordContractError(s.cfg.Namespace, lookupKey, fmt.Errorf("index bulk contract: %w", err))
@@ -91,9 +109,8 @@ func (s *Sluice) ReadBulkWithTTL(ctx context.Context, lookupKey string) (map[str
 
 	// 6. Hydrate L1 Local Cache (if enabled)
 	if s.local != nil {
-		tsInt := int64(currentTs)
-		for _, res := range results {
-			s.local.Put(res.CorrelationKey, res.Payload, tsInt)
+		for i, res := range results {
+			s.local.Put(res.CorrelationKey, hydrated[i].Payload, hydrated[i].Version)
 		}
 	}
 

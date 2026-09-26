@@ -35,9 +35,8 @@ type Sluice struct {
 	dlqCancel         context.CancelFunc
 	dlqDone           chan struct{}
 	// L1 Local Journal (nil if Mode == Off)
-	local         *localjournal.Cache
-	hotAwareFlush atomic.Bool
-	broadcastSub  *broadcast.Subscriber
+	local        *localjournal.Cache
+	broadcastSub *broadcast.Subscriber
 }
 
 // Builder assembles a Sluice instance with a fluent API.

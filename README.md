@@ -314,6 +314,19 @@ L1 cache (`Read`/`ReadOld` only — `ReadFresh` never touches L1), and the secon
 failures are reported through `RecordRedisOp` (`write_hydration`, `updateindexes_hydration`) and never
 surface on the read path.
 
+Hydration (here, in `HotLoad`, and in [`ReadBulk`](#bulk-reads--set-based-cache-pre-warming)) runs a
+dedicated Lua script with two guarantees:
+
+- **It only fills a journal miss.** Every write lands in the journal before the store, so an existing
+  entry — pending flush, already flushed, or dead-lettered — is always at least as new as anything read
+  from the store, including a `Write()` that landed while the store read was in flight. The existing
+  entry wins, and only its TTL is extended (never shortened).
+- **It never marks the key dirty.** Data read from the store is never flushed back to it, and
+  reader-only instances (which run no flush engine) never accumulate a dirty backlog.
+
+Hydrated entries live for `ActivityWindow`. Indexes are only updated when the store payload was
+actually written; a winning journal entry was already indexed by the write path.
+
 ### TTL mechanics
 
 - **Lazy refresh on read** — when `Read()` hits the journal and the remaining payload TTL has fallen
@@ -505,13 +518,14 @@ sequenceDiagram
 
     A->>S: ReadBulk(ctx, "user_123")
     S->>S: ReadBulkContract("user_123") → BulkReadModel
+    S->>S: bulkTs = now (captured before the query)
     S->>D: Source.ReadBulk — one query
     D-->>S: rows → Projector → []BulkReadResult
     rect rgb(240, 248, 255)
-        Note over S,R: shield.BulkWriteJournal — one pipeline
-        S->>R: HSET p, ts + EXPIRE ActivityWindow (× N)
+        Note over S,R: shield.BulkHydrateJournal — one pipeline
+        S->>R: hydrate script (× N): fill journal misses, keep existing entries
     end
-    S->>R: shield.BulkUpdateIndexes — SADD / ZADD (× N), one pipeline
+    S->>R: shield.BulkUpdateIndexes — SADD / ZADD for hydrated items, one pipeline
     S->>L1: Put (× N, version-gated)
     S->>R: shield.BulkGetTTL — PTTL (× N), one pipeline (ReadBulkWithTTL)
     S-->>A: map[correlationKey]payload
@@ -576,8 +590,13 @@ p, _ := sl.Read(ctx, "camp_3")
 
 ### Semantics
 
+- **Read-your-writes** — items already in the journal (e.g. a pending `Write()`) are never overwritten
+  with store data; `ReadBulk` returns the journal payload for them instead. Only journal misses are
+  hydrated, and hydrated keys are never marked dirty — see
+  [Asynchronous read-through hydration](#asynchronous-read-through-hydration).
 - **Residency** — bulk-hydrated payloads are written with an `ActivityWindow` TTL, the same as hot keys.
-- **Indexes are best-effort** — an `IndexBulkContract` error is reported via `RecordContractError` and a
+- **Indexes are best-effort** — `IndexBulkContract` receives only the items that were hydrated from
+  the store; a contract error is reported via `RecordContractError` and a
   pipeline failure via `RecordRedisOp("bulkupdateindexes")`; neither fails the `ReadBulk` call.
 - **TTL fallback** — if the `BulkGetTTL` pipeline fails, `ReadBulkWithTTL` reports `ActivityWindow` for
   every key rather than returning an error.

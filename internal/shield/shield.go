@@ -78,15 +78,22 @@ func New(cfg RedisConfig, namespace string, bandCount int, keyTTL time.Duration,
 		_ = client.Close()
 		return nil, fmt.Errorf("sluice/shield: script load: %w", err)
 	}
+	hydrateSHA, err := client.ScriptLoad(ctx, hydrateLua).Result()
+	if err != nil {
+		_ = client.Close()
+		return nil, fmt.Errorf("sluice/shield: hydrate script load: %w", err)
+	}
 	return &Shield{
-		client:         client,
-		namespace:      namespace,
-		bandCount:      bandCount,
-		keyTTL:         keyTTL,
-		activityWindow: activityWindow,
-		dlqTTL:         7 * 24 * time.Hour, // dead-letter payloads kept 7 days
-		writeScript:    redis.NewScript(atomicWriteLua),
-		writeScriptSHA: sha,
+		client:           client,
+		namespace:        namespace,
+		bandCount:        bandCount,
+		keyTTL:           keyTTL,
+		activityWindow:   activityWindow,
+		dlqTTL:           7 * 24 * time.Hour, // dead-letter payloads kept 7 days
+		writeScript:      redis.NewScript(atomicWriteLua),
+		writeScriptSHA:   sha,
+		hydrateScript:    redis.NewScript(hydrateLua),
+		hydrateScriptSHA: hydrateSHA,
 	}, nil
 }
 
