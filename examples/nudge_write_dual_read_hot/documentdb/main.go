@@ -14,7 +14,11 @@
 // Run:
 //
 //	MONGO_URI=mongodb://localhost:27017 REDIS_ADDRS=localhost:6379
-//	go run ./examples/nudge_hot_reload/main.go
+//	go run ./examples/nudge_write_dual_read_hot/documentdb/main.go
+//
+// Metrics will be available at http://localhost:2112/metrics (override with
+// METRICS_ADDR). Port 9090 is left free for the Prometheus server in
+// docker-compose.yml.
 package main
 
 import (
@@ -22,6 +26,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
@@ -31,8 +37,10 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+
 	sluice "github.com/hussainpithawala/sluice-go"
-	"github.com/hussainpithawala/sluice-go/internal/localjournal"
+	"github.com/hussainpithawala/sluice-go/metrics/prometheus"
 	"github.com/hussainpithawala/sluice-go/sink/docdb"
 	"github.com/hussainpithawala/sluice-go/source"
 	sourcedocdb "github.com/hussainpithawala/sluice-go/source/docdb"
@@ -55,7 +63,6 @@ type NudgeInventoryPayload struct {
 }
 
 // ─── WriteContract (shared by both cold and hot writes) ──────────────────────
-
 func nudgeWriteContract(crn string, rawPayload []byte) (*sluice.WriteModel, error) {
 	var p NudgeInventoryPayload
 	if err := json.Unmarshal(rawPayload, &p); err != nil {
@@ -76,7 +83,6 @@ func nudgeWriteContract(crn string, rawPayload []byte) (*sluice.WriteModel, erro
 }
 
 // ─── ReadContract (unified read — used by both HotLoad and cold fallback) ────
-
 func nudgeReadContract(crn string) (*source.ReadModel, error) {
 	return &source.ReadModel{
 		Filter: bson.D{{Key: "_id", Value: crn}},
@@ -84,7 +90,6 @@ func nudgeReadContract(crn string) (*source.ReadModel, error) {
 }
 
 // ─── IndexContract (enables Query() for compound lookups) ────────────────────
-
 func nudgeIndexContract(crn string, payload []byte) (map[string]interface{}, error) {
 	var p NudgeInventoryPayload
 	if err := json.Unmarshal(payload, &p); err != nil {
@@ -98,73 +103,16 @@ func nudgeIndexContract(crn string, payload []byte) (map[string]interface{}, err
 	}, nil
 }
 
-// ─── Metrics ─────────────────────────────────────────────────────────────────
-
-type logMetrics struct{ log *slog.Logger }
-
-func (m *logMetrics) RecordBroadcastLag(namespace string, lag time.Duration) {
-	m.log.Warn("broad-cast lag", "ns", namespace, "lag", lag)
-}
-
-func (m *logMetrics) RecordWrite(_ string) {}
-func (m *logMetrics) RecordDegradedWrite(ns string, err error) {
-	m.log.Warn("degraded write", "ns", ns, "err", err)
-}
-func (m *logMetrics) RecordRedisOp(ns, op string, d time.Duration, err error) {
-	if err != nil {
-		m.log.Error("redis op", "ns", ns, "op", op, "ms", d.Milliseconds(), "err", err)
-	}
-}
-func (m *logMetrics) RecordFlush(ns, band string, batch int, d time.Duration, err error) {
-	m.log.Info("flush", "ns", ns, "band", band, "batch", batch, "ms", d.Milliseconds(), "err", err)
-}
-func (m *logMetrics) RecordDirtyQueueDepth(ns, band string, depth int) {
-	if depth > 100 {
-		m.log.Warn("dirty queue depth", "ns", ns, "band", band, "depth", depth)
-	}
-}
-func (m *logMetrics) RecordContractError(ns, crn string, err error) {
-	m.log.Error("contract error", "ns", ns, "crn", crn, "err", err)
-}
-func (m *logMetrics) RecordDeadLetter(ns, band string, count int) {
-	m.log.Warn("dead-letter", "ns", ns, "band", band, "count", count)
-}
-func (m *logMetrics) RecordDLQProcess(ns, strategy string, processed, succeeded, failed int) {
-	m.log.Info("dlq-process", "ns", ns, "strategy", strategy, "processed", processed, "succeeded", succeeded, "failed", failed)
-}
-func (m *logMetrics) RecordWarmUp(ns string, duration time.Duration, err error) {
-	m.log.Info("warm-up", "ns", ns, "duration_ms", duration.Milliseconds(), "err", err)
-}
-func (m *logMetrics) RecordRead(ns string, duration time.Duration, isHot bool, err error) {
-	m.log.Info("read", "ns", ns, "duration_ms", duration.Milliseconds(), "is_hot", isHot, "err", err)
-}
-func (m *logMetrics) RecordHotSetSize(ns string, size int) {
-	m.log.Info("hot-set-size", "ns", ns, "size", size)
-}
-func (m *logMetrics) RecordLocalCacheHit(namespace string) {
-	m.log.Info("record-local-cache-hit", "ns", namespace)
-}
-
-func (m *logMetrics) RecordLocalCacheMiss(namespace string, reason localjournal.MissReason) {
-	m.log.Info("record-local-cache-miss", "ns", namespace, "reason", reason)
-}
-
-func (m *logMetrics) RecordLocalSetSize(namespace string, size int) {
-	m.log.Info("record-local-set-size", "ns", namespace, "size", size)
-}
-
 // ─── COLD WRITE PATH: Simulated Stream Consumer ──────────────────────────────
 // These writes come from Kafka/SQS. The CRN is NOT hot.
 // Write() → dirty queue → flush after FlushWindow (250ms) → DocumentDB.
 // No immediate flush signal. No TTL extension. Pure velocity shielding.
-
 func coldWriteSimulator(ctx context.Context, workerID int, sl *sluice.Sluice, log *slog.Logger, written *atomic.Int64, wg *sync.WaitGroup) {
 	defer wg.Done()
 	nudgeMasters := []string{"nm_spring_retarget", "nm_cart_abandonment", "nm_win_back_q2", "nm_first_purchase", "nm_loyalty_upgrade"}
 	channels := []string{"push", "email", "sms", "in_app"}
 	ticker := time.NewTicker(1 * time.Millisecond)
 	defer ticker.Stop()
-
 	for {
 		select {
 		case <-ctx.Done():
@@ -197,12 +145,10 @@ func coldWriteSimulator(ctx context.Context, workerID int, sl *sluice.Sluice, lo
 // The CRN IS hot because HotLoad() was called on login.
 // Write() → dirty queue → HotAwareFlush detects IsHot() → SignalVolume → flush NOW.
 // After flush, RefreshHotTTL extends the ActivityWindow.
-
 func hotWriteSimulator(ctx context.Context, sl *sluice.Sluice, log *slog.Logger, wg *sync.WaitGroup) {
 	defer wg.Done()
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
-
 	sessionCount := 0
 	for {
 		select {
@@ -210,21 +156,17 @@ func hotWriteSimulator(ctx context.Context, sl *sluice.Sluice, log *slog.Logger,
 			return
 		case <-ticker.C:
 			sessionCount++
-			correlationKey := fmt.Sprintf("crn_hot_%06d", sessionCount)
-			log.Info("═══ HOT SESSION START ═══", "crn", correlationKey, "session", sessionCount)
-
+			crn := fmt.Sprintf("crn_hot_%06d", sessionCount)
+			log.Info("═══ HOT SESSION START ═══", "crn", crn, "session", sessionCount)
 			// ─── Step 1: User logs in → HotLoad warms the journal ───────────
 			// This is the ONLY difference between hot and cold.
 			// HotLoad() writes the payload AND sets the hot marker.
 			// After this, IsHot(crn) == true for ActivityWindow duration.
-			if err := sl.HotLoad(ctx, correlationKey); err != nil {
-				log.Error("hotload failed", "err", err)
-			}
-			// If you need the payload immediately, use Read() instead:
-			payload, err := sl.Read(ctx, correlationKey)
+			err := sl.HotLoad(ctx, crn)
+			payload, err := sl.Read(ctx, crn)
 			if err != nil {
 				// New CRN not in DocumentDB yet — write directly to establish state.
-				log.Info("hot session: new CRN, seeding via direct write", "crn", correlationKey)
+				log.Info("hot session: new CRN, seeding via direct write", "crn", crn)
 				payload, _ = json.Marshal(NudgeInventoryPayload{
 					NudgeMasterID: "nm_welcome_bonus",
 					Channel:       "push",
@@ -233,18 +175,16 @@ func hotWriteSimulator(ctx context.Context, sl *sluice.Sluice, log *slog.Logger,
 					ExpiresAt:     time.Now().Add(48 * time.Hour),
 					LastUpdated:   time.Now().UTC(),
 				})
-				if writeErr := sl.Write(ctx, correlationKey, payload); writeErr != nil {
-					log.Error("hot session: seed write failed", "crn", correlationKey, "err", writeErr)
+				if writeErr := sl.Write(ctx, crn, payload); writeErr != nil {
+					log.Error("hot session: seed write failed", "crn", crn, "err", writeErr)
 					continue
 				}
 			} else {
-				log.Info("hot session: HotLoad success (warmed from Source)", "crn", correlationKey, "bytes", len(payload))
+				log.Info("hot session: HotLoad success (warmed from Source)", "crn", crn, "bytes", len(payload))
 			}
-
 			// ─── Step 2: Verify CRN is hot ───────────────────────────────────
-			isHot, _ := sl.IsHot(ctx, correlationKey)
-			log.Info("hot session: post-login state", "crn", correlationKey, "is_hot", isHot)
-
+			isHot, _ := sl.IsHot(ctx, crn)
+			log.Info("hot session: post-login state", "crn", crn, "is_hot", isHot)
 			// ─── Step 3: HOT WRITE — user action via sync API ────────────────
 			// This is the SAME sl.Write() call as the cold path.
 			// But because IsHot(crn) == true AND HotAwareFlush == true,
@@ -255,39 +195,35 @@ func hotWriteSimulator(ctx context.Context, sl *sluice.Sluice, log *slog.Logger,
 			current.Priority = 1 // user dismissed high-priority nudge
 			current.LastUpdated = time.Now().UTC()
 			hotPayload, _ := json.Marshal(current)
-
 			writeStart := time.Now()
-			if err := sl.Write(ctx, correlationKey, hotPayload); err != nil {
-				log.Error("hot session: write failed", "crn", correlationKey, "err", err)
+			if err := sl.Write(ctx, crn, hotPayload); err != nil {
+				log.Error("hot session: write failed", "crn", crn, "err", err)
 				continue
 			}
 			log.Info("hot session: HOT WRITE committed to journal",
-				"crn", correlationKey,
+				"crn", crn,
 				"write_latency_us", time.Since(writeStart).Microseconds(),
 				"note", "HotAwareFlush will trigger immediate band flush",
 			)
-
 			// ─── Step 4: Unified READ — sub-ms from Redis journal ────────────
 			// Read() does NOT care whether the CRN is hot or cold.
 			// - Hot:  returns from Redis in <1ms, lazy-refreshes TTL if <20% remaining
 			// - Cold: falls back to Source (DocumentDB) via ReadContract
 			readStart := time.Now()
-			readPayload, err := sl.Read(ctx, correlationKey)
+			readPayload, err := sl.Read(ctx, crn)
 			readLatency := time.Since(readStart)
 			if err != nil {
-				log.Error("hot session: read failed", "crn", correlationKey, "err", err)
+				log.Error("hot session: read failed", "crn", crn, "err", err)
 				continue
 			}
-
 			var readResult NudgeInventoryPayload
 			_ = json.Unmarshal(readPayload, &readResult)
 			log.Info("hot session: READ served from journal",
-				"crn", correlationKey,
+				"crn", crn,
 				"read_latency_us", readLatency.Microseconds(),
 				"priority", readResult.Priority,
 				"channel", readResult.Channel,
 			)
-
 			// ─── Step 5: QUERY — compound lookup via indexes ─────────────────
 			// Every Write() (cold or hot) maintains secondary indexes via
 			// IndexContract → Go-side pipeline (SADD/ZADD).
@@ -306,14 +242,12 @@ func hotWriteSimulator(ctx context.Context, sl *sluice.Sluice, log *slog.Logger,
 					)
 				}
 			}
-
-			log.Info("═══ HOT SESSION END ═══", "crn", correlationKey)
+			log.Info("═══ HOT SESSION END ═══", "crn", crn)
 		}
 	}
 }
 
 // ─── Main ────────────────────────────────────────────────────────────────────
-
 const bandCount = 16
 
 func main() {
@@ -325,18 +259,15 @@ func main() {
 }
 
 func run(log *slog.Logger) (err error) {
-	log.Info("sluice nudge_hot_reload example",
+	log.Info("sluice nudge example with Prometheus metrics",
 		"version", version, "commit", commit, "built", buildDate,
-		"purpose", "Demonstrates COLD writes (stream) vs HOT writes (sync API) + unified READ + QUERY",
+		"purpose", "Demonstrates COLD writes (stream) vs HOT writes (sync API) + unified READ + QUERY + Prometheus metrics",
 	)
-
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-
 	mongoURI := getEnv("MONGO_URI", "mongodb://localhost:27017")
 	databaseName := "adroll"
 	collectionName := "nudge_inventory"
-
 	// ── Sink (write path → DocumentDB) ─────────────────────────────────────
 	sk, err := docdb.New(ctx, docdb.Config{
 		URI: mongoURI, Database: databaseName, Collection: collectionName,
@@ -346,11 +277,9 @@ func run(log *slog.Logger) (err error) {
 		return fmt.Errorf("connect to MongoDB at %s: %w", mongoURI, err)
 	}
 	log.Info("connected to MongoDB (sink)", "uri", mongoURI)
-
 	// ── Source (read path ← DocumentDB, shares connection pool) ────────────
 	src := sourcedocdb.NewSourceWithClient(sk.Client(), databaseName, collectionName)
 	log.Info("initialized Source (read path)", "database", databaseName, "collection", collectionName)
-
 	// ── Redis config ───────────────────────────────────────────────────────
 	redisAddrsRaw := getEnv("REDIS_ADDRS", "localhost:6379")
 	redisAddrs := strings.Split(redisAddrsRaw, ",")
@@ -358,6 +287,12 @@ func run(log *slog.Logger) (err error) {
 		redisAddrs[i] = strings.TrimSpace(redisAddrs[i])
 	}
 	clusterMode, _ := strconv.ParseBool(getEnv("REDIS_CLUSTER_MODE", "false"))
+
+	// ── Prometheus Metrics Recorder ────────────────────────────────────────
+	// Create a Prometheus-backed metrics recorder for the "nudge_inventory" namespace.
+	// This will expose all sluice metrics at /metrics for Prometheus scraping.
+	metricsRecorder := prometheus.NewRecorder("nudge_inventory")
+	log.Info("initialized Prometheus metrics recorder", "namespace", "nudge_inventory")
 
 	// ── Build Sluice ───────────────────────────────────────────────────────
 	sl, err := sluice.New("nudge_inventory").
@@ -383,7 +318,7 @@ func run(log *slog.Logger) (err error) {
 		WithContentDedup(true).            // ← xxHash64 deduplication
 		WithIdempotencyTTL(4 * time.Hour).
 		WithDegradedModeDirect(true).
-		WithMetrics(&logMetrics{log: log}).
+		WithMetrics(metricsRecorder). // ← Prometheus metrics!
 		OnFlush(func(crns []string, result *sluice.BulkWriteResult, err error) {
 			if err != nil {
 				log.Error("flush failed", "crns", len(crns), "err", err)
@@ -403,7 +338,6 @@ func run(log *slog.Logger) (err error) {
 		}
 		return fmt.Errorf("build sluice: %w", err)
 	}
-
 	log.Info("sluice ready",
 		"redis_addrs", redisAddrs,
 		"cluster_mode", clusterMode,
@@ -413,7 +347,6 @@ func run(log *slog.Logger) (err error) {
 		"hot_aware_flush", true,
 		"content_dedup", true,
 	)
-
 	defer func() {
 		log.Info("draining sluice...")
 		shutCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -428,6 +361,43 @@ func run(log *slog.Logger) (err error) {
 		log.Info("sluice drained and closed")
 	}()
 
+	// ── Start Prometheus HTTP Server ───────────────────────────────────────
+	// Expose metrics at /metrics for Prometheus scraping
+	metricsAddr := getEnv("METRICS_ADDR", ":2112")
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", promhttp.Handler())
+	metricsServer := &http.Server{
+		Addr:    metricsAddr,
+		Handler: mux,
+	}
+
+	// Bind synchronously so a port conflict fails startup instead of
+	// silently running the workload with no metrics endpoint.
+	ln, err := net.Listen("tcp", metricsAddr)
+	if err != nil {
+		return fmt.Errorf("listen on %s: %w", metricsAddr, err)
+	}
+
+	// Serve in a goroutine
+	go func() {
+		log.Info("starting Prometheus metrics server", "addr", metricsAddr, "endpoint", "/metrics")
+		if err := metricsServer.Serve(ln); err != nil && err != http.ErrServerClosed {
+			log.Error("metrics server error", "err", err)
+		}
+	}()
+
+	// Ensure metrics server is gracefully shutdown
+	defer func() {
+		log.Info("shutting down metrics server...")
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer shutdownCancel()
+		if err := metricsServer.Shutdown(shutdownCtx); err != nil {
+			log.Error("metrics server shutdown error", "err", err)
+		} else {
+			log.Info("metrics server shutdown complete")
+		}
+	}()
+
 	// ── Start COLD write path: stream consumers ────────────────────────────
 	const coldWorkers = 8
 	var wg sync.WaitGroup
@@ -437,17 +407,14 @@ func run(log *slog.Logger) (err error) {
 		wg.Add(1)
 		go coldWriteSimulator(ctx, i, sl, log, &coldWritten, &wg)
 	}
-
 	// ── Start HOT write path: synchronous API simulator ────────────────────
 	log.Info("starting HOT write path: sync API session simulator")
 	wg.Add(1)
 	go hotWriteSimulator(ctx, sl, log, &wg)
-
 	// ── Stats reporter ─────────────────────────────────────────────────────
 	statsTicker := time.NewTicker(5 * time.Second)
 	defer statsTicker.Stop()
 	start := time.Now()
-
 	go func() {
 		for {
 			select {
@@ -464,11 +431,9 @@ func run(log *slog.Logger) (err error) {
 			}
 		}
 	}()
-
 	<-ctx.Done()
 	log.Info("shutdown signal received")
 	wg.Wait()
-
 	total := coldWritten.Load()
 	elapsed := time.Since(start)
 	log.Info("final summary",
