@@ -164,7 +164,10 @@ func hotWriteSimulator(ctx context.Context, sl *sluice.Sluice, log *slog.Logger,
 			// This is the ONLY difference between hot and cold.
 			// HotLoad() writes the payload AND sets the hot marker.
 			// After this, IsHot(crn) == true for ActivityWindow duration.
-			err := sl.HotLoad(ctx, crn)
+			hotLoadError := sl.HotLoad(ctx, crn)
+			if hotLoadError != nil {
+				log.Error("Unable to hot load", "crn", crn, "err", hotLoadError)
+			}
 			payload, err := sl.Read(ctx, crn)
 			if err != nil {
 				// New CRN not in DocumentDB yet — write directly to establish state.
