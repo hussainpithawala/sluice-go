@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -169,28 +170,16 @@ func (s *Shield) WriteDedup(ctx context.Context, correlationKey string, payload 
 }
 
 // UpdateIndexes maintains secondary indexes via a Go-side pipeline.
-// No cjson, no Lua, completely Valkey-safe.
+// No cjson, no Lua, completely Valkey-safe. The key's previous values are
+// read first so it is removed from sets for values it no longer has.
 func (s *Shield) UpdateIndexes(ctx context.Context, correlationKey string, indexes map[string]interface{}, ttl time.Duration) error {
-	band := s.BandFor(correlationKey)
-	pipe := s.client.Pipeline()
-
-	for field, val := range indexes {
-		switch v := val.(type) {
-		case string:
-			eqKey := IndexKey(s.namespace, band, field, v)
-			pipe.SAdd(ctx, eqKey, correlationKey)
-			pipe.Expire(ctx, eqKey, ttl)
-		case float64:
-			ridxKey := RangeIndexKey(s.namespace, band, field)
-			pipe.ZAdd(ctx, ridxKey, redis.Z{Score: v, Member: correlationKey})
-			pipe.Expire(ctx, ridxKey, ttl)
-		case int64:
-			ridxKey := RangeIndexKey(s.namespace, band, field)
-			pipe.ZAdd(ctx, ridxKey, redis.Z{Score: float64(v), Member: correlationKey})
-			pipe.Expire(ctx, ridxKey, ttl)
-		}
+	olds, err := s.indexValues(ctx, []string{correlationKey})
+	if err != nil {
+		return err
 	}
-	_, err := pipe.Exec(ctx)
+	pipe := s.client.Pipeline()
+	s.queueIndexUpdate(ctx, pipe, correlationKey, indexes, olds[0], ttl)
+	_, err = pipe.Exec(ctx)
 	return err
 }
 
@@ -208,6 +197,51 @@ func (s *Shield) SetHotMarker(ctx context.Context, correlationKey string, ttl ti
 func (s *Shield) IsHot(ctx context.Context, correlationKey string) (bool, error) {
 	n, err := s.client.Exists(ctx, s.hotMarkerKey(correlationKey)).Result()
 	return n > 0, err
+}
+
+// CountHotMarkers returns the number of live hot markers in this namespace.
+// It SCANs the keyspace (every master in cluster mode), so cost is
+// O(keyspace) — call it from a low-frequency sampler, never a request path.
+func (s *Shield) CountHotMarkers(ctx context.Context) (int, error) {
+	return s.scanKeys(ctx, fmt.Sprintf("sl:%s:hot:*", s.namespace), nil)
+}
+
+// scanKeys SCANs every key matching pattern (every master in cluster mode,
+// where a plain SCAN only covers one node), calling fn per page when non-nil.
+// fn may run concurrently across masters. Returns the number of keys seen.
+func (s *Shield) scanKeys(ctx context.Context, pattern string, fn func(context.Context, []string) error) (int, error) {
+	scan := func(ctx context.Context, c redis.Cmdable) (int, error) {
+		var n int
+		var cursor uint64
+		for {
+			keys, next, err := c.Scan(ctx, cursor, pattern, 1000).Result()
+			if err != nil {
+				return n, err
+			}
+			n += len(keys)
+			if fn != nil && len(keys) > 0 {
+				if err := fn(ctx, keys); err != nil {
+					return n, err
+				}
+			}
+			if next == 0 {
+				return n, nil
+			}
+			cursor = next
+		}
+	}
+
+	cc, ok := s.client.(*redis.ClusterClient)
+	if !ok {
+		return scan(ctx, s.client)
+	}
+	var total atomic.Int64
+	err := cc.ForEachMaster(ctx, func(ctx context.Context, c *redis.Client) error {
+		n, err := scan(ctx, c)
+		total.Add(int64(n))
+		return err
+	})
+	return int(total.Load()), err
 }
 
 // ReadJournal fetches payload, remaining TTL, and the journal write version

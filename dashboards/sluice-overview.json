@@ -505,7 +505,7 @@
       },
       "targets": [
         {
-          "expr": "rate(sluice_${namespace}_local_cache_hit_total[1m]) / (rate(sluice_${namespace}_local_cache_hit_total[1m]) + rate(sluice_${namespace}_local_cache_miss_total[1m]))",
+          "expr": "(sum(rate(sluice_${namespace}_local_cache_hit_total[1m])) or vector(0)) / ((sum(rate(sluice_${namespace}_local_cache_hit_total[1m])) or vector(0)) + sum(rate(sluice_${namespace}_local_cache_miss_total[1m])))",
           "legendFormat": "Hit Ratio"
         }
       ],

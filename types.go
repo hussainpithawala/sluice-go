@@ -34,6 +34,10 @@ type Sluice struct {
 	closed            atomic.Bool
 	dlqCancel         context.CancelFunc
 	dlqDone           chan struct{}
+	gaugeCancel       context.CancelFunc
+	gaugeDone         chan struct{}
+	sweepCancel       context.CancelFunc
+	sweepDone         chan struct{}
 	// L1 Local Journal (nil if Mode == Off)
 	local        *localjournal.Cache
 	broadcastSub *broadcast.Subscriber
@@ -83,6 +87,15 @@ type Config struct {
 	DLQAutoProcess     bool
 	DLQProcessInterval time.Duration
 	DLQProcessStrategy DLQStrategy
+
+	// HotSetSampleInterval controls how often the hot set size gauge is
+	// sampled via SCAN (0 → 30s default, negative disables).
+	HotSetSampleInterval time.Duration
+
+	// IndexSweepInterval controls how often one band's secondary indexes are
+	// swept for members whose payload has expired (0 → 15s default, negative
+	// disables). A full pass over all bands takes BandCount intervals.
+	IndexSweepInterval time.Duration
 
 	// Single-key contracts
 	ReadContract  ReadContract

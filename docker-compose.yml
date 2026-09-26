@@ -8,7 +8,10 @@ services:
     container_name: sluice_redis
     ports:
       - "6379:6379"
-    command: redis-server --maxmemory 512mb --maxmemory-policy allkeys-lru
+    # noeviction: sluice uses Redis as a write buffer, so evicting keys would
+    # silently drop unflushed payloads and dirty-queue entries. When full,
+    # writes fail loudly and sluice falls back to degraded mode instead.
+    command: redis-server --maxmemory 512mb --maxmemory-policy noeviction
     healthcheck:
       test: [ "CMD", "redis-cli", "ping" ]
       interval: 5s
@@ -28,7 +31,7 @@ services:
       redis-server
       --appendonly yes
       --maxmemory 512mb
-      --maxmemory-policy allkeys-lru
+      --maxmemory-policy noeviction
       --requirepass redispassword
       --timeout 300
       --tcp-keepalive 60

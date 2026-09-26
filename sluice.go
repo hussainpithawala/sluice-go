@@ -34,7 +34,6 @@ import (
 	"github.com/hussainpithawala/sluice-go/internal/shield"
 	"github.com/hussainpithawala/sluice-go/sink"
 	"github.com/hussainpithawala/sluice-go/source"
-	"github.com/redis/go-redis/v9"
 )
 
 // New returns a Builder initialised with production-safe defaults.
@@ -134,6 +133,22 @@ func (b *Builder) WithDLQAutoProcess(interval time.Duration, strategy DLQStrateg
 	b.cfg.DLQAutoProcess = true
 	b.cfg.DLQProcessInterval = interval
 	b.cfg.DLQProcessStrategy = strategy
+	return b
+}
+
+// WithHotSetSampleInterval sets how often the hot set size gauge is sampled.
+// Sampling SCANs the Redis keyspace, so keep this coarse on large deployments.
+// Zero uses the 30s default; a negative value disables sampling.
+func (b *Builder) WithHotSetSampleInterval(d time.Duration) *Builder {
+	b.cfg.HotSetSampleInterval = d
+	return b
+}
+
+// WithIndexSweepInterval sets how often one band's secondary indexes are swept
+// for members whose payload has expired. Zero uses the 15s default; a
+// negative value disables the sweeper (Query still prunes what it touches).
+func (b *Builder) WithIndexSweepInterval(d time.Duration) *Builder {
+	b.cfg.IndexSweepInterval = d
 	return b
 }
 
@@ -274,6 +289,14 @@ func (b *Builder) Build(ctx context.Context) (*Sluice, error) {
 	if b.cfg.DLQAutoProcess {
 		s.startDLQProcessor()
 	}
+	// Gauges are sampled rather than event-driven; skip the SCAN cost
+	// entirely when nobody is recording metrics.
+	if _, noop := metrics.(*noopMetrics); !noop {
+		s.startGaugeSampler()
+	}
+	if s.cfg.IndexContract != nil || s.indexContract != nil || s.indexBulkContract != nil {
+		s.startIndexSweeper()
+	}
 
 	return s, nil
 }
@@ -318,10 +341,14 @@ func (s *Sluice) Read(ctx context.Context, correlationKey string) ([]byte, error
 		return nil, ErrLibraryClosed
 	}
 
+	// Hot = served from L1 or L2 (no Source round-trip); cold = L3 fallback.
+	t := time.Now()
+
 	// ── Tier 1: L1 Local Journal ─────────────────────────────────────────
 	if s.local != nil {
 		p, _, ok := s.local.Get(correlationKey)
 		if ok {
+			s.metrics.RecordRead(s.cfg.Namespace, time.Since(t), true, nil)
 			return p, nil
 		}
 	}
@@ -332,6 +359,7 @@ func (s *Sluice) Read(ctx context.Context, correlationKey string) ([]byte, error
 	s.metrics.RecordRedisOp(s.cfg.Namespace, "readjournal", time.Since(tRead), err)
 
 	if err != nil {
+		s.metrics.RecordRead(s.cfg.Namespace, time.Since(t), false, err)
 		return nil, err
 	}
 
@@ -348,6 +376,7 @@ func (s *Sluice) Read(ctx context.Context, correlationKey string) ([]byte, error
 			}()
 		}
 
+		s.metrics.RecordRead(s.cfg.Namespace, time.Since(t), true, nil)
 		return jr.Payload, nil
 	}
 
@@ -356,10 +385,12 @@ func (s *Sluice) Read(ctx context.Context, correlationKey string) ([]byte, error
 	if s.src != nil && s.readContract != nil {
 		readModel, err := s.readContract(correlationKey)
 		if err != nil {
+			s.metrics.RecordRead(s.cfg.Namespace, time.Since(t), false, err)
 			return nil, fmt.Errorf("read contract: %w", err)
 		}
 		hydrateTs := time.Now().UnixMilli() // captured before the Source read
 		payload, err := s.src.Read(ctx, *readModel)
+		s.metrics.RecordRead(s.cfg.Namespace, time.Since(t), false, err)
 		if err != nil {
 			if errors.Is(err, source.ErrRecordNotFound) {
 				return nil, ErrRecordNotFound
@@ -374,6 +405,7 @@ func (s *Sluice) Read(ctx context.Context, correlationKey string) ([]byte, error
 
 		return payload, nil
 	}
+	s.metrics.RecordRead(s.cfg.Namespace, time.Since(t), false, ErrRecordNotFound)
 	return nil, ErrRecordNotFound
 }
 
@@ -726,38 +758,14 @@ func (s *Sluice) Query(ctx context.Context, q Query) ([]QueryResult, error) {
 			eqKeys = append(eqKeys, shield.IndexKey(s.cfg.Namespace, band, field, val))
 		}
 
-		candidates, err := s.shield.SInter(ctx, eqKeys...)
-		if err != nil && err != redis.Nil {
+		t := time.Now()
+		matches, err := s.shield.QueryBand(ctx, band, eqKeys, q.RangeMin, q.RangeMax)
+		s.metrics.RecordRedisOp(s.cfg.Namespace, "query_band", time.Since(t), err)
+		if err != nil {
 			return nil, err
 		}
-
-		for _, ck := range candidates {
-			valid := true
-			// Check RangeMin
-			for field, min := range q.RangeMin {
-				score, err := s.shield.ZScore(ctx, shield.RangeIndexKey(s.cfg.Namespace, band, field), ck)
-				if err != nil || score < min {
-					valid = false
-					break
-				}
-			}
-			// Check RangeMax
-			if valid {
-				for field, max := range q.RangeMax {
-					score, err := s.shield.ZScore(ctx, shield.RangeIndexKey(s.cfg.Namespace, band, field), ck)
-					if err != nil || score > max {
-						valid = false
-						break
-					}
-				}
-			}
-
-			if valid {
-				payload, _, _, _ := s.shield.ReadWithTTL(ctx, ck)
-				if payload != nil {
-					results = append(results, QueryResult{CorrelationKey: ck, Payload: payload})
-				}
-			}
+		for _, m := range matches {
+			results = append(results, QueryResult{CorrelationKey: m.CorrelationKey, Payload: m.Payload})
 		}
 	}
 	return results, nil
@@ -775,6 +783,14 @@ func (s *Sluice) DrainAndClose(ctx context.Context) error {
 	if s.dlqCancel != nil {
 		s.dlqCancel()
 		<-s.dlqDone
+	}
+	if s.gaugeCancel != nil {
+		s.gaugeCancel()
+		<-s.gaugeDone
+	}
+	if s.sweepCancel != nil {
+		s.sweepCancel()
+		<-s.sweepDone
 	}
 
 	if s.engine != nil {
@@ -909,6 +925,120 @@ func (s *Sluice) startDLQProcessor() {
 						"failed", result.Failed,
 					)
 				}
+			}
+		}
+	}()
+}
+
+// localSetSampleInterval is how often the L1 size gauge is emitted. Cache.Len
+// is an in-process shard walk, so it can run far more often than the SCAN.
+const localSetSampleInterval = 5 * time.Second
+
+// startGaugeSampler periodically emits the gauges that have no natural event
+// to hang off: hot set size (Redis SCAN) and L1 local set size.
+func (s *Sluice) startGaugeSampler() {
+	hotInterval := s.cfg.HotSetSampleInterval
+	if hotInterval == 0 {
+		hotInterval = 30 * time.Second
+	}
+	if hotInterval < 0 && s.local == nil {
+		return // nothing to sample
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	s.gaugeCancel = cancel
+	s.gaugeDone = make(chan struct{})
+
+	sampleHot := func() {
+		scanCtx, cancel := context.WithTimeout(ctx, hotInterval)
+		defer cancel()
+		t := time.Now()
+		n, err := s.shield.CountHotMarkers(scanCtx)
+		s.metrics.RecordRedisOp(s.cfg.Namespace, "count_hot", time.Since(t), err)
+		if err == nil {
+			s.metrics.RecordHotSetSize(s.cfg.Namespace, n)
+		}
+	}
+	sampleLocal := func() {
+		s.metrics.RecordLocalSetSize(s.cfg.Namespace, s.local.Len())
+	}
+
+	go func() {
+		defer close(s.gaugeDone)
+
+		// Nil channels never fire, disabling the corresponding case.
+		var hotC, localC <-chan time.Time
+		if hotInterval > 0 {
+			ht := time.NewTicker(hotInterval)
+			defer ht.Stop()
+			hotC = ht.C
+			sampleHot()
+		}
+		if s.local != nil {
+			lt := time.NewTicker(localSetSampleInterval)
+			defer lt.Stop()
+			localC = lt.C
+			sampleLocal()
+		}
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-hotC:
+				sampleHot()
+			case <-localC:
+				sampleLocal()
+			}
+		}
+	}()
+}
+
+// indexSweepBatch is the SSCAN/ZSCAN page size (and EXISTS pipeline size)
+// used by the index sweeper.
+const indexSweepBatch = 500
+
+// startIndexSweeper prunes index members whose payload has expired, one band
+// per tick, so index memory tracks the live journal even when nothing queries.
+func (s *Sluice) startIndexSweeper() {
+	interval := s.cfg.IndexSweepInterval
+	if interval < 0 {
+		return
+	}
+	if interval == 0 {
+		interval = 15 * time.Second
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	s.sweepCancel = cancel
+	s.sweepDone = make(chan struct{})
+
+	go func() {
+		defer close(s.sweepDone)
+
+		// One-time: bring index keys written before the registry existed
+		// under the sweeper's reach.
+		if _, err := s.shield.RegisterExistingIndexes(ctx); err != nil && ctx.Err() == nil {
+			slog.Warn("sluice: index registry bootstrap failed", "namespace", s.cfg.Namespace, "error", err)
+		}
+
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		band := 0
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				sweepCtx, cancel := context.WithTimeout(ctx, interval)
+				t := time.Now()
+				scanned, pruned, err := s.shield.SweepIndexBand(sweepCtx, band, indexSweepBatch)
+				cancel()
+				s.metrics.RecordRedisOp(s.cfg.Namespace, "index_sweep", time.Since(t), err)
+				if pruned > 0 {
+					slog.Debug("sluice: index sweep", "namespace", s.cfg.Namespace, "band", band, "scanned", scanned, "pruned", pruned)
+				}
+				band = (band + 1) % s.cfg.BandCount
 			}
 		}
 	}()

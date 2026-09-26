@@ -40,6 +40,8 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	sluice "github.com/hussainpithawala/sluice-go"
+	"github.com/hussainpithawala/sluice-go/internal/localjournal"
+	"github.com/hussainpithawala/sluice-go/internal/shield"
 	"github.com/hussainpithawala/sluice-go/metrics/prometheus"
 	"github.com/hussainpithawala/sluice-go/sink/docdb"
 	"github.com/hussainpithawala/sluice-go/source"
@@ -318,6 +320,15 @@ func run(log *slog.Logger) (err error) {
 		WithContentDedup(true).            // ← xxHash64 deduplication
 		WithIdempotencyTTL(4 * time.Hour).
 		WithDegradedModeDirect(true).
+		WithLocalCache(localjournal.LocalCacheConfig{ // ← L1 tier; feeds the L1 hit ratio panel
+			// PushPull tails the broadcast stream, which feeds the broadcast
+			// lag panel. In a single process this is the pod's own consumer
+			// lag; run several copies to observe true cross-pod convergence.
+			Mode:       localjournal.LocalCachePushPull,
+			MaxEntries: 200_000,
+			LocalTTL:   60 * time.Second,
+			Broadcast:  shield.BroadcastPayload,
+		}).
 		WithMetrics(metricsRecorder). // ← Prometheus metrics!
 		OnFlush(func(crns []string, result *sluice.BulkWriteResult, err error) {
 			if err != nil {
