@@ -1,4 +1,4 @@
-# RFP #17: Event Log — Recording Every Nudge Event in `sluice-go`
+# RFP #17: Event Log — Recording Every Incoming Event in `sluice-go`
 
 **Status:** Proposed (design agreed 2026-09-27; to be implemented in a separate session)  
 **Target Release:** next minor after v1.0.8  
@@ -8,15 +8,15 @@
 
 ## 1. Context & Problem Statement
 
-Nudge-inventory events for the same CRN arrive **concurrently from two sources**: a Kafka/SQS stream and the synchronous API. The platform uses them to hyper-personalise ads and nudges, and growth teams report on them. **Every event is a fact**: an impression, dismissal or click that is missing from the store produces wrong growth reports.
+Banner-inventory events for the same user_id arrive **concurrently from two sources**: a Kafka/SQS stream and the synchronous API. The platform uses them to hyper-personalise ads and banners, and growth teams report on them. **Every event is a fact**: an impression, dismissal or click that is missing from the store produces wrong growth reports.
 
 `sluice` is built to **collapse** writes per correlation key, which is the opposite of what reporting needs:
 
-- The journal stores one payload per CRN. `atomicWriteLua` does `HSET p <payload>`, so a later `Write` for the same CRN **replaces** the unflushed payload. The dirty set's `ZADD` collapses to one member (see README, *The coalescing mechanism*).
+- The journal stores one payload per user_id. `atomicWriteLua` does `HSET p <payload>`, so a later `Write` for the same user_id **replaces** the unflushed payload. The dirty set's `ZADD` collapses to one member (see README, *The coalescing mechanism*).
 - The engine flushes **only the latest payload per key**, as an upsert (Mongo `$set`, Postgres `ON CONFLICT DO UPDATE`, DynamoDB `PutRequest`).
 - "Latest" means **latest to arrive at Redis**. `ts` is `time.Now()` on the writing pod at journal-write time, not the event time.
 
-So when the stream and the API each emit an event for CRN X within one flush window (250ms by default), only one event reaches the datastore, **even when nothing fails**. The other event is lost from reporting.
+So when the stream and the API each emit an event for user_id X within one flush window (250ms by default), only one event reaches the datastore, **even when nothing fails**. The other event is lost from reporting.
 
 A datastore-side version guard was considered first and rejected. It only decides *which single version* survives, so it still keeps one event of the two.
 
@@ -42,17 +42,17 @@ These must be fixed first (Phase 1), because the event log depends on the same m
 ## 2. The Goal
 
 1. **Record every event exactly once.** Every `WriteEvent` that returns nil is eventually in the datastore's event log, once per event ID, however many times it is redelivered.
-2. **Keep the per-CRN state document working as today**: the current-state inventory that `Read`/`Query`/`HotLoad` serve, latest wins.
+2. **Keep the per-user_id state document working as today**: the current-state inventory that `Read`/`Query`/`HotLoad` serve, latest wins.
 3. **Work on all three sinks**: DocumentDB, Postgres and DynamoDB.
 4. **Stay available for events during a full Redis outage** by writing them directly to the datastore.
 5. **Close the silent-loss paths** in §1.1 for both state and events.
 
-## 3. Resolved Decisions (with the platform owner)
+## 3. Resolved Decisions
 
 | Question | Decision |
 |---|---|
 | Event identity | **Producers attach a unique, stable event ID** (event_id, SQS MessageId, Kafka offset, API idempotency key); redeliveries and retries reuse it. |
-| State doc | **Keep it.** `WriteEvent` appends the event *and* updates the CRN state doc (latest wins, as today). Reports read the event log. |
+| State doc | **Keep it.** `WriteEvent` appends the event *and* updates the user_id state doc (latest wins, as today). Reports read the event log. |
 | Sinks | **All three** in this change. |
 | Full Redis outage | **Write events directly** to the datastore. An immutable event keyed by its identity cannot overwrite, or be overwritten by, anything. |
 
@@ -64,7 +64,7 @@ These must be fixed first (Phase 1), because the event log depends on the same m
 
 ```go
 type Event struct {
-    CorrelationKey string // CRN
+    CorrelationKey string // user_id
     EventID        string // producer-supplied, stable across redeliveries
     Payload        []byte
 }
@@ -87,7 +87,7 @@ type EventLogOptions struct {
 }
 
 func (b *Builder) WithEventLog(sk sink.FlushSink, ec EventContract, opts ...EventLogOption) *Builder
-func (s *Sluice) WriteEvent(ctx context.Context, crn, eventID string, payload []byte) error
+func (s *Sluice) WriteEvent(ctx context.Context, userID, eventID string, payload []byte) error
 func (s *Sluice) ProcessEventDLQ(ctx context.Context, strategy DLQStrategy, opts ...DLQOption) (*DLQResult, error)
 
 // Returned when either half of WriteEvent fails. Unwrap() []error keeps
@@ -107,8 +107,8 @@ var ErrEventLogNotConfigured = errors.New("sluice: event log not configured — 
   - It gets its own payload, dirty-set and DLQ keys. None match the state scan patterns (`sl:<ns>:hot:*`, `sl:<ns>:idx:*`), and vice versa.
   - New field `ownsClient`: `Close()` on a derived Shield does nothing.
   - No broadcast, index sweeper, gauge sampler or hot markers on the event Shield.
-- **Journal key** = `EncodeKey(crn, eventID)`, an injective encoding (`len(crn):crn:eventID`). It lives in the event's own `{band}` slot, so all scripts stay single-slot.
-- **Journal payload** = a versioned binary envelope `0x01 | uvarint len(crn) | crn | uvarint len(eid) | eid | payload`, so contract identity never depends on parsing the key. Don't use JSON: it would base64 the payload and add about 33%.
+- **Journal key** = `EncodeKey(userID, eventID)`, an injective encoding (`len(userID):userID:eventID`). It lives in the event's own `{band}` slot, so all scripts stay single-slot.
+- **Journal payload** = a versioned binary envelope `0x01 | uvarint len(user_id) | user_id | uvarint len(eid) | eid | payload`, so contract identity never depends on parsing the key. Don't use JSON: it would base64 the payload and add about 33%.
 - **Redelivery before flush**: the same event ID writes the same journal key, the `HSET` replaces it with identical content, and there is one flush. There is no double count.
 
 ### 4.3 Event flushing: a second engine
@@ -120,8 +120,8 @@ var ErrEventLogNotConfigured = errors.New("sluice: event log not configured — 
 
 ### 4.4 `WriteEvent` semantics
 
-1. Validate `crn`, `eventID` and the configuration.
-2. Run the event journal write **concurrently** with `s.Write(ctx, crn, payload)` (when a state `WriteContract` is set), so batched mode doesn't pay two batch windows.
+1. Validate `userID`, `eventID` and the configuration.
+2. Run the event journal write **concurrently** with `s.Write(ctx, userID, payload)` (when a state `WriteContract` is set), so batched mode doesn't pay two batch windows.
 3. Event path: `evShield.Write(key, envelope)`. On error with `DegradedDirect`, write straight to the event sink via `EventContract` with **no pending-version probe**: an immutable, identity-keyed event is safe to write directly. In non-batched mode, run the volume check.
 4. Return nil **only if both writes succeeded**; otherwise return a `*PartialWriteError`. Retrying is idempotent: the event is deduplicated by identity, and the state write is latest-wins.
 
@@ -137,8 +137,8 @@ var ErrEventLogNotConfigured = errors.New("sluice: event log not configured — 
 | Sink | Contract / config | Why |
 |---|---|---|
 | DocumentDB | `Filter {_id: ev.Key()}`, `Update {$setOnInsert: {...}}`, `Upsert: true` | The first write wins, and replays are no-ops. An 11000 on `_id_` (an upsert race) is retryable (Phase 1). |
-| Postgres | The event sink uses `OnConflict: DoNothing`; `PRIMARY KEY (crn, event_id)` | No dead tuples or WAL on replay; the first write wins. |
-| DynamoDB | `PK=crn`, `SK=event_id`, `PutRequest` | `BatchWriteItem` can't be conditional, so it is idempotent only because the item is deterministic (a pure contract). Also serves queries by CRN. The degraded single write may use `attribute_not_exists(PK)`, with `ConditionalCheckFailed` counted as success. |
+| Postgres | The event sink uses `OnConflict: DoNothing`; `PRIMARY KEY (user_id, event_id)` | No dead tuples or WAL on replay; the first write wins. |
+| DynamoDB | `PK=user_id`, `SK=event_id`, `PutRequest` | `BatchWriteItem` can't be conditional, so it is idempotent only because the item is deterministic (a pure contract). Also serves queries by user_id. The degraded single write may use `attribute_not_exists(PK)`, with `ConditionalCheckFailed` counted as success. |
 
 ### 4.6 Event DLQ
 
@@ -152,7 +152,7 @@ var ErrEventLogNotConfigured = errors.New("sluice: event log not configured — 
 
 - The Prometheus recorder ignores the namespace argument, so a second engine sharing it would **collide**: `dirty_queue_depth{band="3"}` would jump between state and event values.
 - Default: an `eventMetrics` decorator over the main recorder. Band labels become `ev-<band>`, op names become `ev_<op>`, and the per-event `correlation_key` label on `contract_error_total` is replaced with a constant, to avoid unbounded cardinality.
-- Or pass `EventLogOptions.Metrics`, e.g. `sluiceprom.NewRecorder("nudge_inventory_events")`.
+- Or pass `EventLogOptions.Metrics`, e.g. `sluiceprom.NewRecorder("banner_inventory_events")`.
 
 ### 4.8 Lifecycle and resources
 
@@ -215,7 +215,7 @@ Each phase ends with gofmt, `go build`, `go vet` (also `-tags integration`), and
   - `PartialWriteError` handling (don't ack unless nil);
   - the known limits.
 - CHANGELOG with breaking notes (`SinkError.Class` semantics, DLQ TTL 0 = never).
-- Extend `examples/nudge_write_dual_read_hot/documentdb` with two concurrent sources writing events.
+- Extend `examples/banner_write_dual_read_hot/documentdb` with two concurrent sources writing events.
 
 ---
 
@@ -225,7 +225,7 @@ Each phase ends with gofmt, `go build`, `go vet` (also `-tags integration`), and
 
 | Test | Asserts |
 |---|---|
-| Concurrent events for one CRN | 200 goroutines × distinct event IDs, split across two "sources", within a 2s flush window, with and without batching. **200 event docs**. The state doc equals the final journal payload. Before the flush: 200 event dirty members, 1 state dirty member. |
+| Concurrent events for one user_id | 200 goroutines × distinct event IDs, split across two "sources", within a 2s flush window, with and without batching. **200 event docs**. The state doc equals the final journal payload. Before the flush: 200 event dirty members, 1 state dirty member. |
 | Redelivery | The same event ID ×10 concurrently, then again after flush plus TTL expiry with a different payload. **Exactly 1 doc**, first write kept. |
 | Full Redis outage | Via an in-test TCP proxy to Redis that is then closed. The error has `EventRecorded:true` and matches `ErrDegradedWriteUnsafe`; the event doc exists immediately. The proxy is reopened and the call retried: nil, still 1 event, and the state doc exists. |
 | Journal failure without degraded mode | An error is returned; after the fix and a retry, the event is recorded exactly once. |
@@ -255,7 +255,7 @@ Each phase ends with gofmt, `go build`, `go vet` (also `-tags integration`), and
   - a duplicate key in a batch fails only that row;
   - a 23505 in a 5-row batch fails 1 row and commits 4.
 
-**Live run:** two concurrent sources write the same CRNs for about 60s.
+**Live run:** two concurrent sources write the same user_ids for about 60s.
 - The event-doc count equals the number of `WriteEvent` calls that returned nil.
 - `unflushed_expiry_total` stays 0.
 - Redis memory levels off.
@@ -265,7 +265,7 @@ Each phase ends with gofmt, `go build`, `go vet` (also `-tags integration`), and
 ## 7. Design Traps Found in Review (avoid these)
 
 1. **The shared Redis client is closed too early.** `DrainAndClose` calls `shield.Close()` → `client.Close()` while the event engine is still draining. Fix: a non-owning derived Shield, and close the client once, last.
-2. **Journal identity must equal sink identity.** If the journal key is (CRN, eventID) but the sink key is the eventID alone, two CRNs sharing an event ID silently overwrite one row. If both land in one batch, Postgres raises `21000` and DynamoDB a ValidationException, which retry forever and **stall the band**, because `DrainBand` always picks the lowest scores. Fix: `Event.Key()` end to end, plus sink duplicate pre-checks that return permanent per-row errors.
+2. **Journal identity must equal sink identity.** If the journal key is (user_id, eventID) but the sink key is the eventID alone, two user_ids sharing an event ID silently overwrite one row. If both land in one batch, Postgres raises `21000` and DynamoDB a ValidationException, which retry forever and **stall the band**, because `DrainBand` always picks the lowest scores. Fix: `Event.Key()` end to end, plus sink duplicate pre-checks that return permanent per-row errors.
 3. **`handleReInsert` with an identity key mapping deletes the payload it just wrote** (`CommitDLQKeys` DEL). For events, route ReInsert to Upsert.
 4. **`PEXPIRE 0` deletes the key.** A "never expire" DLQ TTL must be `PERSIST`.
 5. **DLQ payloads expire after 7 days** and `drainAction` drops them with no signal. Events need a TTL of 0 plus a log and metric on discard.
