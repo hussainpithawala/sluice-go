@@ -19,7 +19,10 @@ import (
 
 // ── Test Infrastructure ─────────────────────────────────────────────────────
 
-const bcastTestDB = 15
+// bcastTestDB must differ from the unit tests' DB (15): `go test ./...` runs
+// packages in parallel and both FLUSHDB their DB, so sharing one causes
+// random cross-package failures.
+const bcastTestDB = 14
 
 func bcastRedisAddr() string {
 	if a := os.Getenv("REDIS_ADDR"); a != "" {

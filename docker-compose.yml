@@ -8,7 +8,23 @@ services:
     container_name: sluice_redis
     ports:
       - "6379:6379"
-    command: redis-server --maxmemory 512mb --maxmemory-policy allkeys-lru
+    # noeviction: sluice uses Redis as a write buffer, so evicting keys would
+    # silently drop unflushed payloads and dirty-queue entries. When full,
+    # writes fail loudly and sluice falls back to degraded mode instead.
+    #
+    # appendonly + appendfsync everysec: unflushed payloads exist only in
+    # Redis, so a crash without persistence loses every write not yet flushed
+    # to the datastore. The AOF bounds that to ~1s of writes. The volume keeps
+    # the AOF across container recreation (`make docker-down` uses -v and
+    # deliberately wipes it).
+    command: >
+      redis-server
+      --maxmemory 512mb
+      --maxmemory-policy noeviction
+      --appendonly yes
+      --appendfsync everysec
+    volumes:
+      - sluice_redis_data:/data
     healthcheck:
       test: [ "CMD", "redis-cli", "ping" ]
       interval: 5s
@@ -28,7 +44,7 @@ services:
       redis-server
       --appendonly yes
       --maxmemory 512mb
-      --maxmemory-policy allkeys-lru
+      --maxmemory-policy noeviction
       --requirepass redispassword
       --timeout 300
       --tcp-keepalive 60
@@ -329,6 +345,36 @@ services:
     networks:
       - sluice
 
+  # ── Observability Stack ────────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.51.0
+    container_name: sluice-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+      - ./monitoring/prometheus/rules:/etc/prometheus/rules:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway" # Allows scraping the example app on the host's :2112
+    networks:
+      - sluice
+
+  grafana:
+    image: grafana/grafana:10.4.2
+    container_name: sluice-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning
+      - ./dashboards:/var/lib/grafana/dashboards
+    depends_on:
+      - prometheus
+    networks:
+      - sluice
 networks:
   sluice:
     driver: bridge
@@ -337,6 +383,9 @@ volumes:
   redis_data:
     driver: local
     name: sluice-redis-data
+  sluice_redis_data: # AOF for the main sluice_redis instance
+    driver: local
+    name: sluice-redis-main-data
 
 # ============================================================================
 # NOT WIRED UP — application-level config still needed, not guessed here:

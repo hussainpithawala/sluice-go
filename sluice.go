@@ -34,7 +34,6 @@ import (
 	"github.com/hussainpithawala/sluice-go/internal/shield"
 	"github.com/hussainpithawala/sluice-go/sink"
 	"github.com/hussainpithawala/sluice-go/source"
-	"github.com/redis/go-redis/v9"
 )
 
 // New returns a Builder initialised with production-safe defaults.
@@ -84,8 +83,15 @@ func (b *Builder) WithFlushWindow(d time.Duration) *Builder    { b.cfg.FlushWind
 func (b *Builder) WithMaxBatchSize(n int) *Builder             { b.cfg.MaxBatchSize = n; return b }
 func (b *Builder) WithBandCount(n int) *Builder                { b.cfg.BandCount = n; return b }
 func (b *Builder) WithKeyTTL(d time.Duration) *Builder         { b.cfg.KeyTTL = d; return b }
-func (b *Builder) WithDegradedModeDirect(v bool) *Builder      { b.cfg.DegradedModeDirect = v; return b }
-func (b *Builder) WithMetrics(m MetricsRecorder) *Builder      { b.cfg.Metrics = m; return b }
+
+// WithDegradedModeDirect makes Write() fall back to a direct datastore write
+// when the Redis write fails — but only when no older version of the key is
+// pending in Redis (awaiting flush or dead-lettered), since that version's
+// later flush would overwrite the direct write. Otherwise, including when
+// Redis is unreachable, Write() returns ErrDegradedWriteUnsafe (wrapping
+// ErrRedisUnavailable) so the caller retries and ordering is preserved.
+func (b *Builder) WithDegradedModeDirect(v bool) *Builder { b.cfg.DegradedModeDirect = v; return b }
+func (b *Builder) WithMetrics(m MetricsRecorder) *Builder { b.cfg.Metrics = m; return b }
 
 // WithActivityWindow sets the TTL for hot correlation_key sessions.
 // Active users remain in the Redis journal for this duration. Default is 4 hours.
@@ -119,7 +125,15 @@ func (b *Builder) OnFlush(cb OnFlushCallback) *Builder { b.callback = cb; return
 // WithBatchedWrites enables pipelined Redis writes. Instead of one Redis
 // round-trip per Write() call, writes are buffered and flushed in a single
 // pipeline when the buffer reaches size entries or window elapses.
-// Recommended for high-velocity streams (>10K writes/sec).
+// Recommended for high-velocity streams (>10K writes/sec) with many
+// concurrent writers.
+//
+// Write() still returns only after its own entry has been written to the
+// journal, with that entry's real error — so a nil return is always safe to
+// ack upstream, and a failed batch falls back to degraded mode (or returns
+// an error) instead of being lost. The cost is latency: each Write() waits
+// up to window for its batch. Throughput gains come from concurrency, so a
+// single sequential writer gains nothing from batching.
 func (b *Builder) WithBatchedWrites(size int, window time.Duration) *Builder {
 	b.cfg.BatchedWrites = true
 	b.cfg.WriteBatchSize = size
@@ -134,6 +148,24 @@ func (b *Builder) WithDLQAutoProcess(interval time.Duration, strategy DLQStrateg
 	b.cfg.DLQAutoProcess = true
 	b.cfg.DLQProcessInterval = interval
 	b.cfg.DLQProcessStrategy = strategy
+	return b
+}
+
+// WithHotSetSampleInterval sets how often the hot set size gauge is sampled.
+// Sampling SCANs the Redis keyspace, so keep this coarse on large deployments.
+// Zero uses the 30s default; a negative value disables sampling.
+func (b *Builder) WithHotSetSampleInterval(d time.Duration) *Builder {
+	b.cfg.HotSetSampleInterval = d
+	return b
+}
+
+// WithIndexSweepInterval sets how often one band's secondary indexes are fully
+// swept for members whose payload has expired. Zero uses the 15s default; a
+// negative value disables the full sweep. Expired index entries are still
+// pruned promptly via the expiry queue, and Query prunes what it touches;
+// the sweep is a safety net for anything those miss.
+func (b *Builder) WithIndexSweepInterval(d time.Duration) *Builder {
+	b.cfg.IndexSweepInterval = d
 	return b
 }
 
@@ -172,6 +204,13 @@ func (b *Builder) Build(ctx context.Context) (*Sluice, error) {
 
 		if b.callback != nil {
 			wrappedCb = func(keys []string, result *sink.BulkWriteResult, err error) {
+				// Sinks return a nil result when BulkWrite fails outright.
+				// Hand the callback an empty result rather than nil, so
+				// neither this wrapper nor a callback that reads
+				// result.Errors before checking err can panic.
+				if result == nil {
+					result = &sink.BulkWriteResult{}
+				}
 				pubResult := &BulkWriteResult{
 					InsertedCount: result.InsertedCount,
 					MatchedCount:  result.MatchedCount,
@@ -274,6 +313,14 @@ func (b *Builder) Build(ctx context.Context) (*Sluice, error) {
 	if b.cfg.DLQAutoProcess {
 		s.startDLQProcessor()
 	}
+	// Gauges are sampled rather than event-driven; skip the SCAN cost
+	// entirely when nobody is recording metrics.
+	if _, noop := metrics.(*noopMetrics); !noop {
+		s.startGaugeSampler()
+	}
+	if s.cfg.IndexContract != nil || s.indexContract != nil || s.indexBulkContract != nil {
+		s.startIndexSweeper()
+	}
 
 	return s, nil
 }
@@ -318,10 +365,14 @@ func (s *Sluice) Read(ctx context.Context, correlationKey string) ([]byte, error
 		return nil, ErrLibraryClosed
 	}
 
+	// Hot = served from L1 or L2 (no Source round-trip); cold = L3 fallback.
+	t := time.Now()
+
 	// ── Tier 1: L1 Local Journal ─────────────────────────────────────────
 	if s.local != nil {
 		p, _, ok := s.local.Get(correlationKey)
 		if ok {
+			s.metrics.RecordRead(s.cfg.Namespace, time.Since(t), true, nil)
 			return p, nil
 		}
 	}
@@ -332,6 +383,7 @@ func (s *Sluice) Read(ctx context.Context, correlationKey string) ([]byte, error
 	s.metrics.RecordRedisOp(s.cfg.Namespace, "readjournal", time.Since(tRead), err)
 
 	if err != nil {
+		s.metrics.RecordRead(s.cfg.Namespace, time.Since(t), false, err)
 		return nil, err
 	}
 
@@ -348,6 +400,7 @@ func (s *Sluice) Read(ctx context.Context, correlationKey string) ([]byte, error
 			}()
 		}
 
+		s.metrics.RecordRead(s.cfg.Namespace, time.Since(t), true, nil)
 		return jr.Payload, nil
 	}
 
@@ -356,10 +409,12 @@ func (s *Sluice) Read(ctx context.Context, correlationKey string) ([]byte, error
 	if s.src != nil && s.readContract != nil {
 		readModel, err := s.readContract(correlationKey)
 		if err != nil {
+			s.metrics.RecordRead(s.cfg.Namespace, time.Since(t), false, err)
 			return nil, fmt.Errorf("read contract: %w", err)
 		}
 		hydrateTs := time.Now().UnixMilli() // captured before the Source read
 		payload, err := s.src.Read(ctx, *readModel)
+		s.metrics.RecordRead(s.cfg.Namespace, time.Since(t), false, err)
 		if err != nil {
 			if errors.Is(err, source.ErrRecordNotFound) {
 				return nil, ErrRecordNotFound
@@ -374,6 +429,7 @@ func (s *Sluice) Read(ctx context.Context, correlationKey string) ([]byte, error
 
 		return payload, nil
 	}
+	s.metrics.RecordRead(s.cfg.Namespace, time.Since(t), false, ErrRecordNotFound)
 	return nil, ErrRecordNotFound
 }
 
@@ -628,7 +684,7 @@ func (s *Sluice) Write(ctx context.Context, correlationKey string, payload []byt
 	// Handle Redis failures via degraded mode or hard error
 	if err != nil {
 		if s.cfg.DegradedModeDirect {
-			return s.degradedWrite(ctx, correlationKey, payload)
+			return s.degradedWrite(ctx, correlationKey, payload, err)
 		}
 		return fmt.Errorf("%w: %v", ErrRedisUnavailable, err)
 	}
@@ -726,38 +782,14 @@ func (s *Sluice) Query(ctx context.Context, q Query) ([]QueryResult, error) {
 			eqKeys = append(eqKeys, shield.IndexKey(s.cfg.Namespace, band, field, val))
 		}
 
-		candidates, err := s.shield.SInter(ctx, eqKeys...)
-		if err != nil && err != redis.Nil {
+		t := time.Now()
+		matches, err := s.shield.QueryBand(ctx, band, eqKeys, q.RangeMin, q.RangeMax)
+		s.metrics.RecordRedisOp(s.cfg.Namespace, "query_band", time.Since(t), err)
+		if err != nil {
 			return nil, err
 		}
-
-		for _, ck := range candidates {
-			valid := true
-			// Check RangeMin
-			for field, min := range q.RangeMin {
-				score, err := s.shield.ZScore(ctx, shield.RangeIndexKey(s.cfg.Namespace, band, field), ck)
-				if err != nil || score < min {
-					valid = false
-					break
-				}
-			}
-			// Check RangeMax
-			if valid {
-				for field, max := range q.RangeMax {
-					score, err := s.shield.ZScore(ctx, shield.RangeIndexKey(s.cfg.Namespace, band, field), ck)
-					if err != nil || score > max {
-						valid = false
-						break
-					}
-				}
-			}
-
-			if valid {
-				payload, _, _, _ := s.shield.ReadWithTTL(ctx, ck)
-				if payload != nil {
-					results = append(results, QueryResult{CorrelationKey: ck, Payload: payload})
-				}
-			}
+		for _, m := range matches {
+			results = append(results, QueryResult{CorrelationKey: m.CorrelationKey, Payload: m.Payload})
 		}
 	}
 	return results, nil
@@ -775,6 +807,14 @@ func (s *Sluice) DrainAndClose(ctx context.Context) error {
 	if s.dlqCancel != nil {
 		s.dlqCancel()
 		<-s.dlqDone
+	}
+	if s.gaugeCancel != nil {
+		s.gaugeCancel()
+		<-s.gaugeDone
+	}
+	if s.sweepCancel != nil {
+		s.sweepCancel()
+		<-s.sweepDone
 	}
 
 	if s.engine != nil {
@@ -914,13 +954,201 @@ func (s *Sluice) startDLQProcessor() {
 	}()
 }
 
-func (s *Sluice) degradedWrite(ctx context.Context, correlationKey string, payload []byte) error {
+// localSetSampleInterval is how often the L1 size gauge is emitted. Cache.Len
+// is an in-process shard walk, so it can run far more often than the SCAN.
+const localSetSampleInterval = 5 * time.Second
+
+// startGaugeSampler periodically emits the gauges that have no natural event
+// to hang off: hot set size (Redis SCAN) and L1 local set size.
+func (s *Sluice) startGaugeSampler() {
+	hotInterval := s.cfg.HotSetSampleInterval
+	if hotInterval == 0 {
+		hotInterval = 30 * time.Second
+	}
+	if hotInterval < 0 && s.local == nil {
+		return // nothing to sample
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	s.gaugeCancel = cancel
+	s.gaugeDone = make(chan struct{})
+
+	sampleHot := func() {
+		scanCtx, cancel := context.WithTimeout(ctx, hotInterval)
+		defer cancel()
+		t := time.Now()
+		n, err := s.shield.CountHotMarkers(scanCtx)
+		s.metrics.RecordRedisOp(s.cfg.Namespace, "count_hot", time.Since(t), err)
+		if err == nil {
+			s.metrics.RecordHotSetSize(s.cfg.Namespace, n)
+		}
+	}
+	sampleLocal := func() {
+		s.metrics.RecordLocalSetSize(s.cfg.Namespace, s.local.Len())
+	}
+
+	go func() {
+		defer close(s.gaugeDone)
+
+		// Nil channels never fire, disabling the corresponding case.
+		var hotC, localC <-chan time.Time
+		if hotInterval > 0 {
+			ht := time.NewTicker(hotInterval)
+			defer ht.Stop()
+			hotC = ht.C
+			sampleHot()
+		}
+		if s.local != nil {
+			lt := time.NewTicker(localSetSampleInterval)
+			defer lt.Stop()
+			localC = lt.C
+			sampleLocal()
+		}
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-hotC:
+				sampleHot()
+			case <-localC:
+				sampleLocal()
+			}
+		}
+	}()
+}
+
+const (
+	// indexSweepBatch is the SSCAN/ZSCAN page size (and EXISTS pipeline size)
+	// used by the index sweeper, and the expiry-queue batch for the pruner.
+	indexSweepBatch = 500
+
+	// indexPruneInterval is how often each band's index expiry queue is
+	// drained. Pruning is O(expired keys), so it can run frequently.
+	indexPruneInterval = time.Second
+
+	// indexPruneMaxBatches caps expiry-queue batches per band per tick, so a
+	// backlog on one band cannot starve the others.
+	indexPruneMaxBatches = 20
+)
+
+// startIndexSweeper keeps index memory tracking the live journal even when
+// nothing queries. Two loops share one goroutine:
+//   - the pruner drains each band's expiry queue every indexPruneInterval,
+//     removing index entries of payloads that have just expired;
+//   - the sweeper (IndexSweepInterval, one band per tick; negative disables)
+//     is a safety net that walks whole indexes for anything the queue missed.
+func (s *Sluice) startIndexSweeper() {
+	interval := s.cfg.IndexSweepInterval
+	if interval == 0 {
+		interval = 15 * time.Second
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	s.sweepCancel = cancel
+	s.sweepDone = make(chan struct{})
+
+	go func() {
+		defer close(s.sweepDone)
+
+		pruneTicker := time.NewTicker(indexPruneInterval)
+		defer pruneTicker.Stop()
+
+		// A nil channel never fires, disabling the sweep case.
+		var sweepC <-chan time.Time
+		if interval > 0 {
+			// One-time: bring index keys written before the registry existed
+			// under the sweeper's reach.
+			if _, err := s.shield.RegisterExistingIndexes(ctx); err != nil && ctx.Err() == nil {
+				slog.Warn("sluice: index registry bootstrap failed", "namespace", s.cfg.Namespace, "error", err)
+			}
+			sweepTicker := time.NewTicker(interval)
+			defer sweepTicker.Stop()
+			sweepC = sweepTicker.C
+		}
+
+		band := 0
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-pruneTicker.C:
+				s.pruneExpiredIndexes(ctx)
+			case <-sweepC:
+				sweepCtx, cancel := context.WithTimeout(ctx, interval)
+				t := time.Now()
+				scanned, pruned, err := s.shield.SweepIndexBand(sweepCtx, band, indexSweepBatch)
+				cancel()
+				s.metrics.RecordRedisOp(s.cfg.Namespace, "index_sweep", time.Since(t), err)
+				if pruned > 0 {
+					slog.Debug("sluice: index sweep", "namespace", s.cfg.Namespace, "band", band, "scanned", scanned, "pruned", pruned)
+				}
+				band = (band + 1) % s.cfg.BandCount
+			}
+		}
+	}()
+}
+
+// pruneExpiredIndexes drains every band's index expiry queue of entries due
+// now, up to indexPruneMaxBatches batches per band.
+func (s *Sluice) pruneExpiredIndexes(ctx context.Context) {
+	pruneCtx, cancel := context.WithTimeout(ctx, indexPruneInterval)
+	defer cancel()
+
+	t := time.Now()
+	var total int
+	var firstErr error
+	for band := 0; band < s.cfg.BandCount; band++ {
+		for i := 0; i < indexPruneMaxBatches; i++ {
+			processed, pruned, err := s.shield.PruneExpiredIndexes(pruneCtx, band, t, indexSweepBatch)
+			total += pruned
+			if err != nil {
+				if firstErr == nil {
+					firstErr = err
+				}
+				break
+			}
+			if processed < indexSweepBatch {
+				break
+			}
+		}
+	}
+	if total > 0 || firstErr != nil {
+		s.metrics.RecordRedisOp(s.cfg.Namespace, "index_prune", time.Since(t), firstErr)
+	}
+}
+
+// degradedProbeTimeout bounds the pending-version check before a degraded
+// write, so a hung Redis fails fast into a retryable error.
+const degradedProbeTimeout = 500 * time.Millisecond
+
+// degradedWrite handles a failed Redis write (redisErr) by writing directly
+// to the datastore — but only when that cannot be overwritten later by an
+// older version of the same key. If a version is still pending in Redis
+// (awaiting flush or dead-lettered), or Redis cannot be reached to rule
+// that out, it returns ErrDegradedWriteUnsafe (wrapping ErrRedisUnavailable)
+// instead: the caller retries, and the write then goes through Redis in
+// order. Nothing is persisted in that case, so nothing can be reordered.
+func (s *Sluice) degradedWrite(ctx context.Context, correlationKey string, payload []byte, redisErr error) error {
+	probeCtx, cancel := context.WithTimeout(ctx, degradedProbeTimeout)
+	t := time.Now()
+	pending, probeErr := s.shield.HasPendingVersion(probeCtx, correlationKey)
+	cancel()
+	if probeErr != nil || pending {
+		cause := probeErr
+		if cause == nil {
+			cause = errors.New("older version pending in redis")
+		}
+		s.metrics.RecordRedisOp(s.cfg.Namespace, "degraded_refused", time.Since(t), cause)
+		return fmt.Errorf("%w: %w: %v (redis write: %v)", ErrRedisUnavailable, ErrDegradedWriteUnsafe, cause, redisErr)
+	}
+
 	wm, err := s.writeContract(correlationKey, payload)
 	if err != nil {
 		s.metrics.RecordContractError(s.cfg.Namespace, correlationKey, err)
 		return fmt.Errorf("%w: %v", ErrContractViolation, err)
 	}
-	t := time.Now()
+	t = time.Now()
 	writeErr := s.sk.Write(ctx, sink.WriteModel{
 		CorrelationKey: correlationKey,
 		Filter:         wm.Filter,

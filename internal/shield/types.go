@@ -15,6 +15,12 @@ type FlushRecord struct {
 	Payload        []byte
 	ReceivedAt     time.Time
 	JournalTS      int64 // UnixMilli write ts; 0 if absent
+	// Seq is the payload's per-key write sequence ('v', bumped by every
+	// write) at drain time; "" for entries written before sequencing. Commit
+	// and dead-letter are conditional on it, so a write that lands while the
+	// batch is in flight — even within the same millisecond — is never
+	// removed from the dirty set.
+	Seq string
 }
 
 // WriteOptions configures optional behaviors for a single write operation.
@@ -109,6 +115,11 @@ type writeEntry struct {
 	correlationKey string
 	payload        []byte
 	ts             float64
+	kind           broadcastKind
+	// done receives this entry's own write result once its batch has been
+	// executed (buffered, so the batcher never blocks on it). nil for
+	// direct writes.
+	done chan error
 }
 
 // Shield manages all Redis interactions for the library.
@@ -119,20 +130,31 @@ type Shield struct {
 	keyTTL         time.Duration
 	activityWindow time.Duration
 	dlqTTL         time.Duration // how long dead-letter payload hashes are kept
-	writeScript    *redis.Script
-	writeScriptSHA string // pre-loaded SHA; used by flushBatch to avoid sending script text each time
+	// Scripts are pre-loaded in New and run via EVALSHA; every call site
+	// reloads and retries on NOSCRIPT (script cache flushed by a restart or
+	// failover), so a cold cache never fails a write.
+	writeScript   *redis.Script
+	hydrateScript *redis.Script
 
-	hydrateScript    *redis.Script
-	hydrateScriptSHA string // pre-loaded SHA; used by BulkHydrateJournal pipelines
+	commitScript     *redis.Script // conditional commit + post-flush TTL
+	deadLetterScript *redis.Script // conditional move to dead-letter
+	extendTTLScript  *redis.Script // extend-only TTL refresh for flushed payloads
 
 	// Batching fields — all nil/zero when batching is disabled.
 	batchCh        chan writeEntry
 	batchSize      int
 	batchWin       time.Duration
 	stopBatch      chan struct{}
+	stopOnce       sync.Once
 	batchWg        sync.WaitGroup
 	volumeSignaler VolumeSignaler
-	batchCtx       context.Context // parent context; cancellation stops the batcher
+	batchCtx       context.Context // values only; the batcher runs until StopBatcher
+
+	// batchMu guards batchRunning. Senders hold the read lock while handing
+	// an entry to batchCh, so once StopBatcher holds the write lock no entry
+	// can enter the channel behind the batcher's final drain.
+	batchMu      sync.RWMutex
+	batchRunning bool
 
 	// Broadcast fields — all zero when broadcasting is disabled.
 	broadcastEnabled bool
@@ -147,9 +169,95 @@ type JournalRead struct {
 	Found   bool
 }
 
-// atomicWriteLua handles content deduplication atomically without cjson.
-// Returns 0 if deduplicated (TTL refreshed), 1 if written.
-const atomicWriteLua = `redis.call('HSET', KEYS[1], 'p', ARGV[1], 'ts', ARGV[2]) redis.call('EXPIRE', KEYS[1], tonumber(ARGV[4])) redis.call('ZADD', KEYS[2], ARGV[2], ARGV[3]) return 1`
+// atomicWriteLua stores the payload and marks the key dirty in one step.
+//
+// KEYS[1]=payload hash, KEYS[2]=dirty set; ARGV[1]=payload, ARGV[2]=ts,
+// ARGV[3]=correlation key.
+//
+// An unflushed payload exists only in Redis, so it must never carry a TTL.
+// PERSIST is required, not just omitting EXPIRE: HSET keeps whatever TTL the
+// hash already has, so re-writing a previously flushed key would otherwise
+// inherit its post-flush TTL and could expire before the new value is
+// flushed. The post-flush TTL is applied by commitFlushedLua after the sink
+// confirms the write.
+//
+// HINCRBY 'v' gives every write a per-key sequence, which commit and
+// dead-letter compare against: the ms timestamp alone cannot tell apart two
+// writes in the same millisecond.
+const atomicWriteLua = `
+redis.call('HSET', KEYS[1], 'p', ARGV[1], 'ts', ARGV[2])
+redis.call('HINCRBY', KEYS[1], 'v', 1)
+redis.call('PERSIST', KEYS[1])
+redis.call('ZADD', KEYS[2], ARGV[2], ARGV[3])
+return 1`
+
+// commitFlushedLua commits one flushed key atomically, but only if the
+// payload is still the version that was drained (same 'v'). Otherwise a
+// newer write landed while the batch was in flight: the key is left dirty
+// and persistent so that write is flushed on the next cycle.
+//
+// On commit it removes the key from the dirty set and applies the post-flush
+// TTL; when the key is indexed (its idxv hash exists), the index expiry
+// queue is scored with that expiry so its index entries are pruned when it
+// dies. A non-positive TTL commits without setting one (PEXPIRE 0 deletes).
+//
+// KEYS[1]=dirty set, KEYS[2]=payload hash, KEYS[3]=index expiry ZSET,
+// KEYS[4]=idxv hash; ARGV[1]=correlation key, ARGV[2]=drained seq ("" for
+// pre-sequencing entries), ARGV[3]=ttl in ms, ARGV[4]=expiry (Unix ms).
+// Returns 1 if committed, 0 if skipped because the payload changed.
+const commitFlushedLua = `
+local cur = redis.call('HGET', KEYS[2], 'v') or ''
+if cur ~= ARGV[2] then
+    return 0
+end
+redis.call('ZREM', KEYS[1], ARGV[1])
+local ttl = tonumber(ARGV[3])
+if ttl > 0 then
+    redis.call('PEXPIRE', KEYS[2], ttl)
+    if redis.call('EXISTS', KEYS[4]) == 1 then
+        redis.call('ZADD', KEYS[3], ARGV[4], ARGV[1])
+    end
+end
+return 1`
+
+// deadLetterIfUnchangedLua moves one key from the dirty set to the
+// dead-letter set, but only if its payload is still the drained version.
+// A newer write means the failure applied to a superseded payload; the key
+// stays dirty and the new payload is retried normally.
+//
+// KEYS[1]=dirty set, KEYS[2]=dead-letter set, KEYS[3]=payload hash;
+// ARGV[1]=correlation key, ARGV[2]=drained seq, ARGV[3]=failure ts (ms),
+// ARGV[4]=reason, ARGV[5]=dead-letter TTL in ms.
+// Returns 1 if dead-lettered, 0 if skipped.
+const deadLetterIfUnchangedLua = `
+local cur = redis.call('HGET', KEYS[3], 'v') or ''
+if cur ~= ARGV[2] then
+    return 0
+end
+redis.call('ZADD', KEYS[2], ARGV[3], ARGV[1])
+redis.call('HSET', KEYS[3], 'dlq_reason', ARGV[4], 'dlq_at', ARGV[3])
+redis.call('PEXPIRE', KEYS[3], ARGV[5])
+redis.call('ZREM', KEYS[1], ARGV[1])
+return 1`
+
+// extendTTLLua extends a flushed payload's TTL to at least ARGV[1] ms.
+// A persistent key (PTTL -1) is unflushed and is left untouched, as is a
+// missing key (-2); an existing longer TTL is never shortened. An indexed
+// key's expiry-queue entry is re-scored to match.
+//
+// KEYS[1]=payload hash, KEYS[2]=index expiry ZSET, KEYS[3]=idxv hash;
+// ARGV[1]=ttl in ms, ARGV[2]=expiry (Unix ms), ARGV[3]=correlation key.
+// Returns 1 if extended, else 0.
+const extendTTLLua = `
+local pttl = redis.call('PTTL', KEYS[1])
+if pttl >= 0 and pttl < tonumber(ARGV[1]) then
+    redis.call('PEXPIRE', KEYS[1], ARGV[1])
+    if redis.call('EXISTS', KEYS[3]) == 1 then
+        redis.call('ZADD', KEYS[2], ARGV[2], ARGV[3])
+    end
+    return 1
+end
+return 0`
 
 // hydrateLua seeds the journal with a payload read from the Source, without
 // marking the key dirty (store data must never be flushed back to the sink).
@@ -192,6 +300,15 @@ type HydrateResult struct {
 	Version int64
 }
 
+// atomicDedupWriteLua is atomicWriteLua with xxHash64 content deduplication.
+//
+// KEYS[1]=payload hash, KEYS[2]=dirty set; ARGV[1]=payload, ARGV[2]=ts,
+// ARGV[3]=correlation key, ARGV[4]=ttl in ms, ARGV[5]=content hash.
+//
+// A duplicate refreshes the TTL of a flushed entry (extend-only, so a hot
+// key's longer TTL is kept) and leaves an unflushed, persistent entry alone.
+// A new payload is persisted exactly as in atomicWriteLua.
+// Returns 0 if deduplicated, 1 if written.
 const atomicDedupWriteLua = `
 local payloadKey = KEYS[1]
 local dirtyKey = KEYS[2]
@@ -203,12 +320,16 @@ local contentHash = ARGV[5]
 
 local existingHash = redis.call('HGET', payloadKey, 'h')
 if existingHash == contentHash then
-    redis.call('EXPIRE', payloadKey, ttl)
+    local pttl = redis.call('PTTL', payloadKey)
+    if pttl >= 0 and pttl < ttl then
+        redis.call('PEXPIRE', payloadKey, ttl)
+    end
     return 0
 end
 
 redis.call('HSET', payloadKey, 'p', payload, 'ts', score, 'h', contentHash)
-redis.call('EXPIRE', payloadKey, ttl)
+redis.call('HINCRBY', payloadKey, 'v', 1)
+redis.call('PERSIST', payloadKey)
 redis.call('ZADD', dirtyKey, score, corrKey)
 return 1
 `

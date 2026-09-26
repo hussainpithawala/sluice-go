@@ -142,7 +142,7 @@ func TestWrite_Basic(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, found)
 	assert.Equal(t, payload, readPayload)
-	assert.Greater(t, ttl, time.Duration(0))
+	assert.Equal(t, time.Duration(-1), ttl, "unflushed payload must be persistent (no TTL)")
 
 	// Verify dirty queue has the key
 	depth, err := s.DirtyQueueDepth(ctx, s.BandFor(corrKey))
@@ -872,6 +872,8 @@ func TestRefreshHotTTL(t *testing.T) {
 
 	err := s.Write(ctx, key, []byte(`{"refresh":true}`))
 	require.NoError(t, err)
+	// RefreshHotTTL only extends flushed payloads, so flush with a short TTL.
+	simulateFlush(t, s, key, 5*time.Second)
 
 	// Get initial TTL
 	_, initialTTL, _, err := s.ReadWithTTL(ctx, key)
@@ -1000,11 +1002,17 @@ func TestNamespaceIsolation(t *testing.T) {
 	assert.Equal(t, []byte(`{"ns":"b"}`), payloadB)
 }
 
-func TestExpiredPayloadCleanup(t *testing.T) {
-	// Create shield with very short TTL
+// TestUnflushedPayloadOutlivesKeyTTL replaces the old expiry-cleanup test,
+// which asserted the data-loss behaviour: unflushed writes used to expire
+// after KeyTTL and be silently dropped from the dirty set.
+func TestUnflushedPayloadOutlivesKeyTTL(t *testing.T) {
+	// Create shield with very short TTL. DB must be testRedisDB: the
+	// cleanRedisKeys below FLUSHDBs the client's DB, and the default (0) is
+	// the dev database the examples use.
 	cfg := shield.RedisConfig{
 		Addrs:       []string{testRedisAddr()},
 		ClusterMode: false,
+		DB:          testRedisDB,
 	}
 	s, err := shield.New(cfg, "test_expiry", 16, 1*time.Second, 4*time.Hour)
 	require.NoError(t, err)
@@ -1019,22 +1027,22 @@ func TestExpiredPayloadCleanup(t *testing.T) {
 	cleanRedisKeys(t, s.Client(), "test_expiry")
 
 	key := "expiry_key"
-	err = s.Write(ctx, key, []byte(`{"expires":"soon"}`))
+	payload := []byte(`{"expires":"never while unflushed"}`)
+	err = s.Write(ctx, key, payload)
 	require.NoError(t, err)
 
-	// Wait for TTL to expire
+	// Wait past KeyTTL, as during a sink outage.
 	time.Sleep(2 * time.Second)
 
-	// DrainBand should clean up expired keys
 	band := s.BandFor(key)
 	records, err := s.DrainBand(ctx, band, 10)
 	require.NoError(t, err)
-	assert.Len(t, records, 0, "expired keys should not be returned")
+	require.Len(t, records, 1, "unflushed write must survive past KeyTTL")
+	assert.Equal(t, payload, records[0].Payload)
 
-	// Dirty queue should be cleaned
 	depth, err := s.DirtyQueueDepth(ctx, band)
 	require.NoError(t, err)
-	assert.Equal(t, int64(0), depth)
+	assert.Equal(t, int64(1), depth, "key must stay dirty until flushed")
 }
 
 func TestEmptyCorrelationKey(t *testing.T) {

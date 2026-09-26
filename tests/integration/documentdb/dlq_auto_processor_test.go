@@ -229,6 +229,7 @@ func (c *dlqProcessCounter) RecordFlush(string, string, int, time.Duration, erro
 func (c *dlqProcessCounter) RecordDirtyQueueDepth(string, string, int)                {}
 func (c *dlqProcessCounter) RecordContractError(string, string, error)                {}
 func (c *dlqProcessCounter) RecordDeadLetter(string, string, int)                     {}
+func (c *dlqProcessCounter) RecordUnflushedExpiry(string, string, int)                {}
 func (c *dlqProcessCounter) RecordWarmUp(string, time.Duration, error)                {}
 func (c *dlqProcessCounter) RecordRead(string, time.Duration, bool, error)            {}
 func (c *dlqProcessCounter) RecordHotSetSize(string, int)                             {}

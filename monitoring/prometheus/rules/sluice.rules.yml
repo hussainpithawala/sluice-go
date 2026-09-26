@@ -1,0 +1,83 @@
+# Reference alerting rules for sluice (RFP #16, §6.6).
+#
+# Metric names embed the sluice namespace: sluice_<namespace>_<metric>.
+# These rules target the reference namespace `nudge_inventory`; to re-target,
+# replace `nudge_inventory` with your namespace (one rule group per namespace).
+
+groups:
+  - name: sluice
+    rules:
+      # ── Durability (page) ───────────────────────────────────────────────
+      - alert: SluiceUnflushedPayloadLoss
+        # Dirty keys whose payload was gone at flush time. Unflushed payloads
+        # never expire, so any increase is data loss (eviction, FLUSHDB, ...).
+        expr: increase(sluice_nudge_inventory_unflushed_expiry_total[5m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "sluice lost unflushed writes (band {{ $labels.band }})"
+          description: "Payloads disappeared from Redis before they were flushed. Check Redis eviction policy (must be noeviction), FLUSHDB/manual deletes, and the OnFlush ErrPayloadMissing logs."
+
+      - alert: SluiceDegradedWriteRefused
+        # Redis rejected writes and degraded mode refused to write directly
+        # (a pending older version exists, or Redis is unreachable). Callers
+        # receive ErrDegradedWriteUnsafe and must retry; nothing is lost, but
+        # upstream is backing up.
+        expr: sum(rate(sluice_nudge_inventory_redis_op_duration_seconds_count{op="degraded_refused"}[5m])) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "sluice is refusing degraded writes — Redis is rejecting writes"
+          description: "Writes are being returned to callers for retry. Check Redis memory (noeviction OOM) and connectivity."
+
+      # ── Flush engine ────────────────────────────────────────────────────
+      - alert: SluiceHighFlushLatency
+        expr: histogram_quantile(0.99, sum by (le) (rate(sluice_nudge_inventory_flush_duration_seconds_bucket[5m]))) > 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "sluice flush p99 latency exceeds 1s"
+
+      - alert: SluiceDirtyQueueBacklog
+        expr: max(sluice_nudge_inventory_dirty_queue_depth) > 5000
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "sluice dirty queue depth exceeds 5000 — flush engine falling behind"
+
+      # ── L1 local journal ────────────────────────────────────────────────
+      - alert: SluiceL1HitRatioLow
+        # Both sides are sum()'d: hit_total has no `reason` label while
+        # miss_total does, so an unaggregated `+` would never match (and the
+        # alert would never fire).
+        expr: |
+          sum(rate(sluice_nudge_inventory_local_cache_hit_total[5m]))
+          /
+          (sum(rate(sluice_nudge_inventory_local_cache_hit_total[5m]))
+           + sum(rate(sluice_nudge_inventory_local_cache_miss_total[5m]))) < 0.5
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "sluice L1 cache hit ratio below 50% — consider increasing MaxEntries or LocalTTL"
+
+      - alert: SluiceBroadcastLagHigh
+        expr: histogram_quantile(0.99, sum by (le) (rate(sluice_nudge_inventory_broadcast_lag_seconds_bucket[5m]))) > 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "sluice cross-pod broadcast p99 lag exceeds 1s — check Redis Streams health"
+
+      # ── DLQ ─────────────────────────────────────────────────────────────
+      - alert: SluiceDLQInflowSpike
+        expr: sum(rate(sluice_nudge_inventory_dead_letter_total[5m])) > 10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "sluice DLQ inflow exceeds 10 records/sec — investigate contract errors"

@@ -4,7 +4,9 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -18,15 +20,19 @@ type Config struct {
 	BandCount      int
 	FlushWindow    time.Duration
 	MaxBatchSize   int
-	KeyTTL         time.Duration // In-flight dirty key TTL
-	ActivityWindow time.Duration // Hot correlation_key session TTL
-	HotAwareFlush  bool          // Extend TTL on successful commit
+	KeyTTL         time.Duration // Post-flush TTL for cold payloads; also the backlog flush threshold
+	ActivityWindow time.Duration // Hot correlation_key session TTL (post-flush TTL for hot payloads)
+	HotAwareFlush  bool          // Give flushed hot keys the ActivityWindow TTL and refresh their marker
 }
 
 // MetricsRecorder is the subset of telemetry methods the engine needs.
 // Any type that satisfies the public sluice.MetricsRecorder also satisfies
 // this interface.
 type MetricsRecorder interface {
+	// RecordUnflushedExpiry counts dirty keys whose payload was gone at flush
+	// time. Unflushed payloads are persistent, so any non-zero value is data
+	// loss (eviction, FLUSHDB, manual deletion) and should page someone.
+	RecordUnflushedExpiry(namespace, band string, count int)
 	RecordFlush(namespace, band string, batchSize int, duration time.Duration, err error)
 	RecordDirtyQueueDepth(namespace, band string, depth int)
 	RecordContractError(namespace, correlationKey string, err error)
@@ -54,6 +60,10 @@ type IndexContract func(correlationKey string, payload []byte) (map[string]inter
 // OnFlushCallback is invoked after every BulkWrite attempt — success or failure.
 type OnFlushCallback func(correlationKeys []string, result *sink.BulkWriteResult, err error)
 
+// ErrPayloadMissing is reported to OnFlushCallback for dirty keys whose
+// payload was gone from Redis before it could be flushed (data loss).
+var ErrPayloadMissing = errors.New("sluice: unflushed payload missing from Redis")
+
 // ErrCodeDuplicateKey is the MongoDB / AWS DocumentDB error code for a
 // unique-index violation. The engine uses this to route permanent failures
 // to the dead-letter set instead of retrying them indefinitely.
@@ -67,7 +77,7 @@ type Engine struct {
 	cfg           Config
 	shield        *shield.Shield
 	sink          sink.FlushSink
-	contract      WriteContract
+	writeContract WriteContract
 	metrics       MetricsRecorder
 	callback      OnFlushCallback
 	volumeSignals []chan struct{}
@@ -93,7 +103,7 @@ func New(
 		cfg:           cfg,
 		shield:        sh,
 		sink:          sk,
-		contract:      contract,
+		writeContract: contract,
 		metrics:       metrics,
 		callback:      cb,
 		volumeSignals: signals,
@@ -128,8 +138,9 @@ func (e *Engine) DrainAndStop() {
 }
 
 // startPreEvictionFlusher monitors the oldest dirty keys and forces a flush
-// if they are approaching the KeyTTL expiration threshold. This prevents
-// silent data loss from Redis evicting payloads before they are flushed.
+// of any band whose oldest entry has waited close to KeyTTL. Unflushed
+// payloads are persistent and cannot expire, so this bounds flush latency
+// for backlogged bands rather than preventing expiry.
 func (e *Engine) startPreEvictionFlusher() {
 	if e.cfg.KeyTTL <= 0 {
 		return
@@ -199,8 +210,11 @@ func (e *Engine) runBand(band int) {
 //  2. Apply WriteContract to each record.
 //  3. BulkWrite to the sink.
 //  4. Partition results:
-//     - Success            → CommitKeys (ZREM from dirty set) + RefreshHotTTL.
-//     - Permanent failure  → MoveToDeadLetter (duplicate key, code 11000).
+//     - Success            → CommitFlushed: ZREM from dirty set + post-flush TTL
+//     (ActivityWindow if hot, else KeyTTL; unflushed payloads have none).
+//     - Permanent failure  → DeadLetterIfUnchanged (duplicate key, code 11000).
+//     Both are conditional on the drained write sequence: a key rewritten
+//     mid-flush stays dirty so its newer payload is flushed next cycle.
 //     - Transient failure  → no action; keys remain in dirty set for retry.
 //     - Total failure      → no action; all keys remain in dirty set for retry.
 //
@@ -215,8 +229,8 @@ func (e *Engine) flushBand(ctx context.Context, band int) error {
 		e.metrics.RecordDirtyQueueDepth(e.cfg.Namespace, bandStr, int(depth))
 	}
 
-	// Phase 1: read without removing. Expired-TTL keys are cleaned by DrainBand
-	// internally; all other keys remain in the dirty set until CommitKeys.
+	// Phase 1: read without removing. Every key — including any whose payload
+	// is missing — stays in the dirty set until CommitKeys/MoveToDeadLetter.
 	records, err := e.shield.DrainBand(ctx, band, e.cfg.MaxBatchSize)
 	if err != nil {
 		e.metrics.RecordFlush(e.cfg.Namespace, bandStr, 0, time.Since(start), err)
@@ -226,18 +240,31 @@ func (e *Engine) flushBand(ctx context.Context, band int) error {
 		return nil
 	}
 
+	// Write sequence of each drained version. Commit and dead-letter are
+	// conditional on it, so a write landing mid-flush is never dropped.
+	seqs := make(map[string]string, len(records))
+	var missing []shield.VersionedKey
+
 	// Apply WriteContract — build sink models.
 	models := make([]sink.WriteModel, 0, len(records))
 	corrKeys := make([]string, 0, len(records))
+
 	for _, rec := range records {
-		wm, contractErr := e.contract(rec.CorrelationKey, rec.Payload)
+		if rec.Payload == nil {
+			missing = append(missing, shield.VersionedKey{CorrelationKey: rec.CorrelationKey, Seq: rec.Seq})
+			continue
+		}
+		seqs[rec.CorrelationKey] = rec.Seq
+
+		wm, contractErr := e.writeContract(rec.CorrelationKey, rec.Payload)
 		if contractErr != nil {
 			// Contract violation is a permanent failure for this key.
-			// Move to dead-letter to break an infinite retry loop.
+			// Move to dead-letter to break an infinite retry loop — unless
+			// the key was rewritten meanwhile, in which case the new
+			// payload deserves its own attempt.
 			e.metrics.RecordContractError(e.cfg.Namespace, rec.CorrelationKey, contractErr)
-			_ = e.shield.MoveToDeadLetter(ctx, band,
-				[]string{rec.CorrelationKey}, "contract_violation")
-			e.metrics.RecordDeadLetter(e.cfg.Namespace, bandStr, 1)
+			e.deadLetter(ctx, band, bandStr,
+				[]shield.VersionedKey{{CorrelationKey: rec.CorrelationKey, Seq: rec.Seq}}, "contract_violation")
 			if e.callback != nil {
 				e.callback(
 					[]string{rec.CorrelationKey},
@@ -260,6 +287,8 @@ func (e *Engine) flushBand(ctx context.Context, band int) error {
 		})
 		corrKeys = append(corrKeys, rec.CorrelationKey)
 	}
+
+	e.handleMissingPayloads(ctx, band, bandStr, missing)
 
 	if len(models) == 0 {
 		return nil
@@ -316,31 +345,18 @@ func (e *Engine) flushBand(ctx context.Context, band int) error {
 		}
 	}
 
-	// Commit successful keys — ZREM from dirty set.
-	if len(successKeys) > 0 {
-		if commitErr := e.shield.CommitKeys(ctx, band, successKeys); commitErr == nil {
-			if e.cfg.HotAwareFlush {
-				// Refresh payload TTL
-				_ = e.shield.RefreshHotTTL(ctx, band, successKeys)
-				// Refresh hot markers for any keys that are currently hot
-				for _, ck := range successKeys {
-					if isHot, _ := e.shield.IsHot(ctx, ck); isHot {
-						_ = e.shield.SetHotMarker(ctx, ck, e.cfg.ActivityWindow)
-					}
-				}
-			}
-		}
-	}
+	// Commit successful keys: remove from the dirty set and apply the
+	// post-flush TTL (until now they were persistent, since Redis held the
+	// only copy). Keys rewritten mid-flush stay dirty for the next cycle.
+	e.commitFlushed(ctx, band, successKeys, seqs)
 
 	// Route permanently failed keys to dead-letter.
 	if len(permanentKeys) > 0 {
-		if dlqErr := e.shield.MoveToDeadLetter(ctx, band, permanentKeys, "duplicate_key"); dlqErr != nil {
-			// If MoveToDeadLetter fails, keys stay in dirty set — they will
-			// fail again on retry, but they will not be silently lost.
-			e.metrics.RecordRedisOp(e.cfg.Namespace, "move_to_dlq", 0, dlqErr)
-		} else {
-			e.metrics.RecordDeadLetter(e.cfg.Namespace, bandStr, len(permanentKeys))
+		items := make([]shield.VersionedKey, len(permanentKeys))
+		for i, k := range permanentKeys {
+			items[i] = shield.VersionedKey{CorrelationKey: k, Seq: seqs[k]}
 		}
+		e.deadLetter(ctx, band, bandStr, items, "duplicate_key")
 	}
 
 	if e.callback != nil {
@@ -348,4 +364,103 @@ func (e *Engine) flushBand(ctx context.Context, band int) error {
 	}
 
 	return nil
+}
+
+// commitFlushed commits successfully flushed keys with their post-flush TTL:
+// ActivityWindow for hot keys (whose marker is also refreshed) when
+// HotAwareFlush is on, KeyTTL otherwise. Three pipelines per batch rather
+// than several round-trips per key.
+//
+// Each commit is conditional on the key's drained write sequence: a key
+// rewritten while the batch was in flight — even within the same
+// millisecond — keeps its dirty entry and stays persistent, so the newer
+// payload is flushed next cycle instead of being dropped.
+func (e *Engine) commitFlushed(ctx context.Context, band int, successKeys []string, seqs map[string]string) {
+	if len(successKeys) == 0 {
+		return
+	}
+	var hot []bool
+	if e.cfg.HotAwareFlush {
+		var err error
+		if hot, err = e.shield.HotKeys(ctx, successKeys); err != nil {
+			// Fall back to the cold TTL; the next Read or write refreshes it.
+			e.metrics.RecordRedisOp(e.cfg.Namespace, "hot_keys", 0, err)
+			hot = nil
+		}
+	}
+
+	items := make([]shield.FlushedKey, len(successKeys))
+	var hotKeys []string
+	for i, ck := range successKeys {
+		ttl := e.cfg.KeyTTL
+		if hot != nil && hot[i] {
+			ttl = e.cfg.ActivityWindow
+			hotKeys = append(hotKeys, ck)
+		}
+		items[i] = shield.FlushedKey{CorrelationKey: ck, Seq: seqs[ck], TTL: ttl}
+	}
+
+	if err := e.shield.RefreshHotMarkers(ctx, hotKeys, e.cfg.ActivityWindow); err != nil {
+		e.metrics.RecordRedisOp(e.cfg.Namespace, "refresh_hot_markers", 0, err)
+	}
+	t := time.Now()
+	changed, err := e.shield.CommitFlushed(ctx, band, items)
+	// On error nothing is lost: uncommitted keys stay dirty and are
+	// re-flushed (upserts are idempotent).
+	e.metrics.RecordRedisOp(e.cfg.Namespace, "commit_flushed", time.Since(t), err)
+	if len(changed) > 0 {
+		slog.Debug("sluice: keys rewritten during flush left dirty",
+			"namespace", e.cfg.Namespace, "band", band, "count", len(changed))
+	}
+}
+
+// deadLetter moves keys to the dead-letter set, skipping any rewritten since
+// they were drained (their new payload is retried normally). On failure the
+// keys stay dirty — they will fail again on retry, but they will not be
+// silently lost.
+func (e *Engine) deadLetter(ctx context.Context, band int, bandStr string, items []shield.VersionedKey, reason string) {
+	moved, err := e.shield.DeadLetterIfUnchanged(ctx, band, items, reason)
+	if err != nil {
+		e.metrics.RecordRedisOp(e.cfg.Namespace, "move_to_dlq", 0, err)
+		return
+	}
+	if len(moved) > 0 {
+		e.metrics.RecordDeadLetter(e.cfg.Namespace, bandStr, len(moved))
+	}
+}
+
+// handleMissingPayloads surfaces dirty keys whose payload was gone at flush
+// time. Unflushed payloads are persistent, so this is data loss that already
+// happened (eviction, FLUSHDB, manual deletion). It is recorded as a metric,
+// logged per key, dead-lettered, and reported to the flush callback — never
+// dropped silently.
+//
+// The dead-letter entry carries no payload, so a DLQ run will discard it;
+// the log and metric are the durable record. A key rewritten since it was
+// drained is not dead-lettered: its new payload is flushed normally (only
+// the earlier version was lost).
+func (e *Engine) handleMissingPayloads(ctx context.Context, band int, bandStr string, items []shield.VersionedKey) {
+	if len(items) == 0 {
+		return
+	}
+	keys := make([]string, len(items))
+	for i, it := range items {
+		keys[i] = it.CorrelationKey
+	}
+	e.metrics.RecordUnflushedExpiry(e.cfg.Namespace, bandStr, len(keys))
+	for _, ck := range keys {
+		slog.Error("sluice: unflushed payload missing at flush time — data lost",
+			"namespace", e.cfg.Namespace, "band", band, "correlation_key", ck)
+	}
+
+	// On failure keys stay in the dirty set and are reported again next cycle.
+	e.deadLetter(ctx, band, bandStr, items, "payload_missing_before_flush")
+
+	if e.callback != nil {
+		errs := make([]sink.SinkError, len(keys))
+		for i, ck := range keys {
+			errs[i] = sink.SinkError{CorrelationKey: ck, Err: ErrPayloadMissing}
+		}
+		e.callback(keys, &sink.BulkWriteResult{Errors: errs}, ErrPayloadMissing)
+	}
 }

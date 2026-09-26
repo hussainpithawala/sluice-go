@@ -337,3 +337,7 @@ func ensureTableExists(ctx context.Context, client *dynamodb.Client, tableName s
 	log.Info("table is active", "table", tableName)
 	return nil
 }
+
+func (m *logMetrics) RecordUnflushedExpiry(ns, band string, count int) {
+	m.log.Error("unflushed payload lost", "ns", ns, "band", band, "count", count)
+}

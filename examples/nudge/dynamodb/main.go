@@ -370,3 +370,7 @@ func getEnv(key, def string) string {
 	}
 	return def
 }
+
+func (m *logMetrics) RecordUnflushedExpiry(ns, band string, count int) {
+	m.log.Error("unflushed payload lost", "ns", ns, "band", band, "count", count)
+}

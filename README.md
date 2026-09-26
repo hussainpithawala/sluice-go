@@ -1112,7 +1112,7 @@ and `WithWriteContract()` — see [Deployment topologies](#deployment-topologies
 | `WithBatchedWrites(size, window)` | disabled | Enable pipelined Redis writes for high-velocity streams |
 | `WithContentDedup(bool)` | `false` | xxHash64 payload fingerprinting — skip redundant writes |
 | `WithIdempotencyTTL(d)` | `4h` | Retention for `WriteIdempotent` guard keys |
-| `WithMetrics(m)` | noop | Plug in Prometheus, Datadog, or CloudWatch |
+| `WithMetrics(m)` | noop | Plug in Prometheus, Datadog, or CloudWatch — see [Prometheus metrics export](#prometheus-metrics-export) |
 | `OnFlush(cb)` | nil | Callback invoked after every BulkWrite attempt |
 
 ### Read path and hot/cold regime
@@ -1518,6 +1518,87 @@ type MetricsRecorder interface {
 
 Watch the L1 hit ratio (`RecordLocalCacheHit` vs `RecordLocalCacheMiss`, broken down by `reason`) to
 size `MaxEntries` and `LocalTTL`, and `RecordBroadcastLag` to see how far peer pods trail a write.
+
+`RecordUnflushedExpiry(namespace, band string, count int)` counts dirty keys whose payload was gone at
+flush time. Unflushed payloads never expire, so **any non-zero value is data loss** and should page.
+
+### Prometheus metrics export
+
+`metrics/prometheus` is a ready-made `MetricsRecorder` backed by `prometheus/client_golang`. Design
+notes and deviations are in [`docs/issues/prometheus.md`](docs/issues/prometheus.md).
+
+```go
+import (
+    "net/http"
+
+    "github.com/prometheus/client_golang/prometheus/promhttp"
+    sluiceprom "github.com/hussainpithawala/sluice-go/metrics/prometheus"
+)
+
+rec := sluiceprom.NewRecorder("nudge_inventory") // registers on prometheus.DefaultRegisterer
+
+sl, _ := sluice.New("nudge_inventory").
+    WithRedis(sluice.RedisConfig{Addrs: []string{"redis:6379"}}).
+    WithSink(sk).
+    WithWriteContract(contract).
+    WithMetrics(rec).
+    Build(ctx)
+
+// Serve /metrics on a dedicated port (2112 by convention; 9090 is Prometheus itself).
+mux := http.NewServeMux()
+mux.Handle("/metrics", promhttp.Handler())
+go http.ListenAndServe(":2112", mux)
+```
+
+For several sluice instances in one process, or to keep sluice metrics separate, use a registry per
+instance: `sluiceprom.NewRecorderWithRegistry(ns, reg)` and serve it with
+`promhttp.HandlerFor(reg, promhttp.HandlerOpts{})`. `rec.Unregister(reg)` removes everything again.
+The namespace must be a valid Prometheus identifier (letters, digits, underscores).
+
+All metrics are named `sluice_<namespace>_<metric>`:
+
+| Metric | Type | Labels | Meaning |
+|---|---|---|---|
+| `write_total` | counter | — | Successful journal writes |
+| `degraded_write_total` | counter | `error` | Writes that went directly to the datastore because Redis failed |
+| `redis_op_duration_seconds` | histogram | `op`, `error` | Redis operation latency (`op="degraded_refused"` counts degraded writes refused for ordering safety) |
+| `flush_duration_seconds` | histogram | `band`, `error` | Flush (BulkWrite) latency |
+| `flush_batch_size` | histogram | `band` | Keys per flush |
+| `dirty_queue_depth` | gauge | `band` | Keys awaiting flush |
+| `contract_error_total` | counter | `correlation_key` | WriteContract failures |
+| `dead_letter_total` | counter | `band` | Records moved to the DLQ |
+| `dlq_process_total` | counter | `strategy`, `outcome` | DLQ records processed |
+| `unflushed_expiry_total` | counter | `band` | Dirty keys whose payload vanished before flush — **data loss, must stay 0** |
+| `warmup_duration_seconds` | histogram | `error` | `HotLoad` latency |
+| `read_duration_seconds` | histogram | `is_hot`, `error` | `Read` latency; `is_hot="true"` = served from L1/L2, `false` = Source fallback |
+| `hot_set_size` | gauge | — | Live hot markers (sampled via SCAN, every 30s by default) |
+| `local_cache_hit_total` | counter | — | L1 hits |
+| `local_cache_miss_total` | counter | `reason` (`absent`, `expired`) | L1 misses |
+| `local_set_size` | gauge | — | L1 entries (sampled every 5s) |
+| `broadcast_lag_seconds` | histogram | — | Broadcast stream consumer lag |
+
+**Cardinality.** `correlation_key` on `contract_error_total` creates one series per failing key — query
+it with `sum()` and use logs to find specific keys. The `error` label carries the full error message;
+filter successes with `error=""`.
+
+Scrape configuration:
+
+```yaml
+scrape_configs:
+  - job_name: sluice
+    static_configs:
+      - targets: ['sluice-pod-1:2112', 'sluice-pod-2:2112']
+```
+
+**Dashboard and alerts.** [`dashboards/sluice-overview.json`](dashboards/sluice-overview.json) covers write
+path, flush engine, hot/cold regime, L1, DLQ, and durability (unflushed loss, degraded writes), with
+the namespace discovered from the metrics. Reference alert rules are in
+[`monitoring/prometheus/rules/sluice.rules.yml`](monitoring/prometheus/rules/sluice.rules.yml)
+(written for `nudge_inventory`; replace the namespace to re-target).
+
+**Local stack.** `make docker-up` starts Prometheus on `:9090` (scraping `host.docker.internal:2112`,
+with the alert rules loaded) and Grafana on `:3000` with the datasource and dashboard provisioned.
+Run `examples/nudge_prometheus` or `examples/nudge_write_dual_read_hot/documentdb` to generate traffic.
 
 ---
 

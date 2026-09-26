@@ -44,3 +44,4 @@ func (n *noopMetrics) RecordLocalCacheHit(_ string)                             
 func (n *noopMetrics) RecordLocalCacheMiss(_ string, _ localjournal.MissReason)        {}
 func (n *noopMetrics) RecordLocalSetSize(_ string, _ int)                              {}
 func (n *noopMetrics) RecordBroadcastLag(_ string, _ time.Duration)                    {}
+func (n *noopMetrics) RecordUnflushedExpiry(_ string, _ string, _ int)                 {}
