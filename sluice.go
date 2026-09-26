@@ -50,12 +50,35 @@ func (b *Builder) WithSink(s sink.FlushSink) *Builder { b.sk = s; return b }
 // Required if WithReadContract is used.
 func (b *Builder) WithSource(s source.Source) *Builder { b.src = s; return b }
 
+// Builder Methods for single Key Contracts
+
 // WithReadContract sets the domain function that translates a correlation key
 // into a datastore-agnostic ReadModel for the Source to execute.
 func (b *Builder) WithReadContract(rc ReadContract) *Builder { b.cfg.ReadContract = rc; return b }
 
 // WithIndexContract sets the domain function that extracts secondary index fields.
-func (b *Builder) WithIndexContract(ic IndexContract) *Builder { b.cfg.IndexContract = ic; return b }
+func (b *Builder) WithIndexContract(ic IndexContract) *Builder {
+	b.indexContract = ic
+	b.cfg.IndexContract = ic
+	return b
+}
+
+// Builder methods for BulkContracts
+
+// WithReadBulkContract configures the bulk read execution plan translator.
+func (b *Builder) WithReadBulkContract(fn ReadBulkContract) *Builder {
+	b.readBulkContract = fn
+	b.cfg.ReadBulkContract = fn
+	return b
+}
+
+// WithIndexBulkContract configures the bulk secondary index extractor.
+func (b *Builder) WithIndexBulkContract(fn IndexBulkContract) *Builder {
+	b.indexBulkContract = fn
+	b.cfg.IndexBulkContract = fn
+	return b
+}
+
 func (b *Builder) WithWriteContract(wc WriteContract) *Builder { b.writeContract = wc; return b }
 func (b *Builder) WithFlushWindow(d time.Duration) *Builder    { b.cfg.FlushWindow = d; return b }
 func (b *Builder) WithMaxBatchSize(n int) *Builder             { b.cfg.MaxBatchSize = n; return b }
@@ -125,64 +148,80 @@ func (b *Builder) Build(ctx context.Context) (*Sluice, error) {
 	if err := b.validate(); err != nil {
 		return nil, err
 	}
+
 	metrics := b.cfg.Metrics
 	if metrics == nil {
 		metrics = &noopMetrics{}
-	}
-	if err := b.sk.Ping(ctx); err != nil {
-		return nil, fmt.Errorf("sluice: sink ping failed: %w", err)
-	}
-
-	if b.cfg.ReadContract != nil && b.src == nil {
-		return nil, errors.New("sluice: WithSource() is required when WithReadContract() is used")
 	}
 
 	sh, err := shield.New(b.cfg.Redis.toInternal(), b.cfg.Namespace, b.cfg.BandCount, b.cfg.KeyTTL, b.cfg.ActivityWindow)
 	if err != nil {
 		return nil, err
 	}
-	// Wrap callback to convert internal types to public types
+
+	var eng *engine.Engine
 	var wrappedCb engine.OnFlushCallback
-	if b.callback != nil {
-		wrappedCb = func(keys []string, result *sink.BulkWriteResult, err error) {
-			pubResult := &BulkWriteResult{
-				InsertedCount: result.InsertedCount,
-				MatchedCount:  result.MatchedCount,
-				ModifiedCount: result.ModifiedCount,
-				UpsertedCount: result.UpsertedCount,
-				Errors:        make([]SinkError, len(result.Errors)),
+
+	// ── WRITE PATH: Only initialize if both Sink and WriteContract are present ──
+	// No mutual exclusion enforcement. If only one is provided, the engine
+	// simply won't start, and Write() will return ErrWriteNotConfigured at call time.
+	if b.sk != nil && b.writeContract != nil {
+		if err := b.sk.Ping(ctx); err != nil {
+			return nil, fmt.Errorf("sluice: sink ping failed: %w", err)
+		}
+
+		if b.callback != nil {
+			wrappedCb = func(keys []string, result *sink.BulkWriteResult, err error) {
+				pubResult := &BulkWriteResult{
+					InsertedCount: result.InsertedCount,
+					MatchedCount:  result.MatchedCount,
+					ModifiedCount: result.ModifiedCount,
+					UpsertedCount: result.UpsertedCount,
+					Errors:        make([]SinkError, len(result.Errors)),
+				}
+				for i, se := range result.Errors {
+					pubResult.Errors[i] = SinkError{CorrelationKey: se.CorrelationKey, Code: se.Code, Err: se.Err}
+				}
+				b.callback(keys, pubResult, err)
 			}
-			for i, se := range result.Errors {
-				pubResult.Errors[i] = SinkError{CorrelationKey: se.CorrelationKey, Code: se.Code, Err: se.Err}
+		}
+
+		wrappedContract := func(correlationKey string, payload []byte) (*sink.WriteModel, error) {
+			wm, err := b.writeContract(correlationKey, payload)
+			if err != nil {
+				return nil, err
 			}
-			b.callback(keys, pubResult, err)
+			return &sink.WriteModel{
+				CorrelationKey: "",
+				Filter:         wm.Filter,
+				Update:         wm.Update,
+				Upsert:         wm.Upsert,
+			}, nil
+		}
+
+		eng = engine.New(b.cfg.toInternal(), sh, b.sk, wrappedContract, metrics, wrappedCb)
+		eng.Start()
+
+		if b.cfg.BatchedWrites {
+			sh.EnableBatching(b.cfg.WriteBatchSize, b.cfg.WriteBatchWindow)
+			sh.SetVolumeSignaler(func(band int) { eng.SignalVolume(band) })
+			sh.StartBatcher(ctx)
 		}
 	}
 
-	// Wrap contract to convert public WriteModel to sink.WriteModel
-	wrappedContract := func(correlationKey string, payload []byte) (*sink.WriteModel, error) {
-		wm, err := b.writeContract(correlationKey, payload)
-		if err != nil {
-			return nil, err
-		}
-		return &sink.WriteModel{
-			CorrelationKey: "", // not used in flush path
-			Filter:         wm.Filter,
-			Update:         wm.Update,
-			Upsert:         wm.Upsert,
-		}, nil
+	s := &Sluice{
+		cfg:               b.cfg,
+		shield:            sh,
+		engine:            eng, // nil if write path not configured
+		sk:                b.sk,
+		src:               b.src,
+		writeContract:     b.writeContract,
+		readContract:      b.cfg.ReadContract,
+		indexContract:     b.indexContract,
+		readBulkContract:  b.readBulkContract,
+		indexBulkContract: b.indexBulkContract,
+		metrics:           metrics,
 	}
-	eng := engine.New(b.cfg.toInternal(), sh, b.sk, wrappedContract, metrics, wrappedCb)
-	eng.Start()
-
-	// Enable batched writes if configured.
-	if b.cfg.BatchedWrites {
-		sh.EnableBatching(b.cfg.WriteBatchSize, b.cfg.WriteBatchWindow)
-		sh.SetVolumeSignaler(func(band int) { eng.SignalVolume(band) })
-		sh.StartBatcher(ctx)
-	}
-
-	s := &Sluice{cfg: b.cfg, shield: sh, engine: eng, sk: b.sk, src: b.src, writeContract: b.writeContract, metrics: metrics}
 
 	// ── L1 Local Journal (opt-in, default-off) ────────────────────────────
 	// ── L1 Local Journal (opt-in, default-off) ────────────────────────────
@@ -210,7 +249,7 @@ func (b *Builder) Build(ctx context.Context) (*Sluice, error) {
 			}
 
 			s.shield.EnableBroadcast(shield.BroadcastConfig{
-				Mode:   shield.BroadcastMode(b.localCacheCfg.Broadcast),
+				Mode:   b.localCacheCfg.Broadcast,
 				MaxLen: b.localCacheCfg.Retention,
 			})
 
@@ -242,12 +281,6 @@ func (b *Builder) Build(ctx context.Context) (*Sluice, error) {
 func (b *Builder) validate() error {
 	if b.cfg.Namespace == "" {
 		return ErrMissingNamespace
-	}
-	if b.sk == nil {
-		return ErrMissingSink
-	}
-	if b.writeContract == nil {
-		return ErrMissingContract
 	}
 	if len(b.cfg.Redis.Addrs) == 0 {
 		return ErrMissingRedis
@@ -307,7 +340,7 @@ func (s *Sluice) Read(ctx context.Context, correlationKey string) ([]byte, error
 			s.local.Put(correlationKey, jr.Payload, jr.Version)
 		}
 
-		if s.hotAwareFlush.Load() && jr.PTTL >= 0 && jr.PTTL < s.activityWindow/5 {
+		if s.cfg.HotAwareFlush && jr.PTTL >= 0 && jr.PTTL < s.cfg.ActivityWindow/5 {
 			go func() {
 				bgCtx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 				defer cancel()
@@ -319,11 +352,13 @@ func (s *Sluice) Read(ctx context.Context, correlationKey string) ([]byte, error
 	}
 
 	// ── Tier 3: L3 Source Fallback (Cold Read) ─────────────────────────
+	// ── Tier 3: L3 Source Fallback (Cold Read) ─────────────────────────
 	if s.src != nil && s.readContract != nil {
 		readModel, err := s.readContract(correlationKey)
 		if err != nil {
 			return nil, fmt.Errorf("read contract: %w", err)
 		}
+		hydrateTs := time.Now().UnixMilli() // captured before the Source read
 		payload, err := s.src.Read(ctx, *readModel)
 		if err != nil {
 			if errors.Is(err, source.ErrRecordNotFound) {
@@ -331,10 +366,51 @@ func (s *Sluice) Read(ctx context.Context, correlationKey string) ([]byte, error
 			}
 			return nil, err
 		}
+
+		// ── Asynchronous Read-Through Cache Hydration ─────────────────
+		// Return payload immediately to prioritize fast cold reads.
+		// Hydration of L2, L1, and Indexes happens in the background.
+		go s.hydrateReadThrough(correlationKey, payload, hydrateTs, true)
+
 		return payload, nil
 	}
-
 	return nil, ErrRecordNotFound
+}
+
+// hydrateReadThrough seeds L2, L1 (when withL1), and secondary indexes with a
+// payload read from the Source. Best-effort; runs off the caller's path.
+//
+// L2 hydration only fills a journal miss and never marks the key dirty — see
+// shield.HydrateJournal. Indexes are only updated when the Source payload was
+// actually written; a winning journal entry was already indexed by the write
+// path.
+func (s *Sluice) hydrateReadThrough(correlationKey string, payload []byte, hydrateTs int64, withL1 bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	hr, err := s.shield.HydrateJournal(ctx, correlationKey, payload, hydrateTs)
+	if err != nil {
+		s.metrics.RecordRedisOp(s.cfg.Namespace, "write_hydration", 0, err)
+		return
+	}
+	s.applyHydration(ctx, correlationKey, hr, withL1, s.indexContract)
+}
+
+// applyHydration mirrors a hydration outcome into L1 and, when the Source
+// payload won, into the secondary indexes.
+func (s *Sluice) applyHydration(ctx context.Context, correlationKey string, hr shield.HydrateResult, withL1 bool, ic IndexContract) {
+	if withL1 && s.local != nil {
+		s.local.Put(correlationKey, hr.Payload, hr.Version)
+	}
+	if !hr.Written || ic == nil {
+		return
+	}
+	indexFields, idxErr := ic(correlationKey, hr.Payload)
+	if idxErr == nil && len(indexFields) > 0 {
+		if err := s.shield.UpdateIndexes(ctx, correlationKey, indexFields, s.cfg.ActivityWindow); err != nil {
+			s.metrics.RecordRedisOp(s.cfg.Namespace, "updateindexes_hydration", 0, err)
+		}
+	}
 }
 
 // ReadFresh is the strong-consistency escape hatch (RFC §5.8).
@@ -342,6 +418,9 @@ func (s *Sluice) Read(ctx context.Context, correlationKey string) ([]byte, error
 // through to the Source (L3) on a journal miss — identical semantics to
 // v1.0.7 Read(). Use for money-critical reads that cannot tolerate
 // bounded staleness; use Read() for everything else.
+// ReadFresh is the strong-consistency escape hatch (RFC §5.8).
+// It bypasses L1 entirely and reads from the Redis journal (L2), falling
+// through to the Source (L3) on a journal miss.
 func (s *Sluice) ReadFresh(ctx context.Context, correlationKey string) ([]byte, error) {
 	if s.closed.Load() {
 		return nil, ErrLibraryClosed
@@ -360,12 +439,14 @@ func (s *Sluice) ReadFresh(ctx context.Context, correlationKey string) ([]byte, 
 		return jr.Payload, nil
 	}
 
-	// ── L3: Source fallback (identical to Read's cold path) ──────────────
+	// ── L3: Source fallback ─────────────────────────────────────────────
+	// ── L3: Source fallback ─────────────────────────────────────────────
 	if s.src != nil && s.readContract != nil {
 		readModel, err := s.readContract(correlationKey)
 		if err != nil {
 			return nil, fmt.Errorf("read contract: %w", err)
 		}
+		hydrateTs := time.Now().UnixMilli() // captured before the Source read
 		payload, err := s.src.Read(ctx, *readModel)
 		if err != nil {
 			if errors.Is(err, source.ErrRecordNotFound) {
@@ -373,15 +454,20 @@ func (s *Sluice) ReadFresh(ctx context.Context, correlationKey string) ([]byte, 
 			}
 			return nil, err
 		}
+
+		// ── Asynchronous Read-Through Cache Hydration (L2 + Index only) ─────────────────
+		go s.hydrateReadThrough(correlationKey, payload, hydrateTs, false)
+
 		return payload, nil
 	}
-
 	return nil, ErrRecordNotFound
 }
 
 // ReadOld returns current state from the journal.
 // Hot correlation_key: sub-millisecond Redis read with lazy TTL refresh.
 // Cold correlation_key: falls back to the configured Source via ReadContract.
+// ReadOld returns current state from the journal.
+// Deprecated: Superseded by the new tiered Read() method.
 func (s *Sluice) ReadOld(ctx context.Context, correlationKey string) ([]byte, error) {
 	if s.closed.Load() {
 		return nil, ErrLibraryClosed
@@ -393,8 +479,6 @@ func (s *Sluice) ReadOld(ctx context.Context, correlationKey string) ([]byte, er
 	// Hot path: found in Redis journal
 	if err == nil && payload != nil {
 		s.metrics.RecordRead(s.cfg.Namespace, time.Since(t), true, nil)
-
-		// Lazy refresh: if remaining TTL is < 20% of ActivityWindow, refresh it synchronously.
 		threshold := s.cfg.ActivityWindow / 5
 		if pttl > 0 && pttl < threshold {
 			_ = s.shield.SetHotMarker(ctx, correlationKey, s.cfg.ActivityWindow)
@@ -404,25 +488,27 @@ func (s *Sluice) ReadOld(ctx context.Context, correlationKey string) ([]byte, er
 	}
 
 	// Cold path: fallback to the backing datastore via Source
+	// Cold path: fallback to the backing datastore via Source
 	if s.cfg.ReadContract != nil && s.src != nil {
-		// 1. Caller defines the datastore-agnostic filter
 		model, modelErr := s.cfg.ReadContract(correlationKey)
 		if modelErr != nil {
 			s.metrics.RecordRead(s.cfg.Namespace, time.Since(t), false, modelErr)
 			return nil, modelErr
 		}
 
-		// 2. Source executes the query and returns raw bytes
+		hydrateTs := time.Now().UnixMilli() // captured before the Source read
 		srcPayload, srcErr := s.src.Read(ctx, *model)
 		s.metrics.RecordRead(s.cfg.Namespace, time.Since(t), false, srcErr)
-
 		if srcErr != nil {
-			// Map internal source error to public sluice sentinel error
 			if errors.Is(srcErr, source.ErrRecordNotFound) {
 				return nil, ErrRecordNotFound
 			}
 			return nil, srcErr
 		}
+
+		// ── Asynchronous Read-Through Cache Hydration ─────────────────
+		go s.hydrateReadThrough(correlationKey, srcPayload, hydrateTs, true)
+
 		return srcPayload, nil
 	}
 
@@ -431,44 +517,66 @@ func (s *Sluice) ReadOld(ctx context.Context, correlationKey string) ([]byte, er
 }
 
 // HotLoad activates a correlation_key on user login.
-// Loads the document from the Source into the Redis journal and sets the hot marker.
-func (s *Sluice) HotLoad(ctx context.Context, correlationKey string) ([]byte, error) {
+// It synchronously sets the hot marker (the "command") and asynchronously
+// hydrates the payload from the Source into the L2/L1 journals (the "side effect").
+// The caller should NOT block on payload hydration — this is a fire-and-forget operation.
+func (s *Sluice) HotLoad(ctx context.Context, correlationKey string) error {
 	if s.closed.Load() {
-		return nil, ErrLibraryClosed
+		return ErrLibraryClosed
 	}
-	if s.src == nil || s.cfg.ReadContract == nil {
-		return nil, ErrMissingReadContract
+	if s.src == nil {
+		return ErrMissingSource
 	}
-
-	t := time.Now()
-
-	// 1. Caller defines the filter
-	model, err := s.cfg.ReadContract(correlationKey)
-	if err != nil {
-		s.metrics.RecordWarmUp(s.cfg.Namespace, time.Since(t), err)
-		return nil, err
+	if s.cfg.ReadContract == nil {
+		return ErrMissingReadContract
 	}
 
-	// 2. Source executes the query
-	payload, err := s.src.Read(ctx, *model)
-	s.metrics.RecordWarmUp(s.cfg.Namespace, time.Since(t), err)
-	if err != nil {
-		// Map internal source error to public sluice sentinel error
-		if errors.Is(err, source.ErrRecordNotFound) {
-			return nil, ErrRecordNotFound
-		}
-		return nil, err
-	}
-
-	// 3. Write to Redis journal and set the hot marker
-	if err := s.shield.Write(ctx, correlationKey, payload); err != nil {
-		return nil, err
-	}
+	// 1. SYNCHRONOUS: Set the hot marker immediately.
+	//    This is the actual "command" — it tells the flush engine that this
+	//    key is now hot, so subsequent Write() calls will trigger immediate flushes.
+	//    This is a single Redis SET NX EX — sub-millisecond.
 	if err := s.shield.SetHotMarker(ctx, correlationKey, s.cfg.ActivityWindow); err != nil {
-		return nil, err
+		return fmt.Errorf("hotload: failed to set hot marker: %w", err)
 	}
 
-	return payload, nil
+	// 2. ASYNCHRONOUS: Hydrate the payload from Source → L2 → L1 → Indexes.
+	//    This is a side effect, not the primary objective. The caller should
+	//    not wait for this. If it fails, the next Read() will simply do a cold
+	//    read from the Source, which is graceful degradation.
+	go func() {
+		bgCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		t := time.Now()
+
+		// 2a. Read from Source (cold read)
+		model, err := s.cfg.ReadContract(correlationKey)
+		if err != nil {
+			s.metrics.RecordWarmUp(s.cfg.Namespace, time.Since(t), err)
+			return
+		}
+
+		hydrateTs := time.Now().UnixMilli() // captured before the Source read
+		payload, err := s.src.Read(bgCtx, *model)
+		s.metrics.RecordWarmUp(s.cfg.Namespace, time.Since(t), err)
+		if err != nil {
+			return // Source miss or error — graceful degradation
+		}
+
+		// 2b. Hydrate L2 (fills a journal miss only, never dirty) + seed broadcast
+		hr, err := s.shield.HydrateHotLoad(bgCtx, correlationKey, payload, hydrateTs)
+		if err != nil {
+			s.metrics.RecordRedisOp(s.cfg.Namespace, "hotload_hydration", 0, err)
+			if !hr.Written {
+				return // journal write failed; a broadcast-only failure still hydrates L1/indexes
+			}
+		}
+
+		// 2c/2d. Hydrate L1 and secondary indexes (best-effort)
+		s.applyHydration(bgCtx, correlationKey, hr, true, s.cfg.IndexContract)
+	}()
+
+	return nil
 }
 
 // Write buffers payload under correlationKey in Redis and returns immediately.
@@ -484,6 +592,12 @@ func (s *Sluice) HotLoad(ctx context.Context, correlationKey string) ([]byte, er
 func (s *Sluice) Write(ctx context.Context, correlationKey string, payload []byte) error {
 	if s.closed.Load() {
 		return ErrLibraryClosed
+	}
+	if s.writeContract == nil {
+		return ErrMissingWriteContract
+	}
+	if s.sk == nil {
+		return ErrMissingSink
 	}
 	if correlationKey == "" {
 		return ErrEmptyCorrelationKey
@@ -569,6 +683,13 @@ func (s *Sluice) WriteIdempotent(ctx context.Context, correlationKey string, pay
 	if s.closed.Load() {
 		return ErrLibraryClosed
 	}
+	if s.writeContract == nil {
+		return ErrMissingWriteContract
+	}
+	if s.sk == nil {
+		return ErrMissingSink
+	}
+
 	if correlationKey == "" || idempotencyKey == "" {
 		return ErrEmptyCorrelationKey
 	}
@@ -645,13 +766,9 @@ func (s *Sluice) Query(ctx context.Context, q Query) ([]QueryResult, error) {
 // DrainAndClose flushes all remaining dirty keys, stops band goroutines,
 // and releases Redis and sink connections. Call exactly once during shutdown.
 func (s *Sluice) DrainAndClose(ctx context.Context) error {
-	// Stop the broadcast subscriber BEFORE the engine drains: no new L1
-	// Puts should arrive while the journal is being flushed to the sink.
-	// Bounded by the subscriber's BlockMS + processing time.
 	if s.broadcastSub != nil {
 		s.broadcastSub.Stop()
 	}
-
 	if !s.closed.CompareAndSwap(false, true) {
 		return nil
 	}
@@ -659,13 +776,22 @@ func (s *Sluice) DrainAndClose(ctx context.Context) error {
 		s.dlqCancel()
 		<-s.dlqDone
 	}
-	// Stop the batcher first so all in-flight writes land in Redis before drain.
-	s.shield.StopBatcher()
-	s.engine.DrainAndStop()
+
+	if s.engine != nil {
+		if s.cfg.BatchedWrites {
+			s.shield.StopBatcher()
+		}
+		s.engine.DrainAndStop()
+	}
+
 	if err := s.shield.Close(); err != nil {
 		return fmt.Errorf("sluice: redis close: %w", err)
 	}
-	return s.sk.Close(ctx)
+
+	if s.sk != nil {
+		return s.sk.Close(ctx)
+	}
+	return nil
 }
 
 // ── DLQ Processing ──────────────────────────────────────────────────────────
@@ -699,6 +825,13 @@ func DefaultKeyMutator(oldKey string) string {
 func (s *Sluice) ProcessDLQ(ctx context.Context, strategy DLQStrategy, opts ...DLQOption) (*DLQResult, error) {
 	if s.closed.Load() {
 		return nil, ErrLibraryClosed
+	}
+
+	if s.writeContract == nil {
+		return nil, ErrMissingWriteContract
+	}
+	if s.sk == nil {
+		return nil, ErrMissingSink
 	}
 
 	o := &dlqOptions{maxBatchSize: s.cfg.MaxBatchSize}

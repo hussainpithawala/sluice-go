@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/hussainpithawala/sluice-go/source"
@@ -47,13 +48,13 @@ func NewSource(ctx context.Context, cfg Config) (*Source, error) {
 
 	client, err := mongo.Connect(ctx, opts)
 	if err != nil {
-		return nil, fmt.Errorf("sluice/source/docdb: connect: %w", err)
+		return nil, fmt.Errorf("sluice/source/documentdb: connect: %w", err)
 	}
 	pingCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	if err := client.Ping(pingCtx, readpref.Primary()); err != nil {
 		_ = client.Disconnect(ctx)
-		return nil, fmt.Errorf("sluice/source/docdb: initial ping: %w", err)
+		return nil, fmt.Errorf("sluice/source/documentdb: initial ping: %w", err)
 	}
 	return &Source{
 		client:     client,
@@ -62,7 +63,7 @@ func NewSource(ctx context.Context, cfg Config) (*Source, error) {
 }
 
 // NewSourceWithClient creates a Source using an existing mongo.Client.
-// Use this to share a connection pool with sink/docdb.Sink.
+// Use this to share a connection pool with sink/documentdb.Sink.
 func NewSourceWithClient(client *mongo.Client, database, collection string) *Source {
 	return &Source{
 		client:     client,
@@ -78,15 +79,47 @@ func (s *Source) Read(ctx context.Context, model source.ReadModel) ([]byte, erro
 		if err == mongo.ErrNoDocuments {
 			return nil, source.ErrRecordNotFound
 		}
-		return nil, fmt.Errorf("sluice/source/docdb: read: %w", err)
+		return nil, fmt.Errorf("sluice/source/documentdb: read: %w", err)
 	}
 
 	// Marshal the generic bson.M back to JSON bytes for the Redis journal.
 	b, err := json.Marshal(result)
 	if err != nil {
-		return nil, fmt.Errorf("sluice/source/docdb: marshal read result: %w", err)
+		return nil, fmt.Errorf("sluice/source/documentdb: marshal read result: %w", err)
 	}
 	return b, nil
+}
+
+// ReadBulk executes the Find query defined in DocDBBulkReadModel and delegates
+// the result shaping entirely to the operator's Projector function.
+func (s *Source) ReadBulk(ctx context.Context, model source.BulkReadModel) ([]source.BulkReadResult, error) {
+	mongoModel, ok := model.Query.(DocDBBulkReadModel)
+	if !ok {
+		return nil, fmt.Errorf("documentdb source requires Query to be documentdb.DocDBBulkReadModel")
+	}
+
+	if mongoModel.Filter == nil {
+		return nil, fmt.Errorf("documentdb source requires a non-nil Filter")
+	}
+
+	if mongoModel.Projector == nil {
+		return nil, fmt.Errorf("documentdb source requires a non-nil Projector function")
+	}
+
+	// Execute the Find query using the collection
+	cursor, err := s.collection.Find(ctx, mongoModel.Filter, mongoModel.Options)
+	if err != nil {
+		return nil, fmt.Errorf("documentdb: bulk read find execution failed: %w", err)
+	}
+	// Safety net to prevent cursor/connection leaks
+	defer func(cursor *mongo.Cursor, ctx context.Context) {
+		err := cursor.Close(ctx)
+		if err != nil {
+			slog.Debug("error while closing the documentdb source cursor", "err", err)
+		}
+	}(cursor, ctx)
+
+	return mongoModel.Projector(cursor)
 }
 
 func (s *Source) Ping(ctx context.Context) error  { return s.client.Ping(ctx, readpref.Primary()) }

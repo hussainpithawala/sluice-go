@@ -20,22 +20,23 @@ import (
 // Sluice is the main entry point. Safe for concurrent use.
 // Construct via New().Build() — never instantiate directly.
 type Sluice struct {
-	cfg           Config
-	shield        *shield.Shield
-	engine        *engine.Engine
-	sk            sink.FlushSink
-	src           source.Source
-	writeContract WriteContract
-	readContract  ReadContract
-	metrics       MetricsRecorder
-	closed        atomic.Bool
-	dlqCancel     context.CancelFunc
-	dlqDone       chan struct{}
+	cfg               Config
+	shield            *shield.Shield
+	engine            *engine.Engine
+	sk                sink.FlushSink
+	src               source.Source
+	writeContract     WriteContract
+	readContract      ReadContract
+	indexContract     IndexContract
+	readBulkContract  ReadBulkContract
+	indexBulkContract IndexBulkContract
+	metrics           MetricsRecorder
+	closed            atomic.Bool
+	dlqCancel         context.CancelFunc
+	dlqDone           chan struct{}
 	// L1 Local Journal (nil if Mode == Off)
-	local          *localjournal.Cache
-	hotAwareFlush  atomic.Bool
-	activityWindow time.Duration
-	broadcastSub   *broadcast.Subscriber
+	local        *localjournal.Cache
+	broadcastSub *broadcast.Subscriber
 }
 
 // Builder assembles a Sluice instance with a fluent API.
@@ -45,11 +46,15 @@ type Builder struct {
 	src           source.Source
 	writeContract WriteContract
 	//nolint:unused
-	readContract ReadContract
-	callback     OnFlushCallback
+	readContract  ReadContract
+	indexContract IndexContract
+	callback      OnFlushCallback
 	//nolint:unused
 	namespace     string
 	localCacheCfg localjournal.LocalCacheConfig
+
+	readBulkContract  ReadBulkContract  // Phase 1
+	indexBulkContract IndexBulkContract // Phase 1
 }
 
 // ─── Configuration ───────────────────────────────────────────────────────────
@@ -79,8 +84,13 @@ type Config struct {
 	DLQProcessInterval time.Duration
 	DLQProcessStrategy DLQStrategy
 
+	// Single-key contracts
 	ReadContract  ReadContract
 	IndexContract IndexContract
+
+	// Bulk-key contracts (Phase 1)
+	ReadBulkContract  ReadBulkContract
+	IndexBulkContract IndexBulkContract
 }
 
 // RedisConfig holds Redis connectivity parameters.
@@ -108,6 +118,18 @@ type ReadContract func(correlationKey string) (*source.ReadModel, error)
 
 // IndexContract extracts secondary index fields from a payload.
 type IndexContract func(correlationKey string, payload []byte) (map[string]interface{}, error)
+
+// =============================================================================
+// BULK READ FOUNDATION (Phase 1)
+// =============================================================================
+
+// ReadBulkContract translates a parent/lookup key into a bulk read execution plan.
+type ReadBulkContract func(lookupKey string) (*source.BulkReadModel, error)
+
+// IndexBulkContract extracts secondary index fields from multiple payloads simultaneously.
+// Returns a map of correlationKey -> indexFields.
+// This allows sluice to pipeline all SADD/ZADD operations into a single Redis transaction.
+type IndexBulkContract func(results []source.BulkReadResult) (map[string]map[string]interface{}, error)
 
 // ─── Write Path Models ───────────────────────────────────────────────────────
 

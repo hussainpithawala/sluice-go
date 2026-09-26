@@ -55,6 +55,75 @@ func setupPostgresSource(t *testing.T) (*Source, func()) {
 	return s, cleanup
 }
 
+func TestPostgresSource_ReadBulk_Success(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	pool, err := newTestPool(ctx)
+	require.NoError(t, err)
+	defer pool.Close()
+
+	tableName := "test_source_bulk_" + t.Name()
+	_, err = pool.Exec(ctx, fmt.Sprintf(`
+		CREATE TABLE IF NOT EXISTS %s (
+			id TEXT PRIMARY KEY,
+			user_id TEXT NOT NULL,
+			name TEXT NOT NULL
+		)
+	`, tableName))
+	require.NoError(t, err)
+	defer func() { _, _ = pool.Exec(ctx, fmt.Sprintf("DROP TABLE IF EXISTS %s", tableName)) }()
+
+	// Seed data
+	_, err = pool.Exec(ctx, fmt.Sprintf(`
+		INSERT INTO %s (id, user_id, name) VALUES 
+		('item_1', 'user_123', 'Alice'),
+		('item_2', 'user_123', 'Bob')
+	`, tableName))
+	require.NoError(t, err)
+
+	s := NewSourceWithPool(pool)
+
+	model := source.BulkReadModel{
+		Query: PostgresBulkReadModel{
+			Query: fmt.Sprintf("SELECT id, json_build_object('name', name) as payload FROM %s WHERE user_id = $1", tableName),
+			Args:  []any{"user_123"},
+			Projector: func(rows pgx.Rows) ([]source.BulkReadResult, error) {
+				var results []source.BulkReadResult
+				for rows.Next() {
+					var id string
+					var payload []byte
+					if err := rows.Scan(&id, &payload); err != nil {
+						return nil, err
+					}
+					results = append(results, source.BulkReadResult{
+						CorrelationKey: id,
+						Payload:        payload,
+					})
+				}
+				return results, rows.Err()
+			},
+		},
+	}
+
+	results, err := s.ReadBulk(ctx, model)
+	require.NoError(t, err)
+	assert.Len(t, results, 2)
+
+	// Verify one of the results
+	found := false
+	for _, r := range results {
+		if r.CorrelationKey == "item_1" {
+			var payload map[string]any
+			err := json.Unmarshal(r.Payload, &payload)
+			require.NoError(t, err)
+			assert.Equal(t, "Alice", payload["name"])
+			found = true
+		}
+	}
+	assert.True(t, found)
+}
+
 func TestPostgresSource_Read_Success(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()

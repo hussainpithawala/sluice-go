@@ -229,7 +229,11 @@ func hotRegimeSimulator(ctx context.Context, sl *sluice.Sluice, log *slog.Logger
 			}
 			log.Info("hot regime: pre-login state", "correlationKey", correlationKey, "is_hot", isHot)
 
-			payload, err := sl.HotLoad(ctx, correlationKey)
+			if err := sl.HotLoad(ctx, correlationKey); err != nil {
+				log.Error("hotload failed", "err", err)
+			}
+			// If you need the payload immediately, use Read() instead:
+			payload, err := sl.Read(ctx, correlationKey)
 			if err != nil {
 				log.Info("hot regime: HotLoad (new correlation_key, writing directly)", "correlationKey", correlationKey, "err", err)
 				newPayload, _ := json.Marshal(NudgeInventoryPayload{

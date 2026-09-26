@@ -210,17 +210,21 @@ func hotWriteSimulator(ctx context.Context, sl *sluice.Sluice, log *slog.Logger,
 			return
 		case <-ticker.C:
 			sessionCount++
-			crn := fmt.Sprintf("crn_hot_%06d", sessionCount)
-			log.Info("═══ HOT SESSION START ═══", "crn", crn, "session", sessionCount)
+			correlationKey := fmt.Sprintf("crn_hot_%06d", sessionCount)
+			log.Info("═══ HOT SESSION START ═══", "crn", correlationKey, "session", sessionCount)
 
 			// ─── Step 1: User logs in → HotLoad warms the journal ───────────
 			// This is the ONLY difference between hot and cold.
 			// HotLoad() writes the payload AND sets the hot marker.
 			// After this, IsHot(crn) == true for ActivityWindow duration.
-			payload, err := sl.HotLoad(ctx, crn)
+			if err := sl.HotLoad(ctx, correlationKey); err != nil {
+				log.Error("hotload failed", "err", err)
+			}
+			// If you need the payload immediately, use Read() instead:
+			payload, err := sl.Read(ctx, correlationKey)
 			if err != nil {
 				// New CRN not in DocumentDB yet — write directly to establish state.
-				log.Info("hot session: new CRN, seeding via direct write", "crn", crn)
+				log.Info("hot session: new CRN, seeding via direct write", "crn", correlationKey)
 				payload, _ = json.Marshal(NudgeInventoryPayload{
 					NudgeMasterID: "nm_welcome_bonus",
 					Channel:       "push",
@@ -229,17 +233,17 @@ func hotWriteSimulator(ctx context.Context, sl *sluice.Sluice, log *slog.Logger,
 					ExpiresAt:     time.Now().Add(48 * time.Hour),
 					LastUpdated:   time.Now().UTC(),
 				})
-				if writeErr := sl.Write(ctx, crn, payload); writeErr != nil {
-					log.Error("hot session: seed write failed", "crn", crn, "err", writeErr)
+				if writeErr := sl.Write(ctx, correlationKey, payload); writeErr != nil {
+					log.Error("hot session: seed write failed", "crn", correlationKey, "err", writeErr)
 					continue
 				}
 			} else {
-				log.Info("hot session: HotLoad success (warmed from Source)", "crn", crn, "bytes", len(payload))
+				log.Info("hot session: HotLoad success (warmed from Source)", "crn", correlationKey, "bytes", len(payload))
 			}
 
 			// ─── Step 2: Verify CRN is hot ───────────────────────────────────
-			isHot, _ := sl.IsHot(ctx, crn)
-			log.Info("hot session: post-login state", "crn", crn, "is_hot", isHot)
+			isHot, _ := sl.IsHot(ctx, correlationKey)
+			log.Info("hot session: post-login state", "crn", correlationKey, "is_hot", isHot)
 
 			// ─── Step 3: HOT WRITE — user action via sync API ────────────────
 			// This is the SAME sl.Write() call as the cold path.
@@ -253,12 +257,12 @@ func hotWriteSimulator(ctx context.Context, sl *sluice.Sluice, log *slog.Logger,
 			hotPayload, _ := json.Marshal(current)
 
 			writeStart := time.Now()
-			if err := sl.Write(ctx, crn, hotPayload); err != nil {
-				log.Error("hot session: write failed", "crn", crn, "err", err)
+			if err := sl.Write(ctx, correlationKey, hotPayload); err != nil {
+				log.Error("hot session: write failed", "crn", correlationKey, "err", err)
 				continue
 			}
 			log.Info("hot session: HOT WRITE committed to journal",
-				"crn", crn,
+				"crn", correlationKey,
 				"write_latency_us", time.Since(writeStart).Microseconds(),
 				"note", "HotAwareFlush will trigger immediate band flush",
 			)
@@ -268,17 +272,17 @@ func hotWriteSimulator(ctx context.Context, sl *sluice.Sluice, log *slog.Logger,
 			// - Hot:  returns from Redis in <1ms, lazy-refreshes TTL if <20% remaining
 			// - Cold: falls back to Source (DocumentDB) via ReadContract
 			readStart := time.Now()
-			readPayload, err := sl.Read(ctx, crn)
+			readPayload, err := sl.Read(ctx, correlationKey)
 			readLatency := time.Since(readStart)
 			if err != nil {
-				log.Error("hot session: read failed", "crn", crn, "err", err)
+				log.Error("hot session: read failed", "crn", correlationKey, "err", err)
 				continue
 			}
 
 			var readResult NudgeInventoryPayload
 			_ = json.Unmarshal(readPayload, &readResult)
 			log.Info("hot session: READ served from journal",
-				"crn", crn,
+				"crn", correlationKey,
 				"read_latency_us", readLatency.Microseconds(),
 				"priority", readResult.Priority,
 				"channel", readResult.Channel,
@@ -303,7 +307,7 @@ func hotWriteSimulator(ctx context.Context, sl *sluice.Sluice, log *slog.Logger,
 				}
 			}
 
-			log.Info("═══ HOT SESSION END ═══", "crn", crn)
+			log.Info("═══ HOT SESSION END ═══", "crn", correlationKey)
 		}
 	}
 }

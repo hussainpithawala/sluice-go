@@ -11,12 +11,6 @@ import (
 	"github.com/hussainpithawala/sluice-go/source"
 )
 
-// Source implements source.Source for AWS DynamoDB cold reads.
-type Source struct {
-	client    *dynamodb.Client
-	tableName string
-}
-
 // NewSource creates a new DynamoDB source.
 func NewSource(client *dynamodb.Client, tableName string) *Source {
 	return &Source{
@@ -66,6 +60,35 @@ func (s *Source) Read(ctx context.Context, model source.ReadModel) ([]byte, erro
 	}
 
 	return jsonBytes, nil
+}
+
+// ReadBulk executes the Query defined in DynamoBulkReadModel and delegates
+// the result shaping entirely to the operator's Projector function.
+func (s *Source) ReadBulk(ctx context.Context, model source.BulkReadModel) ([]source.BulkReadResult, error) {
+	dynModel, ok := model.Query.(DynamoBulkReadModel)
+	if !ok {
+		return nil, fmt.Errorf("dynamodb source requires Query to be dynamodb.DynamoBulkReadModel")
+	}
+
+	if dynModel.Input == nil {
+		return nil, fmt.Errorf("dynamodb source requires a non-nil QueryInput")
+	}
+
+	if dynModel.Projector == nil {
+		return nil, fmt.Errorf("dynamodb source requires a non-nil Projector function")
+	}
+
+	// Execute the Query.
+	// Note: For cache pre-warming, a single Query page is typically sufficient.
+	// If the operator expects massive result sets, they should handle pagination
+	// in their ReadBulkContract by making multiple calls, or we can add pagination
+	// logic here in Phase 3 if a concrete use-case demands it.
+	output, err := s.client.Query(ctx, dynModel.Input)
+	if err != nil {
+		return nil, fmt.Errorf("dynamodb: bulk read query execution failed: %w", err)
+	}
+
+	return dynModel.Projector(output.Items)
 }
 
 // Ping verifies connectivity to the DynamoDB table.

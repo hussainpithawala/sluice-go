@@ -78,15 +78,22 @@ func New(cfg RedisConfig, namespace string, bandCount int, keyTTL time.Duration,
 		_ = client.Close()
 		return nil, fmt.Errorf("sluice/shield: script load: %w", err)
 	}
+	hydrateSHA, err := client.ScriptLoad(ctx, hydrateLua).Result()
+	if err != nil {
+		_ = client.Close()
+		return nil, fmt.Errorf("sluice/shield: hydrate script load: %w", err)
+	}
 	return &Shield{
-		client:         client,
-		namespace:      namespace,
-		bandCount:      bandCount,
-		keyTTL:         keyTTL,
-		activityWindow: activityWindow,
-		dlqTTL:         7 * 24 * time.Hour, // dead-letter payloads kept 7 days
-		writeScript:    redis.NewScript(atomicWriteLua),
-		writeScriptSHA: sha,
+		client:           client,
+		namespace:        namespace,
+		bandCount:        bandCount,
+		keyTTL:           keyTTL,
+		activityWindow:   activityWindow,
+		dlqTTL:           7 * 24 * time.Hour, // dead-letter payloads kept 7 days
+		writeScript:      redis.NewScript(atomicWriteLua),
+		writeScriptSHA:   sha,
+		hydrateScript:    redis.NewScript(hydrateLua),
+		hydrateScriptSHA: hydrateSHA,
 	}, nil
 }
 
@@ -246,6 +253,36 @@ func (s *Shield) ReadJournal(ctx context.Context, correlationKey string) (Journa
 func (s *Shield) ReadWithTTL(ctx context.Context, correlationKey string) ([]byte, time.Duration, bool, error) {
 	jr, err := s.ReadJournal(ctx, correlationKey)
 	return jr.Payload, jr.PTTL, jr.Found, err
+}
+
+// BulkGetTTL fetches the remaining PTTL for multiple correlation keys in a
+// single Redis pipeline round-trip. All key formatting and pipeline execution
+// are handled internally to maintain the shield abstraction.
+func (s *Shield) BulkGetTTL(ctx context.Context, correlationKeys []string) (map[string]int64, error) {
+	if len(correlationKeys) == 0 {
+		return map[string]int64{}, nil
+	}
+
+	pipe := s.client.Pipeline()
+	cmds := make(map[string]*redis.DurationCmd, len(correlationKeys))
+
+	for _, ck := range correlationKeys {
+		band := s.BandFor(ck)
+		key := PayloadKey(s.namespace, band, ck)
+		cmds[ck] = pipe.PTTL(ctx, key)
+	}
+
+	_, err := pipe.Exec(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	result := make(map[string]int64, len(correlationKeys))
+	for ck, cmd := range cmds {
+		result[ck] = cmd.Val().Milliseconds()
+	}
+
+	return result, nil
 }
 
 // SetNX implements exactly-once delivery via SETNX EX.
