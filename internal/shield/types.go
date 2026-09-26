@@ -15,6 +15,12 @@ type FlushRecord struct {
 	Payload        []byte
 	ReceivedAt     time.Time
 	JournalTS      int64 // UnixMilli write ts; 0 if absent
+	// Seq is the payload's per-key write sequence ('v', bumped by every
+	// write) at drain time; "" for entries written before sequencing. Commit
+	// and dead-letter are conditional on it, so a write that lands while the
+	// batch is in flight — even within the same millisecond — is never
+	// removed from the dirty set.
+	Seq string
 }
 
 // WriteOptions configures optional behaviors for a single write operation.
@@ -125,7 +131,8 @@ type Shield struct {
 	hydrateScript    *redis.Script
 	hydrateScriptSHA string // pre-loaded SHA; used by BulkHydrateJournal pipelines
 
-	flushedTTLScript *redis.Script // post-flush TTL, guarded by the flushed ts
+	commitScript     *redis.Script // conditional commit + post-flush TTL
+	deadLetterScript *redis.Script // conditional move to dead-letter
 	extendTTLScript  *redis.Script // extend-only TTL refresh for flushed payloads
 
 	// Batching fields — all nil/zero when batching is disabled.
@@ -159,36 +166,84 @@ type JournalRead struct {
 // PERSIST is required, not just omitting EXPIRE: HSET keeps whatever TTL the
 // hash already has, so re-writing a previously flushed key would otherwise
 // inherit its post-flush TTL and could expire before the new value is
-// flushed. The post-flush TTL is applied by flushedTTLLua after the sink
+// flushed. The post-flush TTL is applied by commitFlushedLua after the sink
 // confirms the write.
+//
+// HINCRBY 'v' gives every write a per-key sequence, which commit and
+// dead-letter compare against: the ms timestamp alone cannot tell apart two
+// writes in the same millisecond.
 const atomicWriteLua = `
 redis.call('HSET', KEYS[1], 'p', ARGV[1], 'ts', ARGV[2])
+redis.call('HINCRBY', KEYS[1], 'v', 1)
 redis.call('PERSIST', KEYS[1])
 redis.call('ZADD', KEYS[2], ARGV[2], ARGV[3])
 return 1`
 
-// flushedTTLLua applies the post-flush TTL, but only if the payload is still
-// the version that was flushed. A newer write that landed while the batch was
-// in flight has a different ts and must stay persistent until it is flushed.
+// commitFlushedLua commits one flushed key atomically, but only if the
+// payload is still the version that was drained (same 'v'). Otherwise a
+// newer write landed while the batch was in flight: the key is left dirty
+// and persistent so that write is flushed on the next cycle.
 //
-// KEYS[1]=payload hash; ARGV[1]=flushed ts, ARGV[2]=ttl in ms.
-// Returns 1 if the TTL was applied, 0 if skipped.
-const flushedTTLLua = `
-local ts = redis.call('HGET', KEYS[1], 'ts')
-if ts and tonumber(ts) == tonumber(ARGV[1]) then
-    return redis.call('PEXPIRE', KEYS[1], ARGV[2])
+// On commit it removes the key from the dirty set and applies the post-flush
+// TTL; when the key is indexed (its idxv hash exists), the index expiry
+// queue is scored with that expiry so its index entries are pruned when it
+// dies. A non-positive TTL commits without setting one (PEXPIRE 0 deletes).
+//
+// KEYS[1]=dirty set, KEYS[2]=payload hash, KEYS[3]=index expiry ZSET,
+// KEYS[4]=idxv hash; ARGV[1]=correlation key, ARGV[2]=drained seq ("" for
+// pre-sequencing entries), ARGV[3]=ttl in ms, ARGV[4]=expiry (Unix ms).
+// Returns 1 if committed, 0 if skipped because the payload changed.
+const commitFlushedLua = `
+local cur = redis.call('HGET', KEYS[2], 'v') or ''
+if cur ~= ARGV[2] then
+    return 0
 end
-return 0`
+redis.call('ZREM', KEYS[1], ARGV[1])
+local ttl = tonumber(ARGV[3])
+if ttl > 0 then
+    redis.call('PEXPIRE', KEYS[2], ttl)
+    if redis.call('EXISTS', KEYS[4]) == 1 then
+        redis.call('ZADD', KEYS[3], ARGV[4], ARGV[1])
+    end
+end
+return 1`
+
+// deadLetterIfUnchangedLua moves one key from the dirty set to the
+// dead-letter set, but only if its payload is still the drained version.
+// A newer write means the failure applied to a superseded payload; the key
+// stays dirty and the new payload is retried normally.
+//
+// KEYS[1]=dirty set, KEYS[2]=dead-letter set, KEYS[3]=payload hash;
+// ARGV[1]=correlation key, ARGV[2]=drained seq, ARGV[3]=failure ts (ms),
+// ARGV[4]=reason, ARGV[5]=dead-letter TTL in ms.
+// Returns 1 if dead-lettered, 0 if skipped.
+const deadLetterIfUnchangedLua = `
+local cur = redis.call('HGET', KEYS[3], 'v') or ''
+if cur ~= ARGV[2] then
+    return 0
+end
+redis.call('ZADD', KEYS[2], ARGV[3], ARGV[1])
+redis.call('HSET', KEYS[3], 'dlq_reason', ARGV[4], 'dlq_at', ARGV[3])
+redis.call('PEXPIRE', KEYS[3], ARGV[5])
+redis.call('ZREM', KEYS[1], ARGV[1])
+return 1`
 
 // extendTTLLua extends a flushed payload's TTL to at least ARGV[1] ms.
 // A persistent key (PTTL -1) is unflushed and is left untouched, as is a
-// missing key (-2); an existing longer TTL is never shortened.
+// missing key (-2); an existing longer TTL is never shortened. An indexed
+// key's expiry-queue entry is re-scored to match.
 //
-// KEYS[1]=payload hash; ARGV[1]=ttl in ms. Returns 1 if extended, else 0.
+// KEYS[1]=payload hash, KEYS[2]=index expiry ZSET, KEYS[3]=idxv hash;
+// ARGV[1]=ttl in ms, ARGV[2]=expiry (Unix ms), ARGV[3]=correlation key.
+// Returns 1 if extended, else 0.
 const extendTTLLua = `
 local pttl = redis.call('PTTL', KEYS[1])
 if pttl >= 0 and pttl < tonumber(ARGV[1]) then
-    return redis.call('PEXPIRE', KEYS[1], ARGV[1])
+    redis.call('PEXPIRE', KEYS[1], ARGV[1])
+    if redis.call('EXISTS', KEYS[3]) == 1 then
+        redis.call('ZADD', KEYS[2], ARGV[2], ARGV[3])
+    end
+    return 1
 end
 return 0`
 
@@ -261,6 +316,7 @@ if existingHash == contentHash then
 end
 
 redis.call('HSET', payloadKey, 'p', payload, 'ts', score, 'h', contentHash)
+redis.call('HINCRBY', payloadKey, 'v', 1)
 redis.call('PERSIST', payloadKey)
 redis.call('ZADD', dirtyKey, score, corrKey)
 return 1

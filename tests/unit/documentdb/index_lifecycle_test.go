@@ -206,6 +206,118 @@ func TestRegisterExistingIndexes_LegacyKeysAreSwept(t *testing.T) {
 	assert.Equal(t, []string{keys[0]}, members)
 }
 
+// writeIndexedFlushed writes ck, indexes it, and flushes it with ttl.
+func writeIndexedFlushed(t *testing.T, s *shield.Shield, ck string, ttl time.Duration) {
+	t.Helper()
+	ctx := context.Background()
+	require.NoError(t, s.Write(ctx, ck, []byte(`{"v":"`+ck+`"}`)))
+	require.NoError(t, s.UpdateIndexes(ctx, ck, map[string]interface{}{
+		"channel": "push", "priority": float64(1),
+	}, time.Hour))
+	simulateFlush(t, s, ck, ttl)
+}
+
+func expiryScore(t *testing.T, s *shield.Shield, ck string) (float64, bool) {
+	t.Helper()
+	score, err := s.Client().ZScore(context.Background(), shield.IndexExpiryKey(s.Namespace(), s.BandFor(ck)), ck).Result()
+	if err != nil {
+		return 0, false
+	}
+	return score, true
+}
+
+func TestPruneExpiredIndexes_PrunesOncePayloadExpires(t *testing.T) {
+	s := newTestShield(t, "test_prune_expired")
+	t.Cleanup(func() { _ = s.Close() })
+	ctx := context.Background()
+	const ck = "prune_001"
+	band := s.BandFor(ck)
+
+	writeIndexedFlushed(t, s, ck, 200*time.Millisecond)
+	score, ok := expiryScore(t, s, ck)
+	require.True(t, ok, "flush should enqueue the indexed key")
+	assert.InDelta(t, float64(time.Now().Add(200*time.Millisecond).UnixMilli()), score, 1000,
+		"queue score should be the post-flush expiry")
+
+	time.Sleep(300 * time.Millisecond) // payload expires
+
+	processed, pruned, err := s.PruneExpiredIndexes(ctx, band, time.Now(), 100)
+	require.NoError(t, err)
+	assert.Equal(t, 1, processed)
+	assert.Equal(t, 1, pruned)
+
+	inSet, err := s.Client().SIsMember(ctx, shield.IndexKey(s.Namespace(), band, "channel", "push"), ck).Result()
+	require.NoError(t, err)
+	assert.False(t, inSet, "dead key must leave the equality index")
+	_, err = s.ZScore(ctx, shield.RangeIndexKey(s.Namespace(), band, "priority"), ck)
+	assert.Error(t, err, "dead key must leave the range index")
+	n, err := s.Client().Exists(ctx, shield.IndexValuesKey(s.Namespace(), band, ck)).Result()
+	require.NoError(t, err)
+	assert.Zero(t, n, "idxv hash must be deleted, not left for its 4h backstop TTL")
+	_, ok = expiryScore(t, s, ck)
+	assert.False(t, ok, "pruned key must leave the expiry queue")
+}
+
+func TestPruneExpiredIndexes_KeepsLiveAndUnflushedKeys(t *testing.T) {
+	s := newTestShield(t, "test_prune_live")
+	t.Cleanup(func() { _ = s.Close() })
+	ctx := context.Background()
+
+	band, keys := findKeysForTest(t, s, "prune_live", 2)
+	alive, rewritten := keys[0], keys[1]
+	writeIndexedFlushed(t, s, alive, time.Hour)
+	writeIndexedFlushed(t, s, rewritten, time.Hour)
+	time.Sleep(2 * time.Millisecond)
+	require.NoError(t, s.Write(ctx, rewritten, []byte(`{"v":2}`))) // unflushed again
+
+	// Pretend it is 2h later so both entries are due.
+	later := time.Now().Add(2 * time.Hour)
+	processed, pruned, err := s.PruneExpiredIndexes(ctx, band, later, 100)
+	require.NoError(t, err)
+	assert.Equal(t, 2, processed)
+	assert.Zero(t, pruned, "live payloads must never be pruned")
+
+	score, ok := expiryScore(t, s, alive)
+	require.True(t, ok, "live key stays queued")
+	assert.Greater(t, score, float64(later.UnixMilli()), "live key re-scored to its real expiry")
+
+	_, ok = expiryScore(t, s, rewritten)
+	assert.False(t, ok, "unflushed key leaves the queue until its next flush")
+
+	for _, ck := range keys {
+		inSet, err := s.Client().SIsMember(ctx, shield.IndexKey(s.Namespace(), band, "channel", "push"), ck).Result()
+		require.NoError(t, err)
+		assert.True(t, inSet, "%s must keep its index entries", ck)
+	}
+}
+
+func TestRefreshHotTTL_ReschedulesIndexExpiry(t *testing.T) {
+	s := newTestShield(t, "test_prune_refresh") // activityWindow 4h
+	t.Cleanup(func() { _ = s.Close() })
+	ctx := context.Background()
+	const ck = "prune_refresh_001"
+
+	writeIndexedFlushed(t, s, ck, 5*time.Second)
+	require.NoError(t, s.RefreshHotTTL(ctx, s.BandFor(ck), []string{ck}))
+
+	score, ok := expiryScore(t, s, ck)
+	require.True(t, ok)
+	assert.Greater(t, score, float64(time.Now().Add(3*time.Hour).UnixMilli()),
+		"extending the payload TTL must push back its index expiry")
+}
+
+func TestCommitFlushed_EnqueuesOnlyIndexedKeys(t *testing.T) {
+	s := newTestShield(t, "test_prune_unindexed")
+	t.Cleanup(func() { _ = s.Close() })
+	const ck = "unindexed_001"
+
+	require.NoError(t, s.Write(context.Background(), ck, []byte(`{"v":1}`)))
+	simulateFlush(t, s, ck, 30*time.Second)
+
+	_, ok := expiryScore(t, s, ck)
+	assert.False(t, ok, "namespaces without indexes must not grow an expiry queue")
+}
+
 func TestCountHotMarkers(t *testing.T) {
 	s := newTestShield(t, "test_count_hot")
 	t.Cleanup(func() { _ = s.Close() })

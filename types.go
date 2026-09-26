@@ -93,8 +93,10 @@ type Config struct {
 	HotSetSampleInterval time.Duration
 
 	// IndexSweepInterval controls how often one band's secondary indexes are
-	// swept for members whose payload has expired (0 → 15s default, negative
-	// disables). A full pass over all bands takes BandCount intervals.
+	// fully swept for members whose payload has expired (0 → 15s default,
+	// negative disables). A full pass over all bands takes BandCount
+	// intervals. This is a safety net; expired entries are normally pruned
+	// within about a second via the index expiry queue.
 	IndexSweepInterval time.Duration
 
 	// Single-key contracts

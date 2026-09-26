@@ -102,7 +102,7 @@ func (r *countingRecorder) snapshot() (hits, misses int) {
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
-const l1TestDB = 15
+const l1TestDB = 14 // not 15: see bcastTestDB
 
 func l1RedisAddr() string {
 	if a := os.Getenv("REDIS_ADDR"); a != "" {

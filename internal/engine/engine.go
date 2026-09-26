@@ -210,9 +210,11 @@ func (e *Engine) runBand(band int) {
 //  2. Apply WriteContract to each record.
 //  3. BulkWrite to the sink.
 //  4. Partition results:
-//     - Success            → CommitKeys (ZREM from dirty set) + post-flush TTL
+//     - Success            → CommitFlushed: ZREM from dirty set + post-flush TTL
 //     (ActivityWindow if hot, else KeyTTL; unflushed payloads have none).
-//     - Permanent failure  → MoveToDeadLetter (duplicate key, code 11000).
+//     - Permanent failure  → DeadLetterIfUnchanged (duplicate key, code 11000).
+//     Both are conditional on the drained write sequence: a key rewritten
+//     mid-flush stays dirty so its newer payload is flushed next cycle.
 //     - Transient failure  → no action; keys remain in dirty set for retry.
 //     - Total failure      → no action; all keys remain in dirty set for retry.
 //
@@ -238,9 +240,10 @@ func (e *Engine) flushBand(ctx context.Context, band int) error {
 		return nil
 	}
 
-	// JournalTS of each drained version, for the post-flush TTL guard.
-	journalTS := make(map[string]int64, len(records))
-	var missing []string
+	// Write sequence of each drained version. Commit and dead-letter are
+	// conditional on it, so a write landing mid-flush is never dropped.
+	seqs := make(map[string]string, len(records))
+	var missing []shield.VersionedKey
 
 	// Apply WriteContract — build sink models.
 	models := make([]sink.WriteModel, 0, len(records))
@@ -248,19 +251,20 @@ func (e *Engine) flushBand(ctx context.Context, band int) error {
 
 	for _, rec := range records {
 		if rec.Payload == nil {
-			missing = append(missing, rec.CorrelationKey)
+			missing = append(missing, shield.VersionedKey{CorrelationKey: rec.CorrelationKey, Seq: rec.Seq})
 			continue
 		}
-		journalTS[rec.CorrelationKey] = rec.JournalTS
+		seqs[rec.CorrelationKey] = rec.Seq
 
 		wm, contractErr := e.writeContract(rec.CorrelationKey, rec.Payload)
 		if contractErr != nil {
 			// Contract violation is a permanent failure for this key.
-			// Move to dead-letter to break an infinite retry loop.
+			// Move to dead-letter to break an infinite retry loop — unless
+			// the key was rewritten meanwhile, in which case the new
+			// payload deserves its own attempt.
 			e.metrics.RecordContractError(e.cfg.Namespace, rec.CorrelationKey, contractErr)
-			_ = e.shield.MoveToDeadLetter(ctx, band,
-				[]string{rec.CorrelationKey}, "contract_violation")
-			e.metrics.RecordDeadLetter(e.cfg.Namespace, bandStr, 1)
+			e.deadLetter(ctx, band, bandStr,
+				[]shield.VersionedKey{{CorrelationKey: rec.CorrelationKey, Seq: rec.Seq}}, "contract_violation")
 			if e.callback != nil {
 				e.callback(
 					[]string{rec.CorrelationKey},
@@ -341,24 +345,18 @@ func (e *Engine) flushBand(ctx context.Context, band int) error {
 		}
 	}
 
-	// Commit successful keys — ZREM from dirty set — then give them their
-	// post-flush TTL. Until now they were persistent, since Redis held the
-	// only copy.
-	if len(successKeys) > 0 {
-		if commitErr := e.shield.CommitKeys(ctx, band, successKeys); commitErr == nil {
-			e.applyFlushedTTLs(ctx, successKeys, journalTS)
-		}
-	}
+	// Commit successful keys: remove from the dirty set and apply the
+	// post-flush TTL (until now they were persistent, since Redis held the
+	// only copy). Keys rewritten mid-flush stay dirty for the next cycle.
+	e.commitFlushed(ctx, band, successKeys, seqs)
 
 	// Route permanently failed keys to dead-letter.
 	if len(permanentKeys) > 0 {
-		if dlqErr := e.shield.MoveToDeadLetter(ctx, band, permanentKeys, "duplicate_key"); dlqErr != nil {
-			// If MoveToDeadLetter fails, keys stay in dirty set — they will
-			// fail again on retry, but they will not be silently lost.
-			e.metrics.RecordRedisOp(e.cfg.Namespace, "move_to_dlq", 0, dlqErr)
-		} else {
-			e.metrics.RecordDeadLetter(e.cfg.Namespace, bandStr, len(permanentKeys))
+		items := make([]shield.VersionedKey, len(permanentKeys))
+		for i, k := range permanentKeys {
+			items[i] = shield.VersionedKey{CorrelationKey: k, Seq: seqs[k]}
 		}
+		e.deadLetter(ctx, band, bandStr, items, "duplicate_key")
 	}
 
 	if e.callback != nil {
@@ -368,13 +366,19 @@ func (e *Engine) flushBand(ctx context.Context, band int) error {
 	return nil
 }
 
-// applyFlushedTTLs gives freshly committed keys their post-flush TTL:
+// commitFlushed commits successfully flushed keys with their post-flush TTL:
 // ActivityWindow for hot keys (whose marker is also refreshed) when
 // HotAwareFlush is on, KeyTTL otherwise. Three pipelines per batch rather
-// than several round-trips per key. The TTL is guarded by each key's
-// flushed JournalTS, so a newer write that arrived mid-flush stays
-// persistent until it is flushed itself.
-func (e *Engine) applyFlushedTTLs(ctx context.Context, successKeys []string, journalTS map[string]int64) {
+// than several round-trips per key.
+//
+// Each commit is conditional on the key's drained write sequence: a key
+// rewritten while the batch was in flight — even within the same
+// millisecond — keeps its dirty entry and stays persistent, so the newer
+// payload is flushed next cycle instead of being dropped.
+func (e *Engine) commitFlushed(ctx context.Context, band int, successKeys []string, seqs map[string]string) {
+	if len(successKeys) == 0 {
+		return
+	}
 	var hot []bool
 	if e.cfg.HotAwareFlush {
 		var err error
@@ -393,15 +397,36 @@ func (e *Engine) applyFlushedTTLs(ctx context.Context, successKeys []string, jou
 			ttl = e.cfg.ActivityWindow
 			hotKeys = append(hotKeys, ck)
 		}
-		items[i] = shield.FlushedKey{CorrelationKey: ck, JournalTS: journalTS[ck], TTL: ttl}
+		items[i] = shield.FlushedKey{CorrelationKey: ck, Seq: seqs[ck], TTL: ttl}
 	}
 
 	if err := e.shield.RefreshHotMarkers(ctx, hotKeys, e.cfg.ActivityWindow); err != nil {
 		e.metrics.RecordRedisOp(e.cfg.Namespace, "refresh_hot_markers", 0, err)
 	}
 	t := time.Now()
-	err := e.shield.ApplyFlushedTTLs(ctx, items)
-	e.metrics.RecordRedisOp(e.cfg.Namespace, "apply_flushed_ttl", time.Since(t), err)
+	changed, err := e.shield.CommitFlushed(ctx, band, items)
+	// On error nothing is lost: uncommitted keys stay dirty and are
+	// re-flushed (upserts are idempotent).
+	e.metrics.RecordRedisOp(e.cfg.Namespace, "commit_flushed", time.Since(t), err)
+	if len(changed) > 0 {
+		slog.Debug("sluice: keys rewritten during flush left dirty",
+			"namespace", e.cfg.Namespace, "band", band, "count", len(changed))
+	}
+}
+
+// deadLetter moves keys to the dead-letter set, skipping any rewritten since
+// they were drained (their new payload is retried normally). On failure the
+// keys stay dirty — they will fail again on retry, but they will not be
+// silently lost.
+func (e *Engine) deadLetter(ctx context.Context, band int, bandStr string, items []shield.VersionedKey, reason string) {
+	moved, err := e.shield.DeadLetterIfUnchanged(ctx, band, items, reason)
+	if err != nil {
+		e.metrics.RecordRedisOp(e.cfg.Namespace, "move_to_dlq", 0, err)
+		return
+	}
+	if len(moved) > 0 {
+		e.metrics.RecordDeadLetter(e.cfg.Namespace, bandStr, len(moved))
+	}
 }
 
 // handleMissingPayloads surfaces dirty keys whose payload was gone at flush
@@ -411,10 +436,16 @@ func (e *Engine) applyFlushedTTLs(ctx context.Context, successKeys []string, jou
 // dropped silently.
 //
 // The dead-letter entry carries no payload, so a DLQ run will discard it;
-// the log and metric are the durable record.
-func (e *Engine) handleMissingPayloads(ctx context.Context, band int, bandStr string, keys []string) {
-	if len(keys) == 0 {
+// the log and metric are the durable record. A key rewritten since it was
+// drained is not dead-lettered: its new payload is flushed normally (only
+// the earlier version was lost).
+func (e *Engine) handleMissingPayloads(ctx context.Context, band int, bandStr string, items []shield.VersionedKey) {
+	if len(items) == 0 {
 		return
+	}
+	keys := make([]string, len(items))
+	for i, it := range items {
+		keys[i] = it.CorrelationKey
 	}
 	e.metrics.RecordUnflushedExpiry(e.cfg.Namespace, bandStr, len(keys))
 	for _, ck := range keys {
@@ -422,12 +453,8 @@ func (e *Engine) handleMissingPayloads(ctx context.Context, band int, bandStr st
 			"namespace", e.cfg.Namespace, "band", band, "correlation_key", ck)
 	}
 
-	if err := e.shield.MoveToDeadLetter(ctx, band, keys, "payload_missing_before_flush"); err != nil {
-		// Keys stay in the dirty set and are reported again next cycle.
-		e.metrics.RecordRedisOp(e.cfg.Namespace, "move_to_dlq", 0, err)
-	} else {
-		e.metrics.RecordDeadLetter(e.cfg.Namespace, bandStr, len(keys))
-	}
+	// On failure keys stay in the dirty set and are reported again next cycle.
+	e.deadLetter(ctx, band, bandStr, items, "payload_missing_before_flush")
 
 	if e.callback != nil {
 		errs := make([]sink.SinkError, len(keys))

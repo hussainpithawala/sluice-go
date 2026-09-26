@@ -144,9 +144,11 @@ func (b *Builder) WithHotSetSampleInterval(d time.Duration) *Builder {
 	return b
 }
 
-// WithIndexSweepInterval sets how often one band's secondary indexes are swept
-// for members whose payload has expired. Zero uses the 15s default; a
-// negative value disables the sweeper (Query still prunes what it touches).
+// WithIndexSweepInterval sets how often one band's secondary indexes are fully
+// swept for members whose payload has expired. Zero uses the 15s default; a
+// negative value disables the full sweep. Expired index entries are still
+// pruned promptly via the expiry queue, and Query prunes what it touches;
+// the sweep is a safety net for anything those miss.
 func (b *Builder) WithIndexSweepInterval(d time.Duration) *Builder {
 	b.cfg.IndexSweepInterval = d
 	return b
@@ -187,6 +189,13 @@ func (b *Builder) Build(ctx context.Context) (*Sluice, error) {
 
 		if b.callback != nil {
 			wrappedCb = func(keys []string, result *sink.BulkWriteResult, err error) {
+				// Sinks return a nil result when BulkWrite fails outright.
+				// Hand the callback an empty result rather than nil, so
+				// neither this wrapper nor a callback that reads
+				// result.Errors before checking err can panic.
+				if result == nil {
+					result = &sink.BulkWriteResult{}
+				}
 				pubResult := &BulkWriteResult{
 					InsertedCount: result.InsertedCount,
 					MatchedCount:  result.MatchedCount,
@@ -994,17 +1003,28 @@ func (s *Sluice) startGaugeSampler() {
 	}()
 }
 
-// indexSweepBatch is the SSCAN/ZSCAN page size (and EXISTS pipeline size)
-// used by the index sweeper.
-const indexSweepBatch = 500
+const (
+	// indexSweepBatch is the SSCAN/ZSCAN page size (and EXISTS pipeline size)
+	// used by the index sweeper, and the expiry-queue batch for the pruner.
+	indexSweepBatch = 500
 
-// startIndexSweeper prunes index members whose payload has expired, one band
-// per tick, so index memory tracks the live journal even when nothing queries.
+	// indexPruneInterval is how often each band's index expiry queue is
+	// drained. Pruning is O(expired keys), so it can run frequently.
+	indexPruneInterval = time.Second
+
+	// indexPruneMaxBatches caps expiry-queue batches per band per tick, so a
+	// backlog on one band cannot starve the others.
+	indexPruneMaxBatches = 20
+)
+
+// startIndexSweeper keeps index memory tracking the live journal even when
+// nothing queries. Two loops share one goroutine:
+//   - the pruner drains each band's expiry queue every indexPruneInterval,
+//     removing index entries of payloads that have just expired;
+//   - the sweeper (IndexSweepInterval, one band per tick; negative disables)
+//     is a safety net that walks whole indexes for anything the queue missed.
 func (s *Sluice) startIndexSweeper() {
 	interval := s.cfg.IndexSweepInterval
-	if interval < 0 {
-		return
-	}
 	if interval == 0 {
 		interval = 15 * time.Second
 	}
@@ -1016,20 +1036,30 @@ func (s *Sluice) startIndexSweeper() {
 	go func() {
 		defer close(s.sweepDone)
 
-		// One-time: bring index keys written before the registry existed
-		// under the sweeper's reach.
-		if _, err := s.shield.RegisterExistingIndexes(ctx); err != nil && ctx.Err() == nil {
-			slog.Warn("sluice: index registry bootstrap failed", "namespace", s.cfg.Namespace, "error", err)
+		pruneTicker := time.NewTicker(indexPruneInterval)
+		defer pruneTicker.Stop()
+
+		// A nil channel never fires, disabling the sweep case.
+		var sweepC <-chan time.Time
+		if interval > 0 {
+			// One-time: bring index keys written before the registry existed
+			// under the sweeper's reach.
+			if _, err := s.shield.RegisterExistingIndexes(ctx); err != nil && ctx.Err() == nil {
+				slog.Warn("sluice: index registry bootstrap failed", "namespace", s.cfg.Namespace, "error", err)
+			}
+			sweepTicker := time.NewTicker(interval)
+			defer sweepTicker.Stop()
+			sweepC = sweepTicker.C
 		}
 
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
 		band := 0
 		for {
 			select {
 			case <-ctx.Done():
 				return
-			case <-ticker.C:
+			case <-pruneTicker.C:
+				s.pruneExpiredIndexes(ctx)
+			case <-sweepC:
 				sweepCtx, cancel := context.WithTimeout(ctx, interval)
 				t := time.Now()
 				scanned, pruned, err := s.shield.SweepIndexBand(sweepCtx, band, indexSweepBatch)
@@ -1042,6 +1072,35 @@ func (s *Sluice) startIndexSweeper() {
 			}
 		}
 	}()
+}
+
+// pruneExpiredIndexes drains every band's index expiry queue of entries due
+// now, up to indexPruneMaxBatches batches per band.
+func (s *Sluice) pruneExpiredIndexes(ctx context.Context) {
+	pruneCtx, cancel := context.WithTimeout(ctx, indexPruneInterval)
+	defer cancel()
+
+	t := time.Now()
+	var total int
+	var firstErr error
+	for band := 0; band < s.cfg.BandCount; band++ {
+		for i := 0; i < indexPruneMaxBatches; i++ {
+			processed, pruned, err := s.shield.PruneExpiredIndexes(pruneCtx, band, t, indexSweepBatch)
+			total += pruned
+			if err != nil {
+				if firstErr == nil {
+					firstErr = err
+				}
+				break
+			}
+			if processed < indexSweepBatch {
+				break
+			}
+		}
+	}
+	if total > 0 || firstErr != nil {
+		s.metrics.RecordRedisOp(s.cfg.Namespace, "index_prune", time.Since(t), firstErr)
+	}
 }
 
 func (s *Sluice) degradedWrite(ctx context.Context, correlationKey string, payload []byte) error {

@@ -21,10 +21,15 @@ import (
 //     lets pruning find every index a dead key belongs to.
 //   - idxreg:{band}     SET of index key names in the band. Lets the sweeper
 //     enumerate indexes without a keyspace SCAN (cluster-safe: same slot).
-//   - Pruning           members whose payload is gone are removed lazily by
-//     QueryBand and proactively by SweepIndexBand.
+//   - idxexp:{band}     ZSET of indexed keys scored by when their payload is
+//     expected to expire (ms). Written when a payload gets or extends a TTL,
+//     so PruneExpiredIndexes can remove dead members in O(expired) as soon
+//     as their payload goes, instead of waiting for a full sweep.
+//   - Pruning           members whose payload is gone are removed promptly by
+//     PruneExpiredIndexes, lazily by QueryBand, and as a safety net by
+//     SweepIndexBand (covers anything the expiry queue missed).
 //
-// All three share the {band} hash tag, so every pipeline stays single-slot.
+// All of these share the {band} hash tag, so every pipeline stays single-slot.
 
 const (
 	idxvEqPrefix = "s:" // idxv hash value for an equality field: "s:" + value
@@ -42,6 +47,12 @@ func IndexValuesKey(namespace string, band int, ck string) string {
 // IndexRegistryKey returns the per-band set of index key names.
 func IndexRegistryKey(namespace string, band int) string {
 	return fmt.Sprintf("sl:%s:idxreg:{%d}", namespace, band)
+}
+
+// IndexExpiryKey returns the per-band ZSET of indexed keys scored by the
+// expected expiry time (Unix ms) of their payload.
+func IndexExpiryKey(namespace string, band int) string {
+	return fmt.Sprintf("sl:%s:idxexp:{%d}", namespace, band)
 }
 
 // indexScore normalises a numeric index value; ok is false for non-numerics.
@@ -95,10 +106,17 @@ func (s *Shield) queueIndexUpdate(ctx context.Context, pipe redis.Pipeliner, ck 
 	}
 
 	pipe.Del(ctx, idxvKey)
+	expKey := IndexExpiryKey(s.namespace, band)
 	if len(next) > 0 {
 		pipe.HSet(ctx, idxvKey, next)
 		pipe.Expire(ctx, idxvKey, ttl)
 		pipe.Expire(ctx, regKey, ttl)
+		// Provisional expiry hint (covers hydrated payloads, which live for
+		// ttl). A flush re-scores it to the real post-flush expiry; the
+		// pruner re-checks liveness, so a stale score only delays pruning.
+		pipe.ZAdd(ctx, expKey, redis.Z{Score: float64(time.Now().Add(ttl).UnixMilli()), Member: ck})
+	} else {
+		pipe.ZRem(ctx, expKey, ck)
 	}
 }
 
@@ -150,9 +168,59 @@ func (s *Shield) pruneIndexMembers(ctx context.Context, band int, cks, fallbackS
 			}
 		}
 		pipe.Del(ctx, IndexValuesKey(s.namespace, band, ck))
+		pipe.ZRem(ctx, IndexExpiryKey(s.namespace, band), ck)
 	}
 	_, err = pipe.Exec(ctx)
 	return err
+}
+
+// PruneExpiredIndexes processes up to batch entries of band's expiry queue
+// that are due at now. Each payload's liveness is re-checked, because the
+// queue is only a hint:
+//   - gone (PTTL -2)       → pruned from every index it belongs to;
+//   - alive with a TTL     → re-scored to its real expiry (TTL was extended);
+//   - persistent (PTTL -1) → dropped from the queue; it was re-written and
+//     is unflushed, and its flush will re-enqueue it.
+//
+// Returns how many due entries were processed and how many keys were pruned;
+// processed == batch means more may be due. Cost is O(due entries),
+// independent of how many members the indexes hold.
+func (s *Shield) PruneExpiredIndexes(ctx context.Context, band int, now time.Time, batch int) (processed, pruned int, err error) {
+	expKey := IndexExpiryKey(s.namespace, band)
+	nowMs := now.UnixMilli()
+	due, err := s.client.ZRangeByScore(ctx, expKey, &redis.ZRangeBy{
+		Min: "-inf", Max: fmt.Sprintf("%d", nowMs), Count: int64(batch),
+	}).Result()
+	if err != nil || len(due) == 0 {
+		return 0, 0, err
+	}
+
+	pipe := s.client.Pipeline()
+	pttls := make([]*redis.DurationCmd, len(due))
+	for i, ck := range due {
+		pttls[i] = pipe.PTTL(ctx, PayloadKey(s.namespace, band, ck))
+	}
+	if _, err := pipe.Exec(ctx); err != nil {
+		return 0, 0, err
+	}
+
+	var dead []string
+	pipe = s.client.Pipeline()
+	for i, ck := range due {
+		// go-redis reports PTTL's sentinels raw: -2 missing, -1 no TTL.
+		switch d := pttls[i].Val(); {
+		case d == -2:
+			dead = append(dead, ck)
+		case d < 0: // persistent: unflushed rewrite
+			pipe.ZRem(ctx, expKey, ck)
+		default:
+			pipe.ZAdd(ctx, expKey, redis.Z{Score: float64(nowMs + d.Milliseconds()), Member: ck})
+		}
+	}
+	if _, err := pipe.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
+		return len(due), 0, err
+	}
+	return len(due), len(dead), s.pruneIndexMembers(ctx, band, dead, nil, nil)
 }
 
 // IndexMatch is a live correlation key that satisfied a band query.

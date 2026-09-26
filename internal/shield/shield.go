@@ -95,7 +95,8 @@ func New(cfg RedisConfig, namespace string, bandCount int, keyTTL time.Duration,
 		writeScriptSHA:   sha,
 		hydrateScript:    redis.NewScript(hydrateLua),
 		hydrateScriptSHA: hydrateSHA,
-		flushedTTLScript: redis.NewScript(flushedTTLLua),
+		commitScript:     redis.NewScript(commitFlushedLua),
+		deadLetterScript: redis.NewScript(deadLetterIfUnchangedLua),
 		extendTTLScript:  redis.NewScript(extendTTLLua),
 	}, nil
 }
@@ -356,7 +357,9 @@ func (s *Shield) Read(ctx context.Context, correlationKey string) ([]byte, bool,
 	go func() {
 		bgCtx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 		defer cancel()
-		_ = s.extendTTLScript.Run(bgCtx, s.client, []string{key}, s.activityWindow.Milliseconds()).Err()
+		ttlMs := s.activityWindow.Milliseconds()
+		_ = s.extendTTLScript.Run(bgCtx, s.client, s.ttlScriptKeys(correlationKey),
+			ttlMs, time.Now().UnixMilli()+ttlMs, correlationKey).Err()
 	}()
 
 	return []byte(val), true, nil
@@ -433,7 +436,7 @@ func (s *Shield) DrainBand(ctx context.Context, band, maxBatch int) ([]FlushReco
 	pipe := s.client.Pipeline()
 	cmds := make([]*redis.SliceCmd, len(hashKeys))
 	for i, hk := range hashKeys {
-		cmds[i] = pipe.HMGet(ctx, hk, "p", "ts")
+		cmds[i] = pipe.HMGet(ctx, hk, "p", "ts", "v")
 	}
 	if _, err := pipe.Exec(ctx); err != nil && err != redis.Nil {
 		return nil, fmt.Errorf("sluice/shield: pipeline hmget band %d: %w", band, err)
@@ -476,11 +479,18 @@ func buildFlushRecords(members []redis.Z, cmds []*redis.SliceCmd, corrKeys []str
 			ts = int64(members[i].Score)
 		}
 
+		// 3. Extract write sequence ("" for pre-sequencing entries).
+		var seq string
+		if cmdErr == nil && len(vals) > 2 && vals[2] != nil {
+			seq, _ = vals[2].(string)
+		}
+
 		records = append(records, FlushRecord{
 			CorrelationKey: corrKeys[i],
 			Payload:        payload, // nil if missing/expired
 			ReceivedAt:     time.Now(),
 			JournalTS:      ts,
+			Seq:            seq,
 		})
 	}
 
@@ -894,43 +904,114 @@ func (s *Shield) RefreshHotTTL(ctx context.Context, band int, corrKeys []string)
 	if len(corrKeys) == 0 {
 		return nil
 	}
+	ttlMs := s.activityWindow.Milliseconds()
+	expireAt := time.Now().UnixMilli() + ttlMs
 	keys := make([][]string, len(corrKeys))
 	args := make([][]interface{}, len(corrKeys))
 	for i, ck := range corrKeys {
-		keys[i] = []string{s.payloadKey(ck)}
-		args[i] = []interface{}{s.activityWindow.Milliseconds()}
+		keys[i] = s.ttlScriptKeys(ck)
+		args[i] = []interface{}{ttlMs, expireAt, ck}
 	}
 	_, err := s.evalShaPipelined(ctx, s.extendTTLScript, keys, args)
 	return err
 }
 
+// ttlScriptKeys returns KEYS for extendTTLLua: the payload hash, the band's
+// index expiry queue, and the key's idxv hash — all in the same {band} slot.
+func (s *Shield) ttlScriptKeys(ck string) []string {
+	band := s.BandFor(ck)
+	return []string{
+		PayloadKey(s.namespace, band, ck),
+		IndexExpiryKey(s.namespace, band),
+		IndexValuesKey(s.namespace, band, ck),
+	}
+}
+
 // FlushedKey identifies one successfully flushed payload version.
 type FlushedKey struct {
 	CorrelationKey string
-	JournalTS      int64         // ts of the flushed version (FlushRecord.JournalTS)
-	TTL            time.Duration // post-flush TTL to apply
+	Seq            string        // write sequence of the flushed version (FlushRecord.Seq)
+	TTL            time.Duration // post-flush TTL to apply; <= 0 commits without one
 }
 
-// ApplyFlushedTTLs gives flushed payloads their post-flush TTL in one
-// pipeline. Each TTL is applied only if the payload's ts still equals the
-// flushed JournalTS, so a newer write that landed while the batch was in
-// flight stays persistent until it is flushed itself. Keys with a
-// non-positive TTL are skipped (PEXPIRE 0 would delete them).
-func (s *Shield) ApplyFlushedTTLs(ctx context.Context, items []FlushedKey) error {
-	keys := make([][]string, 0, len(items))
-	args := make([][]interface{}, 0, len(items))
-	for _, it := range items {
-		if it.TTL <= 0 {
-			continue
+// CommitFlushed commits successfully flushed keys of one band in a single
+// pipeline. Each key is committed atomically — removed from the dirty set
+// and given its post-flush TTL — only if its payload is still the flushed
+// version (same Seq). A key whose payload changed while the batch was in
+// flight is left dirty and persistent, so the newer write is flushed on the
+// next cycle rather than lost.
+//
+// Returns the keys that were skipped because they changed. Every key must
+// belong to band (all script keys share its {band} slot).
+func (s *Shield) CommitFlushed(ctx context.Context, band int, items []FlushedKey) (changed []string, err error) {
+	if len(items) == 0 {
+		return nil, nil
+	}
+	now := time.Now().UnixMilli()
+	dirtyKey := s.dirtyKeyForBand(band)
+	expKey := IndexExpiryKey(s.namespace, band)
+	keys := make([][]string, len(items))
+	args := make([][]interface{}, len(items))
+	for i, it := range items {
+		ttlMs := it.TTL.Milliseconds()
+		keys[i] = []string{
+			dirtyKey,
+			PayloadKey(s.namespace, band, it.CorrelationKey),
+			expKey,
+			IndexValuesKey(s.namespace, band, it.CorrelationKey),
 		}
-		keys = append(keys, []string{s.payloadKey(it.CorrelationKey)})
-		args = append(args, []interface{}{it.JournalTS, it.TTL.Milliseconds()})
+		args[i] = []interface{}{it.CorrelationKey, it.Seq, ttlMs, now + ttlMs}
 	}
-	if len(keys) == 0 {
-		return nil
+
+	cmds, err := s.evalShaPipelined(ctx, s.commitScript, keys, args)
+	if err != nil {
+		return nil, fmt.Errorf("sluice/shield: commit flushed band %d: %w", band, err)
 	}
-	_, err := s.evalShaPipelined(ctx, s.flushedTTLScript, keys, args)
-	return err
+	for i, cmd := range cmds {
+		if n, _ := cmd.Int(); n == 0 {
+			changed = append(changed, items[i].CorrelationKey)
+		}
+	}
+	return changed, nil
+}
+
+// VersionedKey is a correlation key paired with the write sequence it had
+// when drained (FlushRecord.Seq).
+type VersionedKey struct {
+	CorrelationKey string
+	Seq            string
+}
+
+// DeadLetterIfUnchanged moves keys of one band from the dirty set to the
+// dead-letter set, annotated with reason — but only those whose payload is
+// still the drained version. A key rewritten since it was drained failed on
+// a superseded payload; it is left dirty so the new payload is retried.
+//
+// Returns the keys actually dead-lettered.
+func (s *Shield) DeadLetterIfUnchanged(ctx context.Context, band int, items []VersionedKey, reason string) (moved []string, err error) {
+	if len(items) == 0 {
+		return nil, nil
+	}
+	now := time.Now().UnixMilli()
+	dirtyKey := s.dirtyKeyForBand(band)
+	dlqKey := s.dlqKey(band)
+	keys := make([][]string, len(items))
+	args := make([][]interface{}, len(items))
+	for i, it := range items {
+		keys[i] = []string{dirtyKey, dlqKey, PayloadKey(s.namespace, band, it.CorrelationKey)}
+		args[i] = []interface{}{it.CorrelationKey, it.Seq, now, reason, s.dlqTTL.Milliseconds()}
+	}
+
+	cmds, err := s.evalShaPipelined(ctx, s.deadLetterScript, keys, args)
+	if err != nil {
+		return nil, fmt.Errorf("sluice/shield: dead-letter band %d: %w", band, err)
+	}
+	for i, cmd := range cmds {
+		if n, _ := cmd.Int(); n == 1 {
+			moved = append(moved, items[i].CorrelationKey)
+		}
+	}
+	return moved, nil
 }
 
 // HotKeys reports, in one pipeline, which correlation keys have a live hot

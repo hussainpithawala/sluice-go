@@ -2,6 +2,7 @@ package documentdb
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -22,27 +23,44 @@ func payloadPTTL(t *testing.T, s *shield.Shield, ck string) time.Duration {
 	return d
 }
 
-// drainedTS returns the JournalTS DrainBand reports for ck.
-func drainedTS(t *testing.T, s *shield.Shield, ck string) int64 {
+// drained returns the FlushRecord DrainBand reports for ck.
+func drained(t *testing.T, s *shield.Shield, ck string) shield.FlushRecord {
 	t.Helper()
 	recs, err := s.DrainBand(context.Background(), s.BandFor(ck), 1000)
 	require.NoError(t, err)
 	for _, r := range recs {
 		if r.CorrelationKey == ck {
-			return r.JournalTS
+			return r
 		}
 	}
 	t.Fatalf("%s not in dirty set", ck)
-	return 0
+	return shield.FlushRecord{}
 }
 
-// simulateFlush commits ck and applies a post-flush TTL, as the engine does.
+// commitAs commits ck as if the drained version rec had just been flushed.
+// Returns true if committed, false if skipped because ck changed.
+func commitAs(t *testing.T, s *shield.Shield, rec shield.FlushRecord, ttl time.Duration) bool {
+	t.Helper()
+	changed, err := s.CommitFlushed(context.Background(), s.BandFor(rec.CorrelationKey),
+		[]shield.FlushedKey{{CorrelationKey: rec.CorrelationKey, Seq: rec.Seq, TTL: ttl}})
+	require.NoError(t, err)
+	return len(changed) == 0
+}
+
+// simulateFlush drains, commits ck and applies a post-flush TTL, as the engine does.
 func simulateFlush(t *testing.T, s *shield.Shield, ck string, ttl time.Duration) {
 	t.Helper()
-	ctx := context.Background()
-	ts := drainedTS(t, s, ck)
-	require.NoError(t, s.CommitKeys(ctx, s.BandFor(ck), []string{ck}))
-	require.NoError(t, s.ApplyFlushedTTLs(ctx, []shield.FlushedKey{{CorrelationKey: ck, JournalTS: ts, TTL: ttl}}))
+	require.True(t, commitAs(t, s, drained(t, s, ck), ttl), "commit of unchanged key must succeed")
+}
+
+func isDirtyKey(t *testing.T, s *shield.Shield, ck string) bool {
+	t.Helper()
+	_, err := s.Client().ZScore(context.Background(), shield.DirtyKey(s.Namespace(), s.BandFor(ck)), ck).Result()
+	if errors.Is(err, redis.Nil) {
+		return false
+	}
+	require.NoError(t, err)
+	return true
 }
 
 func TestWrite_UnflushedPayloadIsPersistent(t *testing.T) {
@@ -105,38 +123,110 @@ func TestWriteDedup_Persistence(t *testing.T) {
 	assert.Equal(t, time.Duration(-1), payloadPTTL(t, s, ck))
 }
 
-func TestApplyFlushedTTLs_GuardsNewerVersion(t *testing.T) {
-	s := newTestShield(t, "test_flushed_ttl_guard")
+// TestCommitFlushed_KeepsWriteThatLandedMidFlush is the commit race: an
+// unconditional ZREM would drop v2 from the dirty set, so v2 would never
+// reach the datastore.
+func TestCommitFlushed_KeepsWriteThatLandedMidFlush(t *testing.T) {
+	s := newTestShield(t, "test_commit_race")
 	t.Cleanup(func() { _ = s.Close() })
 	ctx := context.Background()
-	const ck = "guard_001"
+	const ck = "race_001"
 
 	require.NoError(t, s.Write(ctx, ck, []byte(`{"v":1}`)))
-	v1 := drainedTS(t, s, ck)
+	v1 := drained(t, s, ck)
 
-	// v2 lands while v1's flush is "in flight".
-	time.Sleep(2 * time.Millisecond)
+	// v2 lands while v1's BulkWrite is "in flight".
 	require.NoError(t, s.Write(ctx, ck, []byte(`{"v":2}`)))
 
-	require.NoError(t, s.ApplyFlushedTTLs(ctx, []shield.FlushedKey{{CorrelationKey: ck, JournalTS: v1, TTL: 30 * time.Second}}))
-	assert.Equal(t, time.Duration(-1), payloadPTTL(t, s, ck), "v1's TTL must not apply to unflushed v2")
+	assert.False(t, commitAs(t, s, v1, 30*time.Second), "commit of v1 must be skipped")
+	assert.True(t, isDirtyKey(t, s, ck), "v2 must stay dirty so it is flushed next cycle")
+	assert.Equal(t, time.Duration(-1), payloadPTTL(t, s, ck), "unflushed v2 must stay persistent")
 
-	v2 := drainedTS(t, s, ck)
-	require.NoError(t, s.ApplyFlushedTTLs(ctx, []shield.FlushedKey{{CorrelationKey: ck, JournalTS: v2, TTL: 30 * time.Second}}))
+	v2 := drained(t, s, ck)
+	assert.Equal(t, `{"v":2}`, string(v2.Payload))
+	assert.True(t, commitAs(t, s, v2, 30*time.Second))
+	assert.False(t, isDirtyKey(t, s, ck))
 	assert.Greater(t, payloadPTTL(t, s, ck), time.Duration(0))
 }
 
-func TestApplyFlushedTTLs_SkipsNonPositiveTTL(t *testing.T) {
-	s := newTestShield(t, "test_flushed_ttl_zero")
+// TestCommitFlushed_SameMillisecondRewrite is why commit compares the write
+// sequence rather than the ms timestamp: both writes share one ts, so a ts
+// guard would commit (and expire) the unflushed v2.
+func TestCommitFlushed_SameMillisecondRewrite(t *testing.T) {
+	s := newTestShield(t, "test_commit_same_ms")
+	t.Cleanup(func() { _ = s.Close() })
+	ctx := context.Background()
+	const ck = "same_ms_001"
+	payloadKey := shield.PayloadKey(s.Namespace(), s.BandFor(ck), ck)
+
+	require.NoError(t, s.Write(ctx, ck, []byte(`{"v":1}`)))
+	v1 := drained(t, s, ck)
+	require.NoError(t, s.Write(ctx, ck, []byte(`{"v":2}`)))
+	// Force the collision regardless of timing: give v2 v1's timestamp.
+	require.NoError(t, s.Client().HSet(ctx, payloadKey, "ts", v1.JournalTS).Err())
+
+	assert.False(t, commitAs(t, s, v1, 30*time.Second), "same-ts rewrite must still be detected")
+	assert.True(t, isDirtyKey(t, s, ck))
+	assert.Equal(t, time.Duration(-1), payloadPTTL(t, s, ck))
+}
+
+func TestCommitFlushed_PreSequencingEntryCommits(t *testing.T) {
+	s := newTestShield(t, "test_commit_legacy")
+	t.Cleanup(func() { _ = s.Close() })
+	ctx := context.Background()
+	const ck = "legacy_001"
+	band := s.BandFor(ck)
+
+	// An entry written by a version without the 'v' field.
+	require.NoError(t, s.Client().HSet(ctx, shield.PayloadKey(s.Namespace(), band, ck), "p", `{"v":1}`, "ts", 1).Err())
+	require.NoError(t, s.Client().ZAdd(ctx, shield.DirtyKey(s.Namespace(), band), redis.Z{Score: 1, Member: ck}).Err())
+
+	rec := drained(t, s, ck)
+	assert.Empty(t, rec.Seq)
+	assert.True(t, commitAs(t, s, rec, 30*time.Second), "entries from before the upgrade must still commit")
+	assert.False(t, isDirtyKey(t, s, ck))
+}
+
+func TestCommitFlushed_NonPositiveTTLCommitsWithoutExpiry(t *testing.T) {
+	s := newTestShield(t, "test_commit_zero_ttl")
 	t.Cleanup(func() { _ = s.Close() })
 	ctx := context.Background()
 	const ck = "zero_ttl_001"
 
 	require.NoError(t, s.Write(ctx, ck, []byte(`{"v":1}`)))
-	ts := drainedTS(t, s, ck)
-	require.NoError(t, s.ApplyFlushedTTLs(ctx, []shield.FlushedKey{{CorrelationKey: ck, JournalTS: ts, TTL: 0}}))
+	assert.True(t, commitAs(t, s, drained(t, s, ck), 0))
 
+	assert.False(t, isDirtyKey(t, s, ck))
 	assert.Equal(t, time.Duration(-1), payloadPTTL(t, s, ck), "PEXPIRE 0 would have deleted the key")
+}
+
+func TestDeadLetterIfUnchanged_SparesRewrittenKey(t *testing.T) {
+	s := newTestShield(t, "test_dlq_guard")
+	t.Cleanup(func() { _ = s.Close() })
+	ctx := context.Background()
+
+	band, keys := findKeysForTest(t, s, "dlq_guard", 2)
+	failed, rewritten := keys[0], keys[1]
+	for _, ck := range keys {
+		require.NoError(t, s.Write(ctx, ck, []byte(`{"v":1}`)))
+	}
+	recFailed, recRewritten := drained(t, s, failed), drained(t, s, rewritten)
+	require.NoError(t, s.Write(ctx, rewritten, []byte(`{"v":2}`))) // fixed payload arrives
+
+	moved, err := s.DeadLetterIfUnchanged(ctx, band, []shield.VersionedKey{
+		{CorrelationKey: failed, Seq: recFailed.Seq},
+		{CorrelationKey: rewritten, Seq: recRewritten.Seq},
+	}, "duplicate_key")
+	require.NoError(t, err)
+	assert.Equal(t, []string{failed}, moved)
+
+	_, err = s.Client().ZScore(ctx, shield.DLQKey(s.Namespace(), band), failed).Result()
+	assert.NoError(t, err, "unchanged failure is dead-lettered")
+	assert.False(t, isDirtyKey(t, s, failed))
+
+	assert.True(t, isDirtyKey(t, s, rewritten), "rewritten key must be retried, not dead-lettered")
+	_, err = s.Client().ZScore(ctx, shield.DLQKey(s.Namespace(), band), rewritten).Result()
+	assert.ErrorIs(t, err, redis.Nil)
 }
 
 func TestRefreshHotTTL_OnlyExtendsFlushedPayloads(t *testing.T) {
