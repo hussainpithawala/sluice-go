@@ -1006,10 +1006,13 @@ func TestNamespaceIsolation(t *testing.T) {
 // which asserted the data-loss behaviour: unflushed writes used to expire
 // after KeyTTL and be silently dropped from the dirty set.
 func TestUnflushedPayloadOutlivesKeyTTL(t *testing.T) {
-	// Create shield with very short TTL
+	// Create shield with very short TTL. DB must be testRedisDB: the
+	// cleanRedisKeys below FLUSHDBs the client's DB, and the default (0) is
+	// the dev database the examples use.
 	cfg := shield.RedisConfig{
 		Addrs:       []string{testRedisAddr()},
 		ClusterMode: false,
+		DB:          testRedisDB,
 	}
 	s, err := shield.New(cfg, "test_expiry", 16, 1*time.Second, 4*time.Hour)
 	require.NoError(t, err)

@@ -115,6 +115,11 @@ type writeEntry struct {
 	correlationKey string
 	payload        []byte
 	ts             float64
+	kind           broadcastKind
+	// done receives this entry's own write result once its batch has been
+	// executed (buffered, so the batcher never blocks on it). nil for
+	// direct writes.
+	done chan error
 }
 
 // Shield manages all Redis interactions for the library.
@@ -125,11 +130,11 @@ type Shield struct {
 	keyTTL         time.Duration
 	activityWindow time.Duration
 	dlqTTL         time.Duration // how long dead-letter payload hashes are kept
-	writeScript    *redis.Script
-	writeScriptSHA string // pre-loaded SHA; used by flushBatch to avoid sending script text each time
-
-	hydrateScript    *redis.Script
-	hydrateScriptSHA string // pre-loaded SHA; used by BulkHydrateJournal pipelines
+	// Scripts are pre-loaded in New and run via EVALSHA; every call site
+	// reloads and retries on NOSCRIPT (script cache flushed by a restart or
+	// failover), so a cold cache never fails a write.
+	writeScript   *redis.Script
+	hydrateScript *redis.Script
 
 	commitScript     *redis.Script // conditional commit + post-flush TTL
 	deadLetterScript *redis.Script // conditional move to dead-letter
@@ -140,9 +145,16 @@ type Shield struct {
 	batchSize      int
 	batchWin       time.Duration
 	stopBatch      chan struct{}
+	stopOnce       sync.Once
 	batchWg        sync.WaitGroup
 	volumeSignaler VolumeSignaler
-	batchCtx       context.Context // parent context; cancellation stops the batcher
+	batchCtx       context.Context // values only; the batcher runs until StopBatcher
+
+	// batchMu guards batchRunning. Senders hold the read lock while handing
+	// an entry to batchCh, so once StopBatcher holds the write lock no entry
+	// can enter the channel behind the batcher's final drain.
+	batchMu      sync.RWMutex
+	batchRunning bool
 
 	// Broadcast fields — all zero when broadcasting is disabled.
 	broadcastEnabled bool

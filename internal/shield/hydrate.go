@@ -4,8 +4,6 @@ import (
 	"context"
 	"fmt"
 	"strconv"
-
-	"github.com/redis/go-redis/v9"
 )
 
 // BulkJournalItem represents a single Source result to hydrate into the journal.
@@ -46,12 +44,14 @@ func (s *Shield) BulkHydrateJournal(ctx context.Context, items []BulkJournalItem
 		return nil, nil
 	}
 
-	pipe := s.client.Pipeline()
-	cmds := make([]*redis.Cmd, len(items))
+	keys := make([][]string, len(items))
+	args := make([][]interface{}, len(items))
 	for i, item := range items {
-		cmds[i] = pipe.EvalSha(ctx, s.hydrateScriptSHA, s.hydrateKeys(item.CorrelationKey), s.hydrateArgs(item.Payload, ts)...)
+		keys[i] = s.hydrateKeys(item.CorrelationKey)
+		args[i] = s.hydrateArgs(item.Payload, ts)
 	}
-	if _, err := pipe.Exec(ctx); err != nil {
+	cmds, err := s.evalShaPipelined(ctx, s.hydrateScript, keys, args)
+	if err != nil {
 		return nil, err
 	}
 

@@ -12,6 +12,15 @@ import (
 // deletion) and should be treated as an incident.
 var ErrPayloadMissing = engine.ErrPayloadMissing
 
+// ErrDegradedWriteUnsafe is returned (wrapped together with
+// ErrRedisUnavailable) when a Redis write fails and degraded mode declines
+// to write directly to the datastore, because an older version of the key is
+// still pending in Redis — or Redis is unreachable, so that cannot be ruled
+// out. A direct write there could later be overwritten by the older version's
+// flush. The write was not persisted; retry it (e.g. do not ack the upstream
+// message) and it will go through Redis in order once Redis recovers.
+var ErrDegradedWriteUnsafe = errors.New("sluice: degraded write refused: an older pending version could overwrite it")
+
 var (
 	ErrLibraryClosed        = errors.New("sluice: library is closed")
 	ErrRedisUnavailable     = errors.New("sluice: redis unavailable")

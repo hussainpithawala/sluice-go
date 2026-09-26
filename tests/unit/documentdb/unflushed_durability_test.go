@@ -200,6 +200,35 @@ func TestCommitFlushed_NonPositiveTTLCommitsWithoutExpiry(t *testing.T) {
 	assert.Equal(t, time.Duration(-1), payloadPTTL(t, s, ck), "PEXPIRE 0 would have deleted the key")
 }
 
+func TestHasPendingVersion(t *testing.T) {
+	s := newTestShield(t, "test_has_pending")
+	t.Cleanup(func() { _ = s.Close() })
+	ctx := context.Background()
+	const ck = "pending_001"
+
+	pending := func() bool {
+		t.Helper()
+		p, err := s.HasPendingVersion(ctx, ck)
+		require.NoError(t, err)
+		return p
+	}
+
+	assert.False(t, pending(), "never written")
+
+	require.NoError(t, s.Write(ctx, ck, []byte(`{"v":1}`)))
+	assert.True(t, pending(), "awaiting flush")
+
+	simulateFlush(t, s, ck, 30*time.Second)
+	assert.False(t, pending(), "flushed: the datastore already has it")
+
+	require.NoError(t, s.Write(ctx, ck, []byte(`{"v":2}`)))
+	rec := drained(t, s, ck)
+	_, err := s.DeadLetterIfUnchanged(ctx, s.BandFor(ck), []shield.VersionedKey{{CorrelationKey: ck, Seq: rec.Seq}}, "test")
+	require.NoError(t, err)
+	assert.False(t, isDirtyKey(t, s, ck))
+	assert.True(t, pending(), "dead-lettered: a DLQ replay could still write it")
+}
+
 func TestDeadLetterIfUnchanged_SparesRewrittenKey(t *testing.T) {
 	s := newTestShield(t, "test_dlq_guard")
 	t.Cleanup(func() { _ = s.Close() })

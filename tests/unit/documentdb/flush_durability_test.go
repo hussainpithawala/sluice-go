@@ -243,6 +243,182 @@ func TestFlush_WriteDuringInFlightFlushIsNotLost(t *testing.T) {
 	}, 3*time.Second, 50*time.Millisecond, "v2 should be committed once flushed")
 }
 
+// recordingSink records degraded (direct) writes.
+type recordingSink struct {
+	mu     sync.Mutex
+	direct []string
+}
+
+func (r *recordingSink) BulkWrite(_ context.Context, models []sink.WriteModel) (*sink.BulkWriteResult, error) {
+	return &sink.BulkWriteResult{UpsertedCount: int64(len(models))}, nil
+}
+func (r *recordingSink) Write(_ context.Context, m sink.WriteModel) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.direct = append(r.direct, m.Update.(string))
+	return nil
+}
+func (r *recordingSink) Ping(context.Context) error  { return nil }
+func (r *recordingSink) Close(context.Context) error { return nil }
+
+// TestBatchedWrite_RedisFailureFallsBackToDegradedMode: previously a failed
+// batch was only logged — Write had already returned nil, so the data was
+// gone. Now the writer sees the failure and degraded mode persists it.
+func TestBatchedWrite_RedisFailureFallsBackToDegradedMode(t *testing.T) {
+	const ns = "batch_degraded_unit"
+	rc := redisClient(t)
+	ctx := context.Background()
+	cleanRedisKeys(t, rc, ns)
+	t.Cleanup(func() { cleanRedisKeys(t, rc, ns) })
+
+	rs := &recordingSink{}
+	sl, err := sluice.New(ns).
+		WithRedis(sluice.RedisConfig{Addrs: []string{testRedisAddr}}).
+		WithSink(rs).
+		WithWriteContract(func(_ string, payload []byte) (*sluice.WriteModel, error) {
+			return &sluice.WriteModel{Update: string(payload), Upsert: true}, nil
+		}).
+		WithBatchedWrites(50, 10*time.Millisecond).
+		WithDegradedModeDirect(true).
+		WithBandCount(durabilityBands).
+		Build(ctx)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = sl.DrainAndClose(closeCtx)
+	})
+
+	const ck = "batch_degraded_001"
+	// Make the journal write fail for ck only (HSET → WRONGTYPE) while the
+	// dirty/DLQ sets stay readable, so degraded mode can confirm nothing is
+	// pending and write directly.
+	require.NoError(t, rc.Set(ctx, shield.PayloadKey(ns, shield.BandForKey(ck, durabilityBands), ck), "x", 0).Err())
+
+	require.NoError(t, sl.Write(ctx, ck, []byte("payload-1")), "degraded mode should absorb the failure")
+
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	assert.Equal(t, []string{"payload-1"}, rs.direct, "failed batched write must reach the sink directly")
+}
+
+// buildDegradedSluice builds a degraded-mode sluice whose flushes always
+// fail (so pending versions stay pending) and whose direct writes are
+// recorded.
+func buildDegradedSluice(t *testing.T, ns string) (*sluice.Sluice, *recordingSink) {
+	t.Helper()
+	rs := &recordingSink{}
+	sl, err := sluice.New(ns).
+		WithRedis(sluice.RedisConfig{Addrs: []string{testRedisAddr}}).
+		WithSink(failingBulkSink{rs}).
+		WithWriteContract(func(_ string, payload []byte) (*sluice.WriteModel, error) {
+			return &sluice.WriteModel{Update: string(payload), Upsert: true}, nil
+		}).
+		WithDegradedModeDirect(true).
+		WithFlushWindow(time.Hour). // keep the engine out of the way
+		WithBandCount(durabilityBands).
+		Build(context.Background())
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		closeCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = sl.DrainAndClose(closeCtx)
+	})
+	return sl, rs
+}
+
+// failingBulkSink fails every flush (pending versions stay pending) but
+// records direct degraded writes via the embedded recordingSink.
+type failingBulkSink struct{ *recordingSink }
+
+func (failingBulkSink) BulkWrite(context.Context, []sink.WriteModel) (*sink.BulkWriteResult, error) {
+	return nil, errOutage
+}
+
+// breakJournalWrite makes the next Redis journal write for ck fail with
+// WRONGTYPE (payload hash replaced by a string) without touching the
+// dirty/DLQ sets the degraded-mode probe reads.
+func breakJournalWrite(t *testing.T, rc *redis.Client, ns, ck string) {
+	t.Helper()
+	require.NoError(t, rc.Set(context.Background(),
+		shield.PayloadKey(ns, shield.BandForKey(ck, durabilityBands), ck), "x", 0).Err())
+}
+
+func (r *recordingSink) directWrites() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.direct...)
+}
+
+// TestDegradedWrite_RefusedWhileOlderVersionPending is the lost update: v1
+// awaits flush in Redis, the Redis write of v2 fails, and a direct write of
+// v2 would later be overwritten by v1's flush. It must be refused instead.
+func TestDegradedWrite_RefusedWhileOlderVersionPending(t *testing.T) {
+	const ns = "degraded_pending_unit"
+	rc := redisClient(t)
+	ctx := context.Background()
+	cleanRedisKeys(t, rc, ns)
+	t.Cleanup(func() { cleanRedisKeys(t, rc, ns) })
+
+	sl, rs := buildDegradedSluice(t, ns)
+	const ck = "degraded_pending_001"
+	band := shield.BandForKey(ck, durabilityBands)
+
+	for _, tc := range []struct {
+		name   string
+		setKey string // set holding the older, still-writable version
+	}{
+		{"awaiting flush", shield.DirtyKey(ns, band)},
+		{"dead-lettered", shield.DLQKey(ns, band)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require.NoError(t, rc.Del(ctx, shield.DirtyKey(ns, band), shield.DLQKey(ns, band)).Err())
+			require.NoError(t, rc.ZAdd(ctx, tc.setKey, redis.Z{Score: 1, Member: ck}).Err()) // older v1
+			breakJournalWrite(t, rc, ns, ck)
+
+			err := sl.Write(ctx, ck, []byte("v2"))
+			require.Error(t, err)
+			assert.ErrorIs(t, err, sluice.ErrDegradedWriteUnsafe)
+			assert.ErrorIs(t, err, sluice.ErrRedisUnavailable, "callers treating Redis errors as retryable keep working")
+			assert.Empty(t, rs.directWrites(), "v2 must not be written directly while v1 can still overwrite it")
+		})
+	}
+}
+
+func TestDegradedWrite_DirectWhenNothingPending(t *testing.T) {
+	const ns = "degraded_safe_unit"
+	rc := redisClient(t)
+	ctx := context.Background()
+	cleanRedisKeys(t, rc, ns)
+	t.Cleanup(func() { cleanRedisKeys(t, rc, ns) })
+
+	sl, rs := buildDegradedSluice(t, ns)
+	const ck = "degraded_safe_001"
+	breakJournalWrite(t, rc, ns, ck)
+
+	require.NoError(t, sl.Write(ctx, ck, []byte("v1")))
+	assert.Equal(t, []string{"v1"}, rs.directWrites(), "no pending version: direct write is safe")
+}
+
+func TestDegradedWrite_RefusedWhenPendingCannotBeRuledOut(t *testing.T) {
+	const ns = "degraded_unknown_unit"
+	rc := redisClient(t)
+	cleanRedisKeys(t, rc, ns)
+	t.Cleanup(func() { cleanRedisKeys(t, rc, ns) })
+
+	sl, rs := buildDegradedSluice(t, ns)
+
+	// A dead context fails the Redis write and the probe alike — the same
+	// shape as Redis being unreachable.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := sl.Write(ctx, "degraded_unknown_001", []byte("v1"))
+	require.Error(t, err)
+	assert.ErrorIs(t, err, sluice.ErrDegradedWriteUnsafe)
+	assert.Empty(t, rs.directWrites())
+}
+
 func payloadTTL(t *testing.T, rc *redis.Client, ns, ck string) time.Duration {
 	t.Helper()
 	d, err := rc.PTTL(context.Background(), shield.PayloadKey(ns, shield.BandForKey(ck, durabilityBands), ck)).Result()

@@ -83,8 +83,15 @@ func (b *Builder) WithFlushWindow(d time.Duration) *Builder    { b.cfg.FlushWind
 func (b *Builder) WithMaxBatchSize(n int) *Builder             { b.cfg.MaxBatchSize = n; return b }
 func (b *Builder) WithBandCount(n int) *Builder                { b.cfg.BandCount = n; return b }
 func (b *Builder) WithKeyTTL(d time.Duration) *Builder         { b.cfg.KeyTTL = d; return b }
-func (b *Builder) WithDegradedModeDirect(v bool) *Builder      { b.cfg.DegradedModeDirect = v; return b }
-func (b *Builder) WithMetrics(m MetricsRecorder) *Builder      { b.cfg.Metrics = m; return b }
+
+// WithDegradedModeDirect makes Write() fall back to a direct datastore write
+// when the Redis write fails — but only when no older version of the key is
+// pending in Redis (awaiting flush or dead-lettered), since that version's
+// later flush would overwrite the direct write. Otherwise, including when
+// Redis is unreachable, Write() returns ErrDegradedWriteUnsafe (wrapping
+// ErrRedisUnavailable) so the caller retries and ordering is preserved.
+func (b *Builder) WithDegradedModeDirect(v bool) *Builder { b.cfg.DegradedModeDirect = v; return b }
+func (b *Builder) WithMetrics(m MetricsRecorder) *Builder { b.cfg.Metrics = m; return b }
 
 // WithActivityWindow sets the TTL for hot correlation_key sessions.
 // Active users remain in the Redis journal for this duration. Default is 4 hours.
@@ -118,7 +125,15 @@ func (b *Builder) OnFlush(cb OnFlushCallback) *Builder { b.callback = cb; return
 // WithBatchedWrites enables pipelined Redis writes. Instead of one Redis
 // round-trip per Write() call, writes are buffered and flushed in a single
 // pipeline when the buffer reaches size entries or window elapses.
-// Recommended for high-velocity streams (>10K writes/sec).
+// Recommended for high-velocity streams (>10K writes/sec) with many
+// concurrent writers.
+//
+// Write() still returns only after its own entry has been written to the
+// journal, with that entry's real error — so a nil return is always safe to
+// ack upstream, and a failed batch falls back to degraded mode (or returns
+// an error) instead of being lost. The cost is latency: each Write() waits
+// up to window for its batch. Throughput gains come from concurrency, so a
+// single sequential writer gains nothing from batching.
 func (b *Builder) WithBatchedWrites(size int, window time.Duration) *Builder {
 	b.cfg.BatchedWrites = true
 	b.cfg.WriteBatchSize = size
@@ -669,7 +684,7 @@ func (s *Sluice) Write(ctx context.Context, correlationKey string, payload []byt
 	// Handle Redis failures via degraded mode or hard error
 	if err != nil {
 		if s.cfg.DegradedModeDirect {
-			return s.degradedWrite(ctx, correlationKey, payload)
+			return s.degradedWrite(ctx, correlationKey, payload, err)
 		}
 		return fmt.Errorf("%w: %v", ErrRedisUnavailable, err)
 	}
@@ -1103,13 +1118,37 @@ func (s *Sluice) pruneExpiredIndexes(ctx context.Context) {
 	}
 }
 
-func (s *Sluice) degradedWrite(ctx context.Context, correlationKey string, payload []byte) error {
+// degradedProbeTimeout bounds the pending-version check before a degraded
+// write, so a hung Redis fails fast into a retryable error.
+const degradedProbeTimeout = 500 * time.Millisecond
+
+// degradedWrite handles a failed Redis write (redisErr) by writing directly
+// to the datastore — but only when that cannot be overwritten later by an
+// older version of the same key. If a version is still pending in Redis
+// (awaiting flush or dead-lettered), or Redis cannot be reached to rule
+// that out, it returns ErrDegradedWriteUnsafe (wrapping ErrRedisUnavailable)
+// instead: the caller retries, and the write then goes through Redis in
+// order. Nothing is persisted in that case, so nothing can be reordered.
+func (s *Sluice) degradedWrite(ctx context.Context, correlationKey string, payload []byte, redisErr error) error {
+	probeCtx, cancel := context.WithTimeout(ctx, degradedProbeTimeout)
+	t := time.Now()
+	pending, probeErr := s.shield.HasPendingVersion(probeCtx, correlationKey)
+	cancel()
+	if probeErr != nil || pending {
+		cause := probeErr
+		if cause == nil {
+			cause = errors.New("older version pending in redis")
+		}
+		s.metrics.RecordRedisOp(s.cfg.Namespace, "degraded_refused", time.Since(t), cause)
+		return fmt.Errorf("%w: %w: %v (redis write: %v)", ErrRedisUnavailable, ErrDegradedWriteUnsafe, cause, redisErr)
+	}
+
 	wm, err := s.writeContract(correlationKey, payload)
 	if err != nil {
 		s.metrics.RecordContractError(s.cfg.Namespace, correlationKey, err)
 		return fmt.Errorf("%w: %v", ErrContractViolation, err)
 	}
-	t := time.Now()
+	t = time.Now()
 	writeErr := s.sk.Write(ctx, sink.WriteModel{
 		CorrelationKey: correlationKey,
 		Filter:         wm.Filter,
