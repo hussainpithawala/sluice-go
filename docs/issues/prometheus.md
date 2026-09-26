@@ -1,6 +1,6 @@
 # RFP #16: Prometheus Metrics Export for `sluice-go`
 
-**Status:** Proposed  
+**Status:** Implemented (closed 2026-09-27) — see §9 for deviations and §10 for verification  
 **Target Release:** v1.0.8 (Consolidated Release)  
 **Dependencies:** Core `MetricsRecorder` interface (v1.0.7), L1 Local Journal metrics (v1.0.8)
 
@@ -351,10 +351,34 @@ groups:
     3. Provide Prometheus scrape config example.
     4. Link to the reference Grafana dashboard.
 
-11. Success Criteria
-    ✅ metrics/prometheus package compiles and passes all unit tests.
-    ✅ All 16 MetricsRecorder methods are implemented and produce correct Prometheus metrics.
-    ✅ examples/nudge_prometheus/main.go runs end-to-end and exposes /metrics with real data.
-    ✅ Grafana dashboard renders correctly with all panels populated.
-    ✅ Alerting rules fire correctly when thresholds are breached.
-    ✅ No regression in core sluice tests — the Prometheus sub-package is fully isolated.
+## 9. Implementation Notes & Deviations
+
+What shipped differs from the proposal in these ways:
+
+1. **Metrics port is `:2112`, not `:9090`.** The local stack runs Prometheus itself on `:9090`, so the §5.1 example's `ListenAndServe(":9090")` collided with it (Prometheus ended up scraping itself). The examples serve `/metrics` on `:2112` (`METRICS_ADDR` overrides) and bind synchronously so a taken port fails startup instead of silently exporting nothing. The scrape config targets `host.docker.internal:2112`.
+2. **Compile-time check** is `var _ sluice.MetricsRecorder = (*Recorder)(nil)` against the real interface, not a hand-copied method list that could drift (§7.5).
+3. **The recorder ignores the per-call `namespace` argument**; the Prometheus subsystem is fixed at construction. One `Recorder` per sluice namespace.
+4. **L1 miss reasons** are `absent` and `expired` (what `internal/localjournal` actually emits), not the `expired` / `not_found` / `evicted` listed in §3.5. LRU evictions are counted internally but not exported.
+5. **Core changes were needed before several metrics emitted at all:**
+   - `Read()` (the tiered read path) never called `RecordRead` — only the deprecated `ReadOld` did. It now records every tier (L1/L2 hot, Source cold).
+   - Nothing called `RecordHotSetSize` or `RecordLocalSetSize`. A gauge sampler now emits them (hot set via SCAN every 30s, `WithHotSetSampleInterval`; L1 size every 5s), started only with a non-noop recorder.
+   - Memory pressure from indexes and flushed-payload TTLs was evicting hot markers under `allkeys-lru`, so `hot_set_size` read 0; fixed by the durability work below.
+6. **L1 hit-ratio expression (§6.4, §6.6) was wrong as written**: `hit_total` has no `reason` label, `miss_total` does, so the unaggregated `+` never matches and the panel/alert returns no data. Both now `sum()` each side.
+7. **Added metric** `sluice_<ns>_unflushed_expiry_total{band}` (not in the original catalog) for the durability work done alongside this RFP: dirty keys whose payload vanished before flush. It must stay 0 and has a critical alert.
+8. **Dashboard additions beyond §6:** a durability row (unflushed loss, degraded writes, degraded writes refused), and the namespace variable is a query (`metrics(sluice_.*_write_total)`) instead of a hard-coded list (§8, phase 4).
+9. **Alert additions beyond §6.6:** `SluiceUnflushedPayloadLoss` (critical) and `SluiceDegradedWriteRefused` (warning). Rules live in `monitoring/prometheus/rules/sluice.rules.yml`, loaded by the local Prometheus via `rule_files`.
+10. **Goal 4 (dependency isolation) is not met.** `metrics/prometheus` is a package in the root module, so `github.com/prometheus/client_golang` is a requirement of the root `go.mod` and appears in every consumer's module graph (it is only compiled in when imported). True isolation needs a separate module (`metrics/prometheus/go.mod`). **Follow-up.**
+
+Related durability work done in the same effort (tracked in CHANGELOG, not part of this RFP's scope): unflushed payloads no longer expire, conditional commit, index expiry pruning, batched-write ack-on-commit, NOSCRIPT recovery, `noeviction` + AOF for the local Redis, and safe degraded mode. The remaining "record every event" requirement is tracked separately in `docs/issues/event-log.md`.
+
+## 10. Success Criteria (verified 2026-09-27)
+
+| Criterion | Status | Evidence |
+|---|---|---|
+| `metrics/prometheus` compiles and passes its unit tests | ✅ | `go test ./metrics/prometheus/` passes; full `go test ./...` green |
+| All `MetricsRecorder` methods implemented and producing correct metrics | ✅ | 16 original methods + `RecordUnflushedExpiry`; checked by `var _ sluice.MetricsRecorder`; `tests/unit/documentdb/metrics_sampling_test.go` asserts hot-set and hot/cold read series via a private registry |
+| Example runs end-to-end and exposes `/metrics` with real data | ✅ | `examples/nudge_write_dual_read_hot/documentdb` on `:2112`: ~3.7k writes/s, target `up` in Prometheus |
+| Grafana dashboard renders with all panels populated | ✅ | Provisioned dashboard (25 panels) loaded in Grafana; every panel query returns data from a live run, or 0 where 0 is expected (flush/contract errors, unflushed loss, degraded writes/refusals) |
+| Alerting rules load and evaluate | ✅ | `promtool check rules`: 7 rules; Prometheus `/api/v1/rules`: all `health=ok`, `inactive` under healthy load. Firing on threshold breach not exercised end-to-end |
+| No regression in core sluice tests | ✅ | Full parallel `go test ./...` green (10 packages) |
+| Prometheus sub-package fully isolated (goal 4) | ❌ | Not met; see §9.10 |

@@ -31,7 +31,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - **`ErrPayloadMissing`**: reported to the `OnFlush` callback for dirty keys whose payload is gone at flush time. Such keys are also logged at error level, counted via `RecordUnflushedExpiry`, and dead-lettered (`payload_missing_before_flush`) instead of being dropped.
-- **Prometheus**: `sluice_{ns}_unflushed_expiry_total{band}` counter.
+- **Prometheus metrics export** (RFP #16, `docs/issues/prometheus.md`): `metrics/prometheus` implements the full `MetricsRecorder` with counters, gauges, and histograms named `sluice_<namespace>_<metric>`. `NewRecorder` registers on the default registry; `NewRecorderWithRegistry` and `Unregister` support isolated or multi-instance setups. Includes `sluice_{ns}_unflushed_expiry_total{band}` for data-loss alerting.
+- **Grafana dashboard** (`dashboards/sluice-overview.json`): write path, flush engine (including flush error rate), hot/cold regime, L1 local journal (hit ratio, misses by reason, cache size, broadcast lag), DLQ and contract errors, and a durability row (unflushed loss, degraded writes, degraded refusals). The namespace variable is discovered from the metrics.
+- **Reference alert rules** (`monitoring/prometheus/rules/sluice.rules.yml`): unflushed payload loss (critical), degraded writes refused, flush latency, dirty-queue backlog, L1 hit ratio, broadcast lag, DLQ inflow.
+- **Local observability stack**: Prometheus (`:9090`, rules loaded) and Grafana (`:3000`, datasource and dashboard provisioned) in `docker-compose.yml`, scraping `host.docker.internal:2112`. `examples/nudge_prometheus` and `examples/nudge_write_dual_read_hot/documentdb` serve `/metrics` on `:2112` (overridable via `METRICS_ADDR`) and fail fast if the port is taken.
+- **Gauge sampler**: a background sampler emits `RecordHotSetSize` (SCAN of hot markers, every 30s by default; `WithHotSetSampleInterval`) and `RecordLocalSetSize` (every 5s). Starts only when a non-noop `MetricsRecorder` is configured.
+
+### Fixed (metrics)
+- **`Read()` never recorded reads**: `RecordRead` was only called from the deprecated `ReadOld`. The tiered `Read()` now records every tier (L1/L2 = hot, Source fallback = cold, errors included), so hot/cold read metrics are populated.
+- **L1 hit-ratio query never matched**: `hit_total` has no `reason` label while `miss_total` does, so `rate(hit)/(rate(hit)+rate(miss))` returned no data. The dashboard and alert rule now `sum()` both sides.
 
 ## [1.0.8] - 2026-09-23
 

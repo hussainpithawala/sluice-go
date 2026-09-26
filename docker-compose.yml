@@ -353,6 +353,7 @@ services:
       - "9090:9090"
     volumes:
       - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+      - ./monitoring/prometheus/rules:/etc/prometheus/rules:ro
     extra_hosts:
       - "host.docker.internal:host-gateway" # Allows scraping the example app on the host's :2112
     networks:
