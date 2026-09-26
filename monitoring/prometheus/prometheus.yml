@@ -1,0 +1,12 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: 'sluice'
+    metrics_path: '/metrics'
+    static_configs:
+      # Scrapes the Go application running on the host machine
+      - targets: ['host.docker.internal:2112']
+        labels:
+          environment: 'local-dev'
