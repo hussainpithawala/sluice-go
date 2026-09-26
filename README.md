@@ -12,9 +12,12 @@
 > Active correlation keys live in that same journal as a **hot read/write path** — read and written back
 > in sub-millisecond time without touching the store at all — and an internal broadcast pushes the
 > hottest keys further still, into an in-process **L1 Local Journal** (v1.0.8), for sub-microsecond reads
-> kept convergent across pods via Redis Streams.
+> kept convergent across pods via Redis Streams. Set-based **bulk reads** (`ReadBulk`) collapse N+1 lookups
+> into a single store query and hydrate the whole working set into the journal in one Redis pipeline.
 >
-> One mechanism, scaling write *and* read volume for whatever sits behind it. `sluice` is datastore-agnostic
+> One mechanism, scaling write *and* read volume for whatever sits behind it. Every operation coordinates
+> through the same L1/L2 state plane, so a single build can run as a full writer/reader pod, a reader-only
+> API gateway, or a bulk pre-warmer — just by changing which contracts you configure. `sluice` is datastore-agnostic
 > by design, with first-class adapters for **AWS DocumentDB / MongoDB**, **AWS DynamoDB**, and
 > **PostgreSQL** — each exploiting the journal to dissolve that store's specific bottleneck: index I/O,
 > WCU pricing, or connection/transaction overhead.
@@ -249,12 +252,15 @@ sequenceDiagram
     participant R as Redis journal
     participant D as DataStore
 
-    Note over A,D: User logs in — promote the key to hot
+    Note over A,D: User logs in — promote the key to hot (fire-and-forget)
     A->>S: HotLoad(ctx, correlationKey)
-    S->>D: ReadContract → Source.Read
-    D-->>S: record bytes
-    S->>R: HSET payload + SET hot marker (TTL = ActivityWindow)
-    S-->>A: payload
+    S->>R: SET hot marker (TTL = ActivityWindow)
+    S-->>A: nil — returns immediately
+    par background hydration
+        S->>D: ReadContract → Source.Read
+        D-->>S: record bytes
+        S->>R: HSET payload (+ L1 Put, + IndexContract)
+    end
 
     Note over A,D: Session traffic — DataStore is never read
     A->>S: Write(ctx, correlationKey, payload)
@@ -272,14 +278,16 @@ sequenceDiagram
     S->>D: ReadContract → Source.Read
     D-->>S: document bytes
     S-->>A: payload (or ErrRecordNotFound)
+    S--)R: async read-through hydration (L2 + L1 + indexes)
 ```
 
 ### API
 
 ```go
 // Promote a correlation_key to hot — typically on user login.
-// Loads the document through the Source and seeds the journal + hot marker.
-payload, err := s.HotLoad(ctx, correlationKey)
+// Sets the hot marker synchronously and hydrates the payload in the background.
+// HotLoad is a command, not a query: it returns only an error.
+err := s.HotLoad(ctx, correlationKey)
 
 // Read current state. Hot → Redis. Cold → Source. Neither → ErrRecordNotFound.
 payload, err := s.Read(ctx, correlationKey)
@@ -291,6 +299,20 @@ hot, err := s.IsHot(ctx, correlationKey)
 > **With the L1 cache enabled (v1.0.8),** `Read()` consults the in-process [L1 Local Journal](#l1-local-journal)
 > before Redis and may return data up to `LocalTTL` stale. Use `ReadFresh()` for reads that must hit the
 > authoritative journal.
+
+> **Breaking change (v1.0.8):** `HotLoad` previously returned `([]byte, error)` and blocked on the
+> cold read. It now returns `error` only and never blocks on the store — callers that need the payload
+> immediately should call `Read()` after `HotLoad()`. If background hydration fails, the next `Read()`
+> simply takes the cold path.
+
+### Asynchronous read-through hydration
+
+When `Read`, `ReadFresh`, or `ReadOld` misses the journal and falls back to the `Source`, the payload
+is returned to the caller immediately and a background goroutine hydrates the Redis journal (L2), the
+L1 cache (`Read`/`ReadOld` only — `ReadFresh` never touches L1), and the secondary indexes via
+`IndexContract`. The next read for that key is served from the journal. Hydration is best-effort:
+failures are reported through `RecordRedisOp` (`write_hydration`, `updateindexes_hydration`) and never
+surface on the read path.
 
 ### TTL mechanics
 
@@ -310,8 +332,9 @@ hot, err := s.IsHot(ctx, correlationKey)
 > [Scale envelope](#scale-envelope).
 
 `HotLoad` and the cold path of `Read` both require `WithSource()` **and** `WithReadContract()`.
-`Build()` fails with an error if a `ReadContract` is configured without a `Source`; `HotLoad` returns
-`ErrMissingReadContract` if neither is set.
+Dependencies are validated at call time, not at `Build()`: `HotLoad` returns `ErrMissingSource` when
+no `Source` is configured and `ErrMissingReadContract` when no `ReadContract` is configured, while a
+journal miss on `Read` without either returns `ErrRecordNotFound`.
 
 ## L1 Local Journal
 
@@ -458,6 +481,137 @@ L1 behaviour is surfaced through four additional `MetricsRecorder` methods — s
 [Telemetry](#telemetry).
 
 ---
+
+## Bulk reads — set-based cache pre-warming
+
+**One store query, one Redis pipeline, the whole working set (v1.0.8)**
+
+Single-key `Read()` is ideal for point lookups, but many access patterns are set-shaped — *"load all
+active campaigns for this user"*, *"fetch the latest 50 transactions for this account"*. Serving those
+through `ReadContract` means N separate `FindOne` / `GetItem` / `SELECT` round-trips to the store, then
+N separate journal hydrations.
+
+`ReadBulk` replaces that with a single set-based query driven by a lookup key (e.g. a `user_id`), then
+hydrates the L2 journal, the secondary indexes, and the L1 cache for **every** returned item in one
+pipelined pass:
+
+```mermaid
+sequenceDiagram
+    participant A as Application
+    participant S as sluice
+    participant D as Source (L3)
+    participant R as Redis journal (L2)
+    participant L1 as L1 cache
+
+    A->>S: ReadBulk(ctx, "user_123")
+    S->>S: ReadBulkContract("user_123") → BulkReadModel
+    S->>D: Source.ReadBulk — one query
+    D-->>S: rows → Projector → []BulkReadResult
+    rect rgb(240, 248, 255)
+        Note over S,R: shield.BulkWriteJournal — one pipeline
+        S->>R: HSET p, ts + EXPIRE ActivityWindow (× N)
+    end
+    S->>R: shield.BulkUpdateIndexes — SADD / ZADD (× N), one pipeline
+    S->>L1: Put (× N, version-gated)
+    S->>R: shield.BulkGetTTL — PTTL (× N), one pipeline (ReadBulkWithTTL)
+    S-->>A: map[correlationKey]payload
+```
+
+### Contracts
+
+```go
+// ReadBulkContract translates a lookup key into an adapter-specific bulk execution plan.
+type ReadBulkContract func(lookupKey string) (*source.BulkReadModel, error)
+
+// IndexBulkContract extracts index fields for the whole batch at once
+// (correlationKey → field → value), so every SADD/ZADD lands in one pipeline.
+type IndexBulkContract func(results []source.BulkReadResult) (map[string]map[string]interface{}, error)
+```
+
+`source.BulkReadModel.Query` carries the adapter-specific plan; the adapter's `Projector` shapes the
+raw rows into `[]source.BulkReadResult{CorrelationKey, Payload}`. The core never parses SQL or NoSQL —
+it only sees correlation keys and `[]byte` payloads.
+
+| Adapter | `BulkReadModel.Query` type | Native plan | Projector input |
+|---|---|---|---|
+| `source/postgres` | `postgres.PostgresBulkReadModel` | `Query string` + `Args []any` | `pgx.Rows` |
+| `source/docdb` | `docdb.DocDBBulkReadModel` | `Filter` + `*options.FindOptions` (Sort, Limit, Projection) | `*mongo.Cursor` |
+| `source/dynamodb` | `dynamodb.DynamoBulkReadModel` | `*dynamodb.QueryInput` (single page, `KeyConditionExpression` on a PK) | `[]map[string]types.AttributeValue` |
+
+### Example (PostgreSQL)
+
+```go
+sl, _ := sluice.New("campaigns").
+    WithRedis(sluice.RedisConfig{Addrs: redisAddrs}).
+    WithSource(pgsource.NewSourceWithPool(pool)).
+    WithReadBulkContract(func(userID string) (*source.BulkReadModel, error) {
+        return &source.BulkReadModel{
+            Query: pgsource.PostgresBulkReadModel{
+                Query: `SELECT id, json_build_object('campaign_id', id, 'status', status, 'priority', priority)
+                        FROM campaigns WHERE user_id = $1 LIMIT 50`,
+                Args:  []any{userID},
+                Projector: func(rows pgx.Rows) ([]source.BulkReadResult, error) {
+                    var out []source.BulkReadResult
+                    for rows.Next() {
+                        var r source.BulkReadResult
+                        if err := rows.Scan(&r.CorrelationKey, &r.Payload); err != nil {
+                            return nil, err
+                        }
+                        out = append(out, r)
+                    }
+                    return out, rows.Err()
+                },
+            },
+        }, nil
+    }).
+    WithIndexBulkContract(campaignIndexes). // optional — makes bulk-loaded items visible to Query()
+    Build(ctx)
+
+payloads, err := sl.ReadBulk(ctx, "user_123")              // map[string][]byte
+payloads, ttls, err := sl.ReadBulkWithTTL(ctx, "user_123") // + remaining journal TTL (ms) per key
+
+// Every item is now resident — individual reads and compound queries skip the store.
+p, _ := sl.Read(ctx, "camp_3")
+```
+
+### Semantics
+
+- **Residency** — bulk-hydrated payloads are written with an `ActivityWindow` TTL, the same as hot keys.
+- **Indexes are best-effort** — an `IndexBulkContract` error is reported via `RecordContractError` and a
+  pipeline failure via `RecordRedisOp("bulkupdateindexes")`; neither fails the `ReadBulk` call.
+- **TTL fallback** — if the `BulkGetTTL` pipeline fails, `ReadBulkWithTTL` reports `ActivityWindow` for
+  every key rather than returning an error.
+- **Bound your queries** — `sluice` does not cap `Projector` output. Use `LIMIT` / `FindOptions.SetLimit`
+  / `QueryInput.Limit`, and size `MaxEntries` for the L1 cache accordingly.
+- An empty result set returns empty maps and touches Redis not at all.
+- `ReadBulk` requires both `WithSource()` and `WithReadBulkContract()`; it returns an error if either
+  is missing.
+
+---
+
+## Deployment topologies
+
+`sluice` is one platform, not a set of modes. `Build()` only requires a namespace and Redis; every
+other component is optional and each operation validates its own dependencies at call time. The flush
+engine starts only when **both** `WithSink()` and `WithWriteContract()` are provided.
+
+| Topology | Configuration | Use case |
+|---|---|---|
+| **Full pod** | `Sink`, `WriteContract`, `Source`, `ReadContract`, `ReadBulkContract` | Kafka/SQS ingestion and HTTP read APIs in one service |
+| **Reader-only pod** | `Source`, `ReadContract`, `ReadBulkContract` *(no Sink)* | Stateless API gateway reading the shared journal written by full pods; falls back to the store on a miss and hydrates the journal, but never writes to the store |
+| **Bulk pre-warmer** | `Source`, `ReadBulkContract`, `IndexBulkContract` | Background job that runs `ReadBulk` over active users to keep the journal hot ahead of peak traffic |
+| **Write-only** | `Sink`, `WriteContract` *(no Source)* | High-velocity ingestion worker that never serves reads |
+
+| Operation | Requires | Error when missing |
+|---|---|---|
+| `Write`, `WriteIdempotent`, `ProcessDLQ` | `WriteContract` + `Sink` | `ErrMissingWriteContract` / `ErrMissingSink` |
+| `Read`, `ReadFresh` | Redis; `Source` + `ReadContract` only for the cold path | `ErrRecordNotFound` on a full miss |
+| `ReadBulk`, `ReadBulkWithTTL` | `Source` + `ReadBulkContract` | non-sentinel error |
+| `HotLoad` | `Source` + `ReadContract` | `ErrMissingSource` / `ErrMissingReadContract` |
+| `Query` | `IndexContract` and/or `IndexBulkContract` to populate indexes | empty result |
+
+`DrainAndClose` is safe on every topology — it skips the engine drain and sink close when no write
+path was configured.
 
 ---
 
@@ -607,7 +761,8 @@ flowchart TD
 | Crash recovery | at-least-once via Redis journal |
 | Hot-path `Read()` | sub-millisecond — one pipelined `HGET` + `PTTL` |
 | L1-hit `Read()` (opt-in, v1.0.8) | sub-microsecond — in-process, no network |
-| Cold-path `Read()` | one `Source.Read` against the DataStore |
+| Cold-path `Read()` | one `Source.Read` against the DataStore; journal hydrated asynchronously |
+| `ReadBulk()` (N items) | one `Source.ReadBulk` + three Redis pipelines, instead of N reads + N hydrations |
 | Hot key residency | `ActivityWindow` (4h default), refreshed by read traffic |
 
 Resident-key figures assume `WithHotAwareFlush(false)` — a pure transit buffer. With the hot regime
@@ -765,6 +920,8 @@ flowchart TD
 
     QUERY["Query()<br/>secondary indexes"]
 
+    BULKREAD["ReadBulk()<br/>ReadBulkContract<br/>set-based pre-warm"]
+
     READ -->|"hot"| HOTREAD
     READ -->|"cold miss"| COLDREAD
 
@@ -780,6 +937,11 @@ flowchart TD
   HOTREAD --> HOT
 
   COLDREAD -->|"Source.Read"| DB
+  COLDREAD -.->|"async hydrate"| PAYLOAD
+
+  BULKREAD -->|"Source.ReadBulk · one query"| DB
+  BULKREAD -->|"pipelined HSET"| PAYLOAD
+  BULKREAD -->|"pipelined SADD / ZADD"| INDEX
 
 
 %% ============================================================
@@ -799,7 +961,7 @@ flowchart TD
   class W,BC,BP cold
   class PAYLOAD,DIRTY,HOT,INDEX journal
   class TRIG,DRAIN,CONTRACT,BULK,HOTTTL engine
-  class READ,HOTREAD,COLDREAD,QUERY read
+  class READ,HOTREAD,COLDREAD,QUERY,BULKREAD read
   class DB store
   class DLQ dlq
 ```
@@ -901,12 +1063,16 @@ s, _ := sluice.New("nudge_inventory").
     WithContentDedup(true).                // xxHash64 payload deduplication
     Build(ctx)
 
-// On login: warm the journal from DocumentDB
-payload, _ := s.HotLoad(ctx, correlationKey)
+// On login: mark the key hot and warm the journal from DocumentDB in the background
+_ = s.HotLoad(ctx, correlationKey)
 
 // During the session: sub-millisecond reads, no DocumentDB round-trip
-payload, _ = s.Read(ctx, correlationKey)
+payload, _ := s.Read(ctx, correlationKey)
 ```
+
+To pre-warm a whole working set in one query, add `WithReadBulkContract()` — see
+[Bulk reads](#bulk-reads--set-based-cache-pre-warming). To run a read-only instance, omit `WithSink()`
+and `WithWriteContract()` — see [Deployment topologies](#deployment-topologies).
 
 ---
 
@@ -917,8 +1083,8 @@ payload, _ = s.Read(ctx, correlationKey)
 | Builder method | Default | Description |
 |---|---|---|
 | `WithRedis(cfg)` | — | **Required.** Redis/Valkey connectivity; set `ClusterMode` for CME |
-| `WithSink(s)` | — | **Required.** Write-side DataStore (`sink.FlushSink`) |
-| `WithWriteContract(fn)` | — | **Required.** Translates a payload into a `WriteModel` |
+| `WithSink(s)` | nil | Write-side DataStore (`sink.FlushSink`). Required, together with `WithWriteContract`, for the write path |
+| `WithWriteContract(fn)` | nil | Translates a payload into a `WriteModel`. Without it (or without a sink) the flush engine is not started and `Write` returns `ErrMissingWriteContract` / `ErrMissingSink` |
 | `WithFlushWindow(d)` | `250ms` | Maximum dirty key age before flush — caps DataStore staleness |
 | `WithMaxBatchSize(n)` | `1000` | Keys per BulkWrite call; also the volume trigger threshold |
 | `WithBandCount(n)` | `16` | Parallel flush goroutines — one per dirty-set partition |
@@ -934,9 +1100,11 @@ payload, _ = s.Read(ctx, correlationKey)
 
 | Builder method | Default | Description |
 |---|---|---|
-| `WithSource(s)` | nil | Read-side DataStore (`source.Source`) — required with `WithReadContract` |
+| `WithSource(s)` | nil | Read-side DataStore (`source.Source`) — required with `WithReadContract` / `WithReadBulkContract` |
 | `WithReadContract(fn)` | nil | Translates a correlation key into a `source.ReadModel` for `HotLoad` / cold `Read` |
 | `WithIndexContract(fn)` | nil | Projects secondary index fields from a payload — enables `Query()` |
+| `WithReadBulkContract(fn)` | nil | Translates a lookup key into a `source.BulkReadModel` — enables `ReadBulk()` / `ReadBulkWithTTL()` |
+| `WithIndexBulkContract(fn)` | nil | Projects index fields for a whole bulk result set in one pipeline |
 | `WithActivityWindow(d)` | `4h` | Journal residency for hot correlation keys |
 | `WithHotAwareFlush(bool)` | `true` | Extend payload TTL to `ActivityWindow` after a successful commit |
 
@@ -1174,6 +1342,8 @@ The read path is symmetric to the write path: `ReadContract` produces a datastor
 type Source interface {
     // Read returns the raw document bytes, or source.ErrRecordNotFound.
     Read(ctx context.Context, model ReadModel) ([]byte, error)
+    // ReadBulk executes a set-based query and returns multiple hydrated results.
+    ReadBulk(ctx context.Context, model BulkReadModel) ([]BulkReadResult, error)
     Ping(ctx context.Context) error
     Close(ctx context.Context) error
 }
@@ -1181,13 +1351,29 @@ type Source interface {
 type ReadModel struct {
     Filter interface{}
 }
+
+type BulkReadModel struct {
+    Query     interface{} // adapter-specific plan, e.g. postgres.PostgresBulkReadModel
+    Args      []any
+    Projector func(scanner any) ([]BulkReadResult, error)
+}
+
+type BulkReadResult struct {
+    CorrelationKey string
+    Payload        []byte
+}
 ```
 
-| Package | Target |
-|---|---|
-| `source/docdb` | AWS DocumentDB · MongoDB (`FindOne`, result marshalled to JSON bytes) |
-| `source/dynamodb` | AWS DynamoDB — `GetItem` with `ConsistentRead: true` |
-| `source/postgres` | PostgreSQL — `QueryParams` + `Projector`, prepared `SELECT` against the primary |
+> **Breaking change (v1.0.8):** custom `Source` implementations must now implement `ReadBulk`.
+
+| Package | Single-key `Read` | `ReadBulk` |
+|---|---|---|
+| `source/docdb` | AWS DocumentDB · MongoDB (`FindOne`, result marshalled to JSON bytes) | `Find` with `DocDBBulkReadModel` → `*mongo.Cursor` |
+| `source/dynamodb` | AWS DynamoDB — `GetItem` with `ConsistentRead: true` | `Query` with `DynamoBulkReadModel` → item maps |
+| `source/postgres` | PostgreSQL — `QueryParams` + `Projector`, prepared `SELECT` against the primary | `PostgresBulkReadModel` → `pgx.Rows` |
+
+Each adapter type-asserts `BulkReadModel.Query` to its own model and returns an error on a mismatch,
+a missing query / filter / `QueryInput`, or a nil `Projector`.
 
 `source/docdb` offers two constructors: `NewSource(ctx, Config)` opens its own connection pool, and
 `NewSourceWithClient(client, db, collection)` shares an existing `*mongo.Client` — pass `sink.Client()`
@@ -1322,14 +1508,20 @@ All sentinel errors are comparable with `errors.Is`.
 
 | Error | Returned by | Meaning |
 |---|---|---|
-| `ErrRecordNotFound` | `Read`, `HotLoad` | Absent from both the journal and the source |
+| `ErrRecordNotFound` | `Read`, `ReadFresh` | Absent from both the journal and the source |
 | `ErrDuplicateIdempotencyKey` | `WriteIdempotent` | The idempotency key was already consumed |
-| `ErrMissingReadContract` | `HotLoad` | No `Source` / `ReadContract` configured |
+| `ErrMissingSource` | `HotLoad` | No `Source` configured |
+| `ErrMissingReadContract` | `HotLoad` | No `ReadContract` configured |
+| `ErrMissingSink` · `ErrMissingWriteContract` | `Write`, `WriteIdempotent`, `ProcessDLQ` | Write path not configured (reader-only instance) |
 | `ErrRedisUnavailable` | `Write` | Redis failed and `DegradedModeDirect` is off |
 | `ErrContractViolation` | degraded `Write` | `WriteContract` rejected the payload |
 | `ErrEmptyCorrelationKey` | `Write`, `WriteIdempotent` | Empty correlation or idempotency key |
 | `ErrLibraryClosed` | every method | Called after `DrainAndClose` |
-| `ErrMissingNamespace` · `ErrMissingSink` · `ErrMissingContract` · `ErrMissingRedis` | `Build` | Required builder option not set |
+| `ErrMissingNamespace` · `ErrMissingRedis` | `Build` | Required builder option not set |
+
+> **Breaking change (v1.0.8):** `ErrMissingContract` was renamed to `ErrMissingWriteContract`, and
+> `Build()` no longer fails when `WithSink()` / `WithWriteContract()` are omitted — those errors are
+> now returned at call time by the write-path methods.
 
 ---
 
@@ -1345,72 +1537,49 @@ make check              # pre-commit: tidy + vet + lint + unit tests
 
 Hot/cold regime coverage lives in `tests/unit/documentdb/hot_features_test.go` and
 `tests/integration/documentdb/hot_features_test.go` — `HotLoad`/`Read`, `WriteIdempotent`, content dedup, and
-compound `Query`. `tests/unit/dynamodb` and `tests/unit/postgres` cover chunking/batching, degraded mode,
-strong consistency, and (for Postgres) complex projections — against DynamoDB Local and a real PostgreSQL
-container respectively.
+compound `Query`. `tests/unit/dynamodb` covers chunking/batching, degraded mode, and strong consistency
+against DynamoDB Local; the PostgreSQL adapter is tested alongside its code in `sink/postgres` and
+`source/postgres` (including complex projections) against a real PostgreSQL container. `ReadBulk` is
+covered per adapter in `source/docdb`, `source/dynamodb`, and `source/postgres`.
 
 ---
 
 ## Local development
 
+Examples live under `examples/<scenario>/<adapter>/`, where `<adapter>` is `documentdb`, `dynamodb`, or
+`postgres` (`nudge_secured` is DocumentDB-only). The Makefile discovers and runs them with local
+defaults for `MONGO_URI`, `DYNAMODB_ENDPOINT`, `POSTGRES_URI`, `REDIS_ADDR`, `REDIS_ADDRS`, and
+`REDIS_CLUSTER_MODE` — override any of them in the environment.
+
 ```bash
-make docker-up              # start all services
-
-# Minimal quickstart — basic write + flush
-MONGO_URI=mongodb://localhost:27017 \
-REDIS_ADDRS=localhost:6379 \
-REDIS_CLUSTER_MODE=false \
-go run ./examples/nudge/main.go
-
-# Hot/Cold regime — HotLoad, Read, IsHot, Query, dedup, secondary indexes
-MONGO_URI=mongodb://localhost:27017 \
-REDIS_ADDRS=localhost:6379 \
-REDIS_CLUSTER_MODE=false \
-go run ./examples/nudge_hot_reload/main.go
-
-# TLS-secured Redis
-MONGO_URI=mongodb://localhost:27017 \
-REDIS_ADDR=localhost:7380 \
-go run ./examples/nudge_secured/main.go
-
-# DLQ validation — inline ticker scheduler (no extra deps)
-MONGO_URI=mongodb://localhost:27017 \
-REDIS_ADDR=localhost:6379 \
-go run ./examples/ticker_dlq/main.go
-
-# DLQ validation — distributed Asynq cron scheduler
-MONGO_URI=mongodb://localhost:27017 \
-REDIS_ADDR=localhost:6379 \
-go run ./examples/asynq_dlq/main.go
-
-# DynamoDB adapter — basic write + flush (DynamoDB Local)
-DYNAMODB_ENDPOINT=http://localhost:8000 \
-REDIS_ADDR=localhost:6379 \
-go run ./examples/nudge_dynamodb/main.go
-
-# DynamoDB adapter — hot/cold regime, Query via Redis-side indexes
-DYNAMODB_ENDPOINT=http://localhost:8000 \
-REDIS_ADDR=localhost:6379 \
-go run ./examples/nudge_hot_reload_dynamodb/main.go
-
-# PostgreSQL adapter — basic write + flush (Mode A bulk upsert)
-POSTGRES_DSN=postgres://sluice:sluice@localhost:5432/sluice?sslmode=disable \
-REDIS_ADDR=localhost:6379 \
-go run ./examples/nudge_postgres/main.go
-
-# PostgreSQL adapter — hot/cold regime, split writer/reader pools
-POSTGRES_DSN=postgres://sluice:sluice@localhost:5432/sluice?sslmode=disable \
-REDIS_ADDR=localhost:6379 \
-go run ./examples/nudge_write_dual_read_hot_postgres/main.go
-
+make docker-up                                          # start all services
+make list-examples                                      # list every runnable example
+make run-example DIR=examples/bulk_read/postgres        # run one example
+make run-examples                                       # run them all sequentially (Ctrl+C skips long-running ones)
 make docker-down
 ```
 
+| Scenario | What it demonstrates |
+|---|---|
+| `nudge` | Minimal quickstart — basic write + flush |
+| `nudge_hot_reload` | Hot/cold regime — fire-and-forget `HotLoad`, `Read`, `IsHot`, `Query`, dedup, secondary indexes |
+| `nudge_write_dual_read_hot` | Full lifecycle — cold stream writes, hot API writes, unified `Read`, and compound `Query` |
+| `bulk_read` | `ReadBulk` set-based pre-warming, `IndexBulkContract`, and `Query` over bulk-loaded items |
+| `localjournal_pushpull` | L1 Local Journal cross-pod convergence (plus split `reader/` and `writer/` processes) |
+| `ticker_dlq` | DLQ processing with an inline `time.Ticker` scheduler |
+| `asynq_dlq` | DLQ processing with a distributed Asynq cron scheduler |
+| `nudge_secured` | TLS-secured Redis (`REDIS_ADDR=localhost:7380`) |
+
+Running an example directly works too:
+
+```bash
+POSTGRES_URI=postgres://sluice:sluice@localhost:5432/sluice_test?sslmode=disable \
+REDIS_ADDRS=localhost:6379 \
+go run ./examples/bulk_read/postgres
+```
+
 `docker-compose.yml` runs `dynamodb-local` and `postgres` services alongside Redis/Valkey and MongoDB,
-so the examples above need no external AWS account or managed database. DLQ and Local Journal examples
-have DynamoDB and PostgreSQL counterparts too: `ticker_dlq_dynamodb`, `asynq_dlq_dynamodb`,
-`localjournal_pushpull_dynamodb`, `ticker_dlq_postgres`, `asynq_dlq_postgres`, and
-`localjournal_pushpull_postgres`.
+so the examples need no external AWS account or managed database.
 
 `examples/nudge_hot_reload/documentdb/main.go` runs both regimes side by side: eight cold-path bulk consumers
 driving the flush engine, plus a hot-path simulator that logs in a synthetic user every two seconds
