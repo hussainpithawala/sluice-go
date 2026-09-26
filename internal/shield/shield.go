@@ -95,6 +95,8 @@ func New(cfg RedisConfig, namespace string, bandCount int, keyTTL time.Duration,
 		writeScriptSHA:   sha,
 		hydrateScript:    redis.NewScript(hydrateLua),
 		hydrateScriptSHA: hydrateSHA,
+		flushedTTLScript: redis.NewScript(flushedTTLLua),
+		extendTTLScript:  redis.NewScript(extendTTLLua),
 	}, nil
 }
 
@@ -129,14 +131,14 @@ func (s *Shield) writeWithKind(ctx context.Context, correlationKey string, paylo
 	if !s.broadcastEnabled {
 		return s.writeScript.Run(ctx, s.client,
 			[]string{s.payloadKey(correlationKey), s.dirtyKey(correlationKey)},
-			payload, fmt.Sprintf("%.0f", floatTs), correlationKey, int64(s.keyTTL.Seconds()),
+			payload, fmt.Sprintf("%.0f", floatTs), correlationKey,
 		).Err()
 	}
 
 	pipe := s.client.Pipeline()
 	pipe.EvalSha(ctx, s.writeScriptSHA,
 		[]string{s.payloadKey(correlationKey), s.dirtyKey(correlationKey)},
-		payload, fmt.Sprintf("%.0f", floatTs), correlationKey, int64(s.keyTTL.Seconds()),
+		payload, fmt.Sprintf("%.0f", floatTs), correlationKey,
 	)
 	s.enqueueBroadcast(ctx, pipe, correlationKey, int64(floatTs), kind, payload)
 	_, err := pipe.Exec(ctx)
@@ -153,7 +155,7 @@ func (s *Shield) WriteDedup(ctx context.Context, correlationKey string, payload 
 
 	res, err := script.Run(ctx, s.client,
 		[]string{s.payloadKey(correlationKey), s.dirtyKeyForBand(band)},
-		payload, tsStr, correlationKey, int64(s.keyTTL.Seconds()), hash,
+		payload, tsStr, correlationKey, s.keyTTL.Milliseconds(), hash,
 	).Int()
 
 	written := res == 1
@@ -324,8 +326,10 @@ func (s *Shield) SetNX(ctx context.Context, key string, value interface{}, expir
 	return s.client.SetNX(ctx, key, value, expiration).Result()
 }
 
-// HotLoad forces a payload into the journal with ActivityWindow TTL
+// HotLoad forces a payload into the journal, marks the key hot, and emits a
 // kind=seed message so peer pods converge on the promoted key (RFC §5.4).
+// The payload stays persistent until flushed; the flush then applies the
+// ActivityWindow TTL because the key is hot.
 func (s *Shield) HotLoad(ctx context.Context, correlationKey string, payload []byte) error {
 	// 1. Journal write + seed broadcast (kind=seed distinguishes promotions
 	//    from normal writes in stream telemetry).
@@ -333,12 +337,7 @@ func (s *Shield) HotLoad(ctx context.Context, correlationKey string, payload []b
 		return err
 	}
 
-	// 2. Extend payload TTL to ActivityWindow for hot CRNs.
-	if err := s.client.Expire(ctx, s.payloadKey(correlationKey), s.activityWindow).Err(); err != nil {
-		return err
-	}
-
-	// 3. Set the hot marker so IsHot() returns true for this CRN.
+	// 2. Set the hot marker so IsHot() returns true for this CRN.
 	return s.SetHotMarker(ctx, correlationKey, s.activityWindow)
 }
 
@@ -353,11 +352,11 @@ func (s *Shield) Read(ctx context.Context, correlationKey string) ([]byte, bool,
 		return nil, false, err
 	}
 
-	// Fire-and-forget TTL refresh to keep it hot
+	// Fire-and-forget TTL refresh to keep it hot (flushed entries only).
 	go func() {
 		bgCtx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 		defer cancel()
-		_ = s.client.Expire(bgCtx, key, s.activityWindow).Err()
+		_ = s.extendTTLScript.Run(bgCtx, s.client, []string{key}, s.activityWindow.Milliseconds()).Err()
 	}()
 
 	return []byte(val), true, nil
@@ -389,16 +388,18 @@ func RangeIndexKey(namespace string, band int, field string) string {
 }
 
 // DrainBand reads up to maxBatch dirty keys and returns their payloads as
-// FlushRecords ready for BulkWrite assembly.
+// FlushRecords ready for BulkWrite assembly. It has no side effects.
 //
 // Two-phase commit contract:
-//   - Keys whose payload hash has expired (TTL elapsed) are removed from the
-//     dirty set immediately — there is nothing to flush for them.
-//   - Keys with a valid payload are returned WITHOUT being removed from the
-//     dirty set. The caller MUST call CommitKeys after a confirmed successful
-//     BulkWrite, and MoveToDeadLetter for permanently failed keys.
-//     Keys that fail with a transient error require no action here — they
-//     remain in the dirty set and are retried on the next flush cycle.
+//   - Every dirty key is returned WITHOUT being removed from the dirty set.
+//     The caller MUST call CommitKeys after a confirmed successful BulkWrite,
+//     and MoveToDeadLetter for permanently failed keys. Keys that fail with a
+//     transient error require no action — they remain in the dirty set and
+//     are retried on the next flush cycle.
+//   - A key whose payload hash is gone is returned with a nil Payload.
+//     Unflushed payloads are persistent, so this indicates data loss
+//     (eviction, FLUSHDB, manual deletion); the caller must surface it
+//     rather than drop it silently.
 //
 // This design ensures that a BulkWrite failure (including unique-ID collision
 // during DrainAndClose) never causes silent record loss.
@@ -438,7 +439,52 @@ func (s *Shield) DrainBand(ctx context.Context, band, maxBatch int) ([]FlushReco
 		return nil, fmt.Errorf("sluice/shield: pipeline hmget band %d: %w", band, err)
 	}
 
-	return drainAction(ctx, members, cmds, corrKeys, s, dirtyKey)
+	// Pure parsing. No side effects.
+	return buildFlushRecords(members, cmds, corrKeys), nil
+}
+
+// buildFlushRecords parses pipelined HMGET results into FlushRecords.
+// If a payload is missing (expired or evicted), it returns a FlushRecord
+// with a nil Payload so the engine can route it to the DLQ.
+func buildFlushRecords(members []redis.Z, cmds []*redis.SliceCmd, corrKeys []string) []FlushRecord {
+	records := make([]FlushRecord, 0, len(members))
+
+	for i, cmd := range cmds {
+		vals, cmdErr := cmd.Result()
+
+		var payload []byte
+		var ts int64
+
+		// 1. Extract Payload
+		if cmdErr == nil && len(vals) > 0 && vals[0] != nil {
+			if pStr, ok := vals[0].(string); ok && pStr != "" {
+				payload = []byte(pStr)
+			}
+		}
+
+		// 2. Extract Timestamp
+		if cmdErr == nil && len(vals) > 1 && vals[1] != nil {
+			if tsStr, ok := vals[1].(string); ok && tsStr != "" {
+				if f, perr := strconv.ParseFloat(tsStr, 64); perr == nil {
+					ts = int64(f)
+				}
+			}
+		}
+
+		// Fallback to ZSET score if HGET "ts" is missing
+		if ts == 0 {
+			ts = int64(members[i].Score)
+		}
+
+		records = append(records, FlushRecord{
+			CorrelationKey: corrKeys[i],
+			Payload:        payload, // nil if missing/expired
+			ReceivedAt:     time.Now(),
+			JournalTS:      ts,
+		})
+	}
+
+	return records
 }
 
 // CommitKeys removes successfully persisted correlation keys from the dirty
@@ -840,23 +886,111 @@ func (s *Shield) runBatcher() {
 	}
 }
 
-// RefreshHotTTL extends the ActivityWindow TTL on successfully flushed hot correlation_keys.
-// This ensures active users remain in the fast-path journal for subsequent Read() calls.
+// RefreshHotTTL extends the ActivityWindow TTL on flushed hot correlation_keys,
+// so active users remain in the fast-path journal for subsequent Read() calls.
+// Extend-only and flushed-only: an unflushed (persistent) payload never gains
+// a TTL here, and a longer TTL is never shortened.
 func (s *Shield) RefreshHotTTL(ctx context.Context, band int, corrKeys []string) error {
+	if len(corrKeys) == 0 {
+		return nil
+	}
+	keys := make([][]string, len(corrKeys))
+	args := make([][]interface{}, len(corrKeys))
+	for i, ck := range corrKeys {
+		keys[i] = []string{s.payloadKey(ck)}
+		args[i] = []interface{}{s.activityWindow.Milliseconds()}
+	}
+	_, err := s.evalShaPipelined(ctx, s.extendTTLScript, keys, args)
+	return err
+}
+
+// FlushedKey identifies one successfully flushed payload version.
+type FlushedKey struct {
+	CorrelationKey string
+	JournalTS      int64         // ts of the flushed version (FlushRecord.JournalTS)
+	TTL            time.Duration // post-flush TTL to apply
+}
+
+// ApplyFlushedTTLs gives flushed payloads their post-flush TTL in one
+// pipeline. Each TTL is applied only if the payload's ts still equals the
+// flushed JournalTS, so a newer write that landed while the batch was in
+// flight stays persistent until it is flushed itself. Keys with a
+// non-positive TTL are skipped (PEXPIRE 0 would delete them).
+func (s *Shield) ApplyFlushedTTLs(ctx context.Context, items []FlushedKey) error {
+	keys := make([][]string, 0, len(items))
+	args := make([][]interface{}, 0, len(items))
+	for _, it := range items {
+		if it.TTL <= 0 {
+			continue
+		}
+		keys = append(keys, []string{s.payloadKey(it.CorrelationKey)})
+		args = append(args, []interface{}{it.JournalTS, it.TTL.Milliseconds()})
+	}
+	if len(keys) == 0 {
+		return nil
+	}
+	_, err := s.evalShaPipelined(ctx, s.flushedTTLScript, keys, args)
+	return err
+}
+
+// HotKeys reports, in one pipeline, which correlation keys have a live hot
+// marker. The result is index-aligned with corrKeys.
+func (s *Shield) HotKeys(ctx context.Context, corrKeys []string) ([]bool, error) {
+	pipe := s.client.Pipeline()
+	cmds := make([]*redis.IntCmd, len(corrKeys))
+	for i, ck := range corrKeys {
+		cmds[i] = pipe.Exists(ctx, s.hotMarkerKey(ck))
+	}
+	if _, err := pipe.Exec(ctx); err != nil {
+		return nil, err
+	}
+	hot := make([]bool, len(corrKeys))
+	for i, cmd := range cmds {
+		hot[i] = cmd.Val() > 0
+	}
+	return hot, nil
+}
+
+// RefreshHotMarkers resets the hot marker TTL for corrKeys in one pipeline.
+func (s *Shield) RefreshHotMarkers(ctx context.Context, corrKeys []string, ttl time.Duration) error {
 	if len(corrKeys) == 0 {
 		return nil
 	}
 	pipe := s.client.Pipeline()
 	for _, ck := range corrKeys {
-		pipe.Expire(ctx, s.payloadKey(ck), s.activityWindow)
+		pipe.Set(ctx, s.hotMarkerKey(ck), "1", ttl)
 	}
 	_, err := pipe.Exec(ctx)
 	return err
 }
 
+// evalShaPipelined runs script once per keys[i]/args[i] in a single pipeline
+// via EVALSHA. If the script cache was flushed (e.g. a Redis restart) it
+// reloads the script and retries once, so callers never see NOSCRIPT.
+func (s *Shield) evalShaPipelined(ctx context.Context, script *redis.Script, keys [][]string, args [][]interface{}) ([]*redis.Cmd, error) {
+	run := func() ([]*redis.Cmd, error) {
+		pipe := s.client.Pipeline()
+		cmds := make([]*redis.Cmd, len(keys))
+		for i := range keys {
+			cmds[i] = script.EvalSha(ctx, pipe, keys[i], args[i]...)
+		}
+		_, err := pipe.Exec(ctx)
+		return cmds, err
+	}
+
+	cmds, err := run()
+	if err != nil && redis.HasErrorPrefix(err, "NOSCRIPT") {
+		if lerr := script.Load(ctx, s.client).Err(); lerr != nil {
+			return cmds, lerr
+		}
+		cmds, err = run()
+	}
+	return cmds, err
+}
+
 // OldestDirtyScore returns the score (timestamp) of the oldest item in a band's
 // dirty sorted set. Returns 0 if the set is empty. Used by the engine's
-// pre-eviction flusher to force a flush before Redis TTL expires the payload.
+// backlog flusher to force a flush of entries that have waited too long.
 func (s *Shield) OldestDirtyScore(ctx context.Context, band int) (float64, error) {
 	res, err := s.client.ZRangeWithScores(ctx, s.dirtyKeyForBand(band), 0, 0).Result()
 	if err != nil || len(res) == 0 {
@@ -870,12 +1004,11 @@ func (s *Shield) flushBatch(entries []writeEntry) {
 	defer cancel()
 
 	pipe := s.client.Pipeline()
-	ttlSec := int64(s.keyTTL.Seconds())
 
 	for _, e := range entries {
 		pipe.EvalSha(ctx, s.writeScriptSHA,
 			[]string{s.payloadKey(e.correlationKey), s.dirtyKey(e.correlationKey)},
-			e.payload, fmt.Sprintf("%.0f", e.ts), e.correlationKey, ttlSec,
+			e.payload, fmt.Sprintf("%.0f", e.ts), e.correlationKey,
 		)
 		// Piggy-back broadcast XADD in the same pipeline.
 		// Zero additional round-trips on the batched hot path.

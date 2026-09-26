@@ -5,6 +5,24 @@ All notable changes to sluice will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- **Unflushed writes could silently expire (data loss)**: every write gave its payload a `KeyTTL` (default 30s) TTL before it was flushed, and `DrainBand` silently `ZREM`ed dirty keys whose payload had expired. A sink outage or backlog longer than `KeyTTL` therefore dropped writes with no metric or log. Unflushed payloads are now persistent (`PERSIST` in both the plain and content-dedup write scripts — `HSET` alone would keep the TTL of a previously flushed version), and the post-flush TTL is applied only after the sink confirms the write.
+- **Content-dedup refresh could add a TTL to an unflushed payload**: a duplicate write now leaves an unflushed (persistent) payload untouched, and only extends a flushed payload's TTL — never shortening a hot key's longer TTL.
+- **Flushed cold payloads were kept for `ActivityWindow`**: with `HotAwareFlush`, every flushed key's TTL was extended to `ActivityWindow` (default 4h), not just hot keys, inflating Redis memory by orders of magnitude. Cold keys now get `KeyTTL` after flush; only keys with a live hot marker get `ActivityWindow`.
+- **TTL refreshes on read** (`RefreshHotTTL`, `shield.Read`) are now extend-only and skip unflushed payloads.
+
+### Changed
+- **Breaking — `MetricsRecorder`** gains `RecordUnflushedExpiry(namespace, band string, count int)`. Custom recorders must implement it; any non-zero count is data loss and should alert.
+- **`KeyTTL` semantics**: now the post-flush TTL for cold payloads (and the backlog-flush threshold), no longer a TTL on in-flight writes.
+- Post-flush TTL and hot-marker refresh run as three pipelines per flush batch instead of per-key round-trips. The TTL is guarded by the flushed version's timestamp, so a newer write that lands mid-flush stays persistent until it is flushed.
+- `shield.HotLoad` no longer sets a TTL on the (unflushed) payload; the flush applies `ActivityWindow` because the key is hot.
+
+### Added
+- **`ErrPayloadMissing`**: reported to the `OnFlush` callback for dirty keys whose payload is gone at flush time. Such keys are also logged at error level, counted via `RecordUnflushedExpiry`, and dead-lettered (`payload_missing_before_flush`) instead of being dropped.
+- **Prometheus**: `sluice_{ns}_unflushed_expiry_total{band}` counter.
+
 ## [1.0.8] - 2026-09-23
 
 ### Added

@@ -38,6 +38,7 @@ type Recorder struct {
 	contractErrorTotal *prometheus.CounterVec
 	deadLetterTotal    *prometheus.CounterVec
 	dlqProcessTotal    *prometheus.CounterVec
+	unflushedLossTotal *prometheus.CounterVec
 
 	// Hot/cold regime
 	warmupDuration *prometheus.HistogramVec
@@ -135,6 +136,13 @@ func NewRecorderWithRegistry(namespace string, reg prometheus.Registerer) *Recor
 			Help:      "Total number of DLQ records processed.",
 		}, []string{"strategy", "outcome"}),
 
+		unflushedLossTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: "sluice",
+			Subsystem: namespace,
+			Name:      "unflushed_expiry_total",
+			Help:      "Dirty keys whose payload was gone before it could be flushed. Data loss; must stay 0.",
+		}, []string{"band"}),
+
 		// Hot/cold regime
 		warmupDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Namespace: "sluice",
@@ -201,6 +209,7 @@ func NewRecorderWithRegistry(namespace string, reg prometheus.Registerer) *Recor
 		r.contractErrorTotal,
 		r.deadLetterTotal,
 		r.dlqProcessTotal,
+		r.unflushedLossTotal,
 		r.warmupDuration,
 		r.readDuration,
 		r.hotSetSize,
@@ -260,6 +269,10 @@ func (r *Recorder) RecordDLQProcess(_ string, strategy string, processed, succee
 	r.dlqProcessTotal.WithLabelValues(strategy, "processed").Add(float64(processed))
 	r.dlqProcessTotal.WithLabelValues(strategy, "succeeded").Add(float64(succeeded))
 	r.dlqProcessTotal.WithLabelValues(strategy, "failed").Add(float64(failed))
+}
+
+func (r *Recorder) RecordUnflushedExpiry(_ string, bandStr string, count int) {
+	r.unflushedLossTotal.WithLabelValues(bandStr).Add(float64(count))
 }
 
 // ── Hot/cold regime ─────────────────────────────────────────────────────────
@@ -326,6 +339,7 @@ func (r *Recorder) Unregister(reg prometheus.Registerer) {
 	reg.Unregister(r.contractErrorTotal)
 	reg.Unregister(r.deadLetterTotal)
 	reg.Unregister(r.dlqProcessTotal)
+	reg.Unregister(r.unflushedLossTotal)
 	reg.Unregister(r.warmupDuration)
 	reg.Unregister(r.readDuration)
 	reg.Unregister(r.hotSetSize)

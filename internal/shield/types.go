@@ -125,6 +125,9 @@ type Shield struct {
 	hydrateScript    *redis.Script
 	hydrateScriptSHA string // pre-loaded SHA; used by BulkHydrateJournal pipelines
 
+	flushedTTLScript *redis.Script // post-flush TTL, guarded by the flushed ts
+	extendTTLScript  *redis.Script // extend-only TTL refresh for flushed payloads
+
 	// Batching fields — all nil/zero when batching is disabled.
 	batchCh        chan writeEntry
 	batchSize      int
@@ -147,9 +150,47 @@ type JournalRead struct {
 	Found   bool
 }
 
-// atomicWriteLua handles content deduplication atomically without cjson.
-// Returns 0 if deduplicated (TTL refreshed), 1 if written.
-const atomicWriteLua = `redis.call('HSET', KEYS[1], 'p', ARGV[1], 'ts', ARGV[2]) redis.call('EXPIRE', KEYS[1], tonumber(ARGV[4])) redis.call('ZADD', KEYS[2], ARGV[2], ARGV[3]) return 1`
+// atomicWriteLua stores the payload and marks the key dirty in one step.
+//
+// KEYS[1]=payload hash, KEYS[2]=dirty set; ARGV[1]=payload, ARGV[2]=ts,
+// ARGV[3]=correlation key.
+//
+// An unflushed payload exists only in Redis, so it must never carry a TTL.
+// PERSIST is required, not just omitting EXPIRE: HSET keeps whatever TTL the
+// hash already has, so re-writing a previously flushed key would otherwise
+// inherit its post-flush TTL and could expire before the new value is
+// flushed. The post-flush TTL is applied by flushedTTLLua after the sink
+// confirms the write.
+const atomicWriteLua = `
+redis.call('HSET', KEYS[1], 'p', ARGV[1], 'ts', ARGV[2])
+redis.call('PERSIST', KEYS[1])
+redis.call('ZADD', KEYS[2], ARGV[2], ARGV[3])
+return 1`
+
+// flushedTTLLua applies the post-flush TTL, but only if the payload is still
+// the version that was flushed. A newer write that landed while the batch was
+// in flight has a different ts and must stay persistent until it is flushed.
+//
+// KEYS[1]=payload hash; ARGV[1]=flushed ts, ARGV[2]=ttl in ms.
+// Returns 1 if the TTL was applied, 0 if skipped.
+const flushedTTLLua = `
+local ts = redis.call('HGET', KEYS[1], 'ts')
+if ts and tonumber(ts) == tonumber(ARGV[1]) then
+    return redis.call('PEXPIRE', KEYS[1], ARGV[2])
+end
+return 0`
+
+// extendTTLLua extends a flushed payload's TTL to at least ARGV[1] ms.
+// A persistent key (PTTL -1) is unflushed and is left untouched, as is a
+// missing key (-2); an existing longer TTL is never shortened.
+//
+// KEYS[1]=payload hash; ARGV[1]=ttl in ms. Returns 1 if extended, else 0.
+const extendTTLLua = `
+local pttl = redis.call('PTTL', KEYS[1])
+if pttl >= 0 and pttl < tonumber(ARGV[1]) then
+    return redis.call('PEXPIRE', KEYS[1], ARGV[1])
+end
+return 0`
 
 // hydrateLua seeds the journal with a payload read from the Source, without
 // marking the key dirty (store data must never be flushed back to the sink).
@@ -192,6 +233,15 @@ type HydrateResult struct {
 	Version int64
 }
 
+// atomicDedupWriteLua is atomicWriteLua with xxHash64 content deduplication.
+//
+// KEYS[1]=payload hash, KEYS[2]=dirty set; ARGV[1]=payload, ARGV[2]=ts,
+// ARGV[3]=correlation key, ARGV[4]=ttl in ms, ARGV[5]=content hash.
+//
+// A duplicate refreshes the TTL of a flushed entry (extend-only, so a hot
+// key's longer TTL is kept) and leaves an unflushed, persistent entry alone.
+// A new payload is persisted exactly as in atomicWriteLua.
+// Returns 0 if deduplicated, 1 if written.
 const atomicDedupWriteLua = `
 local payloadKey = KEYS[1]
 local dirtyKey = KEYS[2]
@@ -203,12 +253,15 @@ local contentHash = ARGV[5]
 
 local existingHash = redis.call('HGET', payloadKey, 'h')
 if existingHash == contentHash then
-    redis.call('EXPIRE', payloadKey, ttl)
+    local pttl = redis.call('PTTL', payloadKey)
+    if pttl >= 0 and pttl < ttl then
+        redis.call('PEXPIRE', payloadKey, ttl)
+    end
     return 0
 end
 
 redis.call('HSET', payloadKey, 'p', payload, 'ts', score, 'h', contentHash)
-redis.call('EXPIRE', payloadKey, ttl)
+redis.call('PERSIST', payloadKey)
 redis.call('ZADD', dirtyKey, score, corrKey)
 return 1
 `

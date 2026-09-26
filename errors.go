@@ -1,6 +1,16 @@
 package sluice
 
-import "errors"
+import (
+	"errors"
+
+	"github.com/hussainpithawala/sluice-go/internal/engine"
+)
+
+// ErrPayloadMissing is passed to the OnFlush callback for dirty keys whose
+// payload was gone from Redis before it could be flushed. Unflushed payloads
+// never expire, so this means data was lost (eviction, FLUSHDB, manual
+// deletion) and should be treated as an incident.
+var ErrPayloadMissing = engine.ErrPayloadMissing
 
 var (
 	ErrLibraryClosed        = errors.New("sluice: library is closed")
