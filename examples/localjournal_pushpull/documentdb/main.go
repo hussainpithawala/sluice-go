@@ -530,3 +530,7 @@ func dumpStreamTail(ctx context.Context, redisAddrs []string, clusterMode bool, 
 		)
 	}
 }
+
+func (m *logMetrics) RecordUnflushedExpiry(ns, band string, count int) {
+	m.log.Error("unflushed payload lost", "ns", ns, "band", band, "count", count)
+}
