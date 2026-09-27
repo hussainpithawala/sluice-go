@@ -198,6 +198,10 @@ const tableName = "nudge_inventory_pushpull"
 // buildPod constructs a full Sluice instance backed by PostgreSQL.
 func buildPod(ctx context.Context, tag string, postgresURI string, redisAddrs []string, clusterMode bool, log *slog.Logger) (*sluice.Sluice, func(context.Context) error, error) {
 	pool, err := pgxpool.New(ctx, postgresURI)
+	if err != nil {
+		return nil, nil, fmt.Errorf("error while creating pgxpool: %w", err)
+	}
+
 	sk, err := pgsink.New(ctx, pgsink.Config{
 		ConnString:      postgresURI,
 		TableName:       tableName,

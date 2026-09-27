@@ -104,7 +104,7 @@ func (s *Sink) BulkWrite(ctx context.Context, models []sink.WriteModel) (*sink.B
 	seenKeys := make(map[string]bool)
 	requestItems := make([]types.WriteRequest, 0, len(models))
 	var preErrors []sink.SinkError
-	var validModels []sink.WriteModel
+	validModels := make([]sink.WriteModel, 0, len(models))
 
 	for _, m := range models {
 		// RFP Fix: Catch type assertion failures per-item, do not return early.
@@ -113,7 +113,7 @@ func (s *Sink) BulkWrite(ctx context.Context, models []sink.WriteModel) (*sink.B
 			preErrors = append(preErrors, sink.SinkError{
 				CorrelationKey: m.CorrelationKey,
 				Class:          sink.ClassPermanent,
-				Err:            errors.New("Update field must be map[string]any"),
+				Err:            errors.New("update field must be map[string]any"),
 			})
 			continue
 		}
@@ -264,7 +264,7 @@ func (s *Sink) fallbackPutItems(ctx context.Context, models []sink.WriteModel, e
 func (s *Sink) Write(ctx context.Context, model sink.WriteModel) error {
 	item, ok := model.Update.(map[string]any)
 	if !ok {
-		return errors.New("Update field must be map[string]any")
+		return errors.New("update field must be map[string]any")
 	}
 	avItem, err := attributevalue.MarshalMap(item)
 	if err != nil {

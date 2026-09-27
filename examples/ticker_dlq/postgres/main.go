@@ -152,6 +152,9 @@ func run(log *slog.Logger) error {
 	postgresURI := getEnv("POSTGRES_URI", "postgres://sluice:sluice@localhost:5432/sluice_test?sslmode=disable")
 	tableName := "nudge_inventory_dlq"
 	pool, err := pgxpool.New(ctx, postgresURI)
+	if err != nil {
+		return fmt.Errorf("error while creating pgxpool: %w", err)
+	}
 	// 1. Initialize PostgreSQL Sink
 	sk, err := pgsink.New(ctx, pgsink.Config{
 		ConnString:      postgresURI,

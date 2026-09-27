@@ -198,6 +198,9 @@ func run(log *slog.Logger) error {
 		TableName:   tableName,
 		PKAttribute: "PK",
 	})
+	if err != nil {
+		return fmt.Errorf("unable to create sink for dynamodb : %w", err)
+	}
 
 	redisAddr := getEnv("REDIS_ADDR", "localhost:6379")
 

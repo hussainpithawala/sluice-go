@@ -3,6 +3,7 @@ package postgres_test
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"testing"
 	"time"
 
@@ -34,7 +35,12 @@ func TestPostgresBulkWrite_SilentLossPrevention(t *testing.T) {
 		Started:          true,
 	})
 	require.NoError(t, err)
-	defer pgC.Terminate(ctx)
+	defer func(pgC testcontainers.Container, ctx context.Context, opts ...testcontainers.TerminateOption) {
+		err := pgC.Terminate(ctx, opts...)
+		if err != nil {
+			slog.Error(fmt.Sprintf("Error while terminating the PgContainer %e", err))
+		}
+	}(pgC, ctx)
 
 	host, _ := pgC.Host(ctx)
 	port, _ := pgC.MappedPort(ctx, "5432")
@@ -64,7 +70,12 @@ func TestPostgresBulkWrite_SilentLossPrevention(t *testing.T) {
 		OnConflict:      sinkpostgres.OnConflictDoUpdate,
 	})
 	require.NoError(t, err)
-	defer s.Close(ctx)
+	defer func(s *sinkpostgres.Sink, ctx context.Context) {
+		err := s.Close(ctx)
+		if err != nil {
+			slog.Error(fmt.Sprintf("unable to close the sink due to error %e", err))
+		}
+	}(s, ctx)
 
 	t.Run("Column mismatch: Row with different columns gets permanent error, rest succeed", func(t *testing.T) {
 		models := []sink.WriteModel{
@@ -168,7 +179,12 @@ func TestPostgresBulkWrite_SilentLossPrevention(t *testing.T) {
 			OnConflict:      sinkpostgres.OnConflictDoNothing,
 		})
 		require.NoError(t, err)
-		defer sDoNothing.Close(ctx)
+		defer func(sDoNothing *sinkpostgres.Sink, ctx context.Context) {
+			err := sDoNothing.Close(ctx)
+			if err != nil {
+				slog.Error("Error while closing the sink")
+			}
+		}(sDoNothing, ctx)
 
 		// Insert a row
 		_, err = pool.Exec(ctx, "INSERT INTO test_table (user_id, email, val) VALUES ('donothing_user', 'first@test.com', 10)")

@@ -85,7 +85,7 @@ func (s *Sink) BulkWrite(ctx context.Context, models []sink.WriteModel) (*sink.B
 	}
 
 	var preErrors []sink.SinkError
-	var validModels []sink.WriteModel
+	validModels := make([]sink.WriteModel, 0, len(models))
 	var expectedCols []string
 	seenConflictKeys := make(map[string]bool)
 
@@ -96,7 +96,7 @@ func (s *Sink) BulkWrite(ctx context.Context, models []sink.WriteModel) (*sink.B
 			preErrors = append(preErrors, sink.SinkError{
 				CorrelationKey: m.CorrelationKey,
 				Class:          sink.ClassPermanent,
-				Err:            errors.New("Update field must be map[string]any"),
+				Err:            errors.New("update field must be map[string]any"),
 			})
 			continue
 		}
@@ -263,7 +263,7 @@ func (s *Sink) retryRowByRow(ctx context.Context, models []sink.WriteModel, cols
 func (s *Sink) Write(ctx context.Context, model sink.WriteModel) error {
 	item, ok := model.Update.(map[string]any)
 	if !ok {
-		return errors.New("Update field must be map[string]any")
+		return errors.New("update field must be map[string]any")
 	}
 	cols := sortedColumnsFromMap(item)
 	return s.executeBulk(ctx, []sink.WriteModel{model}, cols)
@@ -302,7 +302,7 @@ func sameColumns(a, b []string) bool {
 }
 
 func buildConflictKeyFromMap(item map[string]any, conflictCols []string) string {
-	var parts []string
+	parts := make([]string, 0, len(conflictCols))
 	for _, c := range conflictCols {
 		parts = append(parts, fmt.Sprintf("%v", item[c]))
 	}

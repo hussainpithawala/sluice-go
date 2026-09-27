@@ -4,6 +4,7 @@ package documentdb
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"sync"
 	"testing"
 
@@ -31,7 +32,12 @@ func TestDocDBBulkWrite_SilentLossPrevention(t *testing.T) {
 		Started:          true,
 	})
 	require.NoError(t, err)
-	defer mongoC.Terminate(ctx)
+	defer func(mongoC testcontainers.Container, ctx context.Context, opts ...testcontainers.TerminateOption) {
+		err := mongoC.Terminate(ctx, opts...)
+		if err != nil {
+			slog.Error(fmt.Sprintf("Error while terminating the MongoContainer %e", err))
+		}
+	}(mongoC, ctx)
 
 	host, _ := mongoC.Host(ctx)
 	port, _ := mongoC.MappedPort(ctx, "27017")
@@ -39,7 +45,12 @@ func TestDocDBBulkWrite_SilentLossPrevention(t *testing.T) {
 
 	s, err := docdb.New(ctx, docdb.DefaultConfig(uri, "testdb", "testcoll"))
 	require.NoError(t, err)
-	defer s.Close(ctx)
+	defer func(s *docdb.Sink, ctx context.Context) {
+		err := s.Close(ctx)
+		if err != nil {
+			slog.Error(fmt.Sprintf("Error while closing the source %e", err))
+		}
+	}(s, ctx)
 
 	client := s.Client()
 	coll := client.Database("testdb").Collection("testcoll")

@@ -84,6 +84,10 @@ func main() {
 		TableName:   tableName,
 		PKAttribute: "PK",
 	})
+	if err != nil {
+		slog.Error(fmt.Sprintf("unable to create sink for dynamodb : %e", err))
+		return
+	}
 	src := dynsource.NewSource(client, tableName)
 
 	sl, err := sluice.New("bulk_read_demo").

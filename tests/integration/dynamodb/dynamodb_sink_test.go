@@ -3,6 +3,7 @@ package dynamodb
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"testing"
 	"time"
 
@@ -33,7 +34,12 @@ func TestDynamoDBBulkWrite_SilentLossPrevention(t *testing.T) {
 		Started:          true,
 	})
 	require.NoError(t, err)
-	defer dynamoC.Terminate(ctx)
+	defer func(dynamoC testcontainers.Container, ctx context.Context, opts ...testcontainers.TerminateOption) {
+		err := dynamoC.Terminate(ctx, opts...)
+		if err != nil {
+			slog.Error(fmt.Sprintf("Error while terminating the DynContainer %e", err))
+		}
+	}(dynamoC, ctx)
 
 	host, _ := dynamoC.Host(ctx)
 	port, _ := dynamoC.MappedPort(ctx, "8000")

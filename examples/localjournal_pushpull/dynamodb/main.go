@@ -220,6 +220,9 @@ func buildPod(ctx context.Context, tag string, endpoint string, redisAddrs []str
 		TableName:   tableName,
 		PKAttribute: "PK",
 	})
+	if err != nil {
+		return nil, nil, fmt.Errorf("unable to create sink for dynamodb : %w", err)
+	}
 	src := dynsource.NewSource(client, tableName)
 
 	sl, err := sluice.New("nudge_inventory_dynamodb").
