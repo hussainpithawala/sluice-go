@@ -213,7 +213,13 @@ func buildPod(ctx context.Context, tag string, endpoint string, redisAddrs []str
 		return nil, nil, fmt.Errorf("ensure table exists: %w", err)
 	}
 
-	sk := dynsink.NewSink(client, tableName)
+	// 2. Initialize Sluice Sink
+	sk, err := dynsink.New(ctx, dynsink.Config{
+		Endpoint:    endpoint,
+		Region:      "us-east-1",
+		TableName:   tableName,
+		PKAttribute: "PK",
+	})
 	src := dynsource.NewSource(client, tableName)
 
 	sl, err := sluice.New("nudge_inventory_dynamodb").
@@ -405,7 +411,7 @@ func run(log *slog.Logger) (err error) {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	endpoint := os.Getenv("DYNAMODB_ENDPOINT")
+	endpoint := getEnv("DYNAMODB_ENDPOINT", "http://localhost:8000")
 
 	// ── Redis config (shared by both pods) ───────────────────────────────
 	redisAddrsRaw := getEnv("REDIS_ADDRS", "localhost:7001,localhost:7002,localhost:7003,localhost:7004")

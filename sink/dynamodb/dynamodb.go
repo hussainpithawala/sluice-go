@@ -301,3 +301,9 @@ func findCorrelationKey(models []sink.WriteModel, avItem map[string]types.Attrib
 	}
 	return ""
 }
+
+// Client returns the underlying dynamodb.Client, allowing it to be shared
+// with tests or other components that need direct access.
+func (s *Sink) Client() *dynamodb.Client {
+	return s.api
+}

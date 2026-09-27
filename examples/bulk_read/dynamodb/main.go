@@ -76,8 +76,14 @@ func main() {
 	}
 	log.Info("seeded 5 campaigns for user_123")
 
-	// 2. Initialize Sluice
-	sk := dynsink.NewSink(client, tableName)
+	// NEW:
+	// 2. Initialize Sluice Sink
+	sk, err := dynsink.New(ctx, dynsink.Config{
+		Endpoint:    endpoint,
+		Region:      "us-east-1",
+		TableName:   tableName,
+		PKAttribute: "PK",
+	})
 	src := dynsource.NewSource(client, tableName)
 
 	sl, err := sluice.New("bulk_read_demo").

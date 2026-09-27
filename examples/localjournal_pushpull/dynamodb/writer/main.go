@@ -160,7 +160,7 @@ func run(log *slog.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	endpoint := os.Getenv("DYNAMODB_ENDPOINT")
+	endpoint := getEnv("DYNAMODB_ENDPOINT", "http://localhost:8000")
 
 	// 1. Initialize DynamoDB Client
 	httpClient := &http.Client{Timeout: 30 * time.Second}
@@ -185,7 +185,13 @@ func run(log *slog.Logger) error {
 		return fmt.Errorf("ensure table exists: %w", err)
 	}
 
-	sk := dynsink.NewSink(client, tableName)
+	// 2. Initialize Sluice Sink
+	sk, err := dynsink.New(ctx, dynsink.Config{
+		Endpoint:    endpoint,
+		Region:      "us-east-1",
+		TableName:   tableName,
+		PKAttribute: "PK",
+	})
 	src := dynsource.NewSource(client, tableName)
 
 	redisAddrs := splitAddrs(getEnv("REDIS_ADDRS", "localhost:7001,localhost:7002,localhost:7003,localhost:7004"))
