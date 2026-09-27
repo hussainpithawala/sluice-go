@@ -210,20 +210,10 @@ func (e *Engine) runBand(band int) {
 //  2. Apply WriteContract to each record.
 //  3. BulkWrite to the sink.
 //  4. Partition results:
-//     - Success            → CommitFlushed: ZREM from dirty set + post-flush TTL
-//     (ActivityWindow if hot, else KeyTTL; unflushed payloads have none).
-//     - Permanent failure  → DeadLetterIfUnchanged (duplicate key, code 11000).
-//     Both are conditional on the drained write sequence: a key rewritten
-//     mid-flush stays dirty so its newer payload is flushed next cycle.
+//     - Success            → CommitFlushed: ZREM from dirty set + post-flush TTL.
+//     - Permanent failure  → DeadLetterIfUnchanged (IsPermanent() == true).
 //     - Transient failure  → no action; keys remain in dirty set for retry.
 //     - Total failure      → no action; all keys remain in dirty set for retry.
-// This ensures a BulkWrite failure — including a unique-ID collision during
-// DrainAndClose — never causes silent record loss.
-
-// UPDATED: Now enforces CheckAttribution to prevent success-by-elimination silent loss,
-// and uses SinkError.IsPermanent() for accurate dead-letter routing.
-
-// ... [Keep imports, Config, MetricsRecorder, Contracts, Engine struct, New, Start, SignalVolume, DrainAndStop, startPreEvictionFlusher, runBand exactly as they are] ...
 func (e *Engine) flushBand(ctx context.Context, band int) error {
 	start := time.Now()
 	bandStr := fmt.Sprintf("%d", band)
@@ -232,7 +222,6 @@ func (e *Engine) flushBand(ctx context.Context, band int) error {
 		e.metrics.RecordDirtyQueueDepth(e.cfg.Namespace, bandStr, int(depth))
 	}
 
-	// Phase 1: read without removing.
 	records, err := e.shield.DrainBand(ctx, band, e.cfg.MaxBatchSize)
 	if err != nil {
 		e.metrics.RecordFlush(e.cfg.Namespace, bandStr, 0, time.Since(start), err)
@@ -244,6 +233,7 @@ func (e *Engine) flushBand(ctx context.Context, band int) error {
 
 	seqs := make(map[string]string, len(records))
 	var missing []shield.VersionedKey
+
 	models := make([]sink.WriteModel, 0, len(records))
 	corrKeys := make([]string, 0, len(records))
 
@@ -263,7 +253,8 @@ func (e *Engine) flushBand(ctx context.Context, band int) error {
 					[]string{rec.CorrelationKey},
 					&sink.BulkWriteResult{
 						Errors: []sink.SinkError{
-							{CorrelationKey: rec.CorrelationKey, Err: fmt.Errorf("%w: %v", sink.ErrContractViolation, contractErr)},
+							{CorrelationKey: rec.CorrelationKey,
+								Err: fmt.Errorf("%w: %v", sink.ErrContractViolation, contractErr)},
 						},
 					},
 					contractErr,
@@ -291,8 +282,6 @@ func (e *Engine) flushBand(ctx context.Context, band int) error {
 	e.metrics.RecordFlush(e.cfg.Namespace, bandStr, len(models), duration, flushErr)
 
 	if flushErr != nil {
-		// Total failure — network, timeout, write concern, or unrecognised error.
-		// Do not commit any keys. All keys remain in the dirty set and will be retried.
 		if e.callback != nil {
 			e.callback(corrKeys, result, flushErr)
 		}
@@ -300,16 +289,19 @@ func (e *Engine) flushBand(ctx context.Context, band int) error {
 	}
 
 	// NEW: Attribution Guard. Prevents success-by-elimination silent loss.
-	// If the sink returns partial errors but fails to attribute them to a key, we abort the commit.
+	// If the sink returns partial errors but fails to attribute them to a key
+	// in the batch, we abort the commit entirely. All keys stay dirty.
 	if err := sink.CheckAttribution(models, result); err != nil {
-		slog.Error("sluice: flush aborted due to unattributed sink error", "err", err, "namespace", e.cfg.Namespace, "band", band)
+		slog.Error("sluice: flush aborted due to unattributed sink error",
+			"err", err, "namespace", e.cfg.Namespace, "band", band)
 		if e.callback != nil {
 			e.callback(corrKeys, result, err)
 		}
-		return err // Return error to keep all keys in the dirty set for retry
+		return err
 	}
 
-	// Partition results using the new IsPermanent() method.
+	// CHANGED: Partition results using IsPermanent() instead of Code == 11000.
+	// This works across all sinks (DocDB, DynamoDB, Postgres) uniformly.
 	permanentKeys := make([]string, 0)
 	transientKeys := make(map[string]bool)
 	if result != nil {
@@ -344,6 +336,8 @@ func (e *Engine) flushBand(ctx context.Context, band int) error {
 		for i, k := range permanentKeys {
 			items[i] = shield.VersionedKey{CorrelationKey: k, Seq: seqs[k]}
 		}
+		// CHANGED: Reason is now "permanent_sink_error" instead of "duplicate_key",
+		// since IsPermanent() covers more than just 11000.
 		e.deadLetter(ctx, band, bandStr, items, "permanent_sink_error")
 	}
 

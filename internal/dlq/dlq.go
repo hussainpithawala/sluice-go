@@ -198,6 +198,15 @@ func (p *Processor) handleUpsert(ctx context.Context, band int, records []shield
 		return fmt.Errorf("dlq: bulk write band %d: %w", band, err)
 	}
 
+	// NEW: Attribution Guard. Prevents success-by-elimination silent loss.
+	// If the sink returns partial errors but fails to attribute them to a key
+	// in the batch, we abort the commit. All keys stay in the DLQ for retry.
+	if err := sink.CheckAttribution(models, result); err != nil {
+		p.cfg.Logger.Error("dlq: upsert aborted due to unattributed sink error",
+			"err", err, "band", band)
+		return fmt.Errorf("dlq: attribution check failed band %d: %w", band, err)
+	}
+
 	// Partition results: identify failed keys.
 	failedKeys := make(map[string]bool)
 	if result != nil {
@@ -206,24 +215,22 @@ func (p *Processor) handleUpsert(ctx context.Context, band int, records []shield
 			p.cfg.Logger.Warn("dlq: upsert failed for key",
 				"correlation_key", se.CorrelationKey,
 				"code", se.Code,
+				"class", se.Class,
 				"error", se.Err,
 			)
 		}
 	}
-
 	successKeys := make([]string, 0, len(corrKeys))
 	for _, k := range corrKeys {
 		if !failedKeys[k] {
 			successKeys = append(successKeys, k)
 		}
 	}
-
 	if len(successKeys) > 0 {
 		if commitErr := p.shield.CommitDLQKeys(ctx, band, successKeys); commitErr != nil {
 			return fmt.Errorf("dlq: commit upsert band %d: %w", band, commitErr)
 		}
 	}
-
 	total.Processed += len(corrKeys)
 	total.Succeeded += len(successKeys)
 	total.Failed += len(failedKeys)
