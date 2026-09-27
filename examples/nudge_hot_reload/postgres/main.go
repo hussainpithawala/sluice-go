@@ -327,26 +327,28 @@ func run(log *slog.Logger) (err error) {
 	defer stop()
 
 	postgresURI := getEnv("POSTGRES_URI", "postgres://sluice:sluice@localhost:5432/sluice_test?sslmode=disable")
+	pool, err := pgxpool.New(ctx, postgresURI)
 	tableName := "nudge_inventory_hot_cold"
 
 	// ── Initialize PostgreSQL Sink ───────────────────────────────────────
 	sk, err := pgsink.New(ctx, pgsink.Config{
-		ConnString: postgresURI,
-		TableName:  tableName,
-		MaxConns:   20,
-		MinConns:   5,
+		ConnString:      postgresURI,
+		TableName:       tableName,
+		ConflictColumns: []string{"id"}, // Required: specifies the ON CONFLICT target
+		OnConflict:      pgsink.OnConflictDoUpdate,
 	})
+
 	if err != nil {
 		return fmt.Errorf("connect postgres: %w", err)
 	}
 
 	// ── Ensure Table Exists (operator's responsibility in production) ────
-	if err := ensureTableExists(ctx, sk.Pool(), tableName, log); err != nil {
+	if err := ensureTableExists(ctx, pool, tableName, log); err != nil {
 		return fmt.Errorf("ensure table exists: %w", err)
 	}
 
 	// ── Initialize PostgreSQL Source (shares connection pool) ────────────
-	src := pgsource.NewSourceWithPool(sk.Pool())
+	src := pgsource.NewSourceWithPool(pool)
 
 	// ── Redis config ─────────────────────────────────────────────────────
 	redisAddrsRaw := getEnv("REDIS_ADDRS", "localhost:6379")

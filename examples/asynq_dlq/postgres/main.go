@@ -105,7 +105,6 @@ func nudgeWriteContract(correlationKey string, rawPayload []byte) (*sluice.Write
 		"expires_at":      p.ExpiresAt,
 		"last_updated":    p.LastUpdated,
 	}
-
 	return &sluice.WriteModel{
 		Filter: "id", // ON CONFLICT (id)
 		Update: item,
@@ -128,7 +127,6 @@ func (h *DLQTaskHandler) ProcessTask(ctx context.Context, t *asynq.Task) error {
 	if err := json.Unmarshal(t.Payload(), &payload); err != nil {
 		return fmt.Errorf("parse task payload: %w", err)
 	}
-
 	h.log.Info("asynq: executing scheduled DLQ processing task",
 		"namespace", payload.Namespace,
 		"strategy", payload.Strategy,
@@ -156,7 +154,6 @@ func (h *DLQTaskHandler) ProcessTask(ctx context.Context, t *asynq.Task) error {
 		h.log.Error("asynq: ProcessDLQ execution failed", "err", err)
 		return err
 	}
-
 	h.log.Info("asynq: DLQ recovery completed successfully",
 		"processed", res.Processed,
 		"succeeded", res.Succeeded,
@@ -235,17 +232,24 @@ func run(log *slog.Logger) error {
 
 	// 1. Initialize PostgreSQL Sink
 	sk, err := pgsink.New(ctx, pgsink.Config{
-		ConnString: postgresURI,
-		TableName:  tableName,
-		MaxConns:   20,
-		MinConns:   5,
+		ConnString:      postgresURI,
+		TableName:       tableName,
+		ConflictColumns: []string{"id"}, // Required: specifies the ON CONFLICT target
+		OnConflict:      pgsink.OnConflictDoUpdate,
 	})
 	if err != nil {
 		return fmt.Errorf("postgres connection failure: %w", err)
 	}
 
+	// Create a separate pool for table setup (operator's responsibility in production)
+	setupPool, err := pgxpool.New(ctx, postgresURI)
+	if err != nil {
+		return fmt.Errorf("setup pool connection failure: %w", err)
+	}
+	defer setupPool.Close()
+
 	// Ensure table exists for local testing (Operator's responsibility in production)
-	if err := ensureTableExists(ctx, sk.Pool(), tableName, log); err != nil {
+	if err := ensureTableExists(ctx, setupPool, tableName, log); err != nil {
 		return fmt.Errorf("ensure table exists: %w", err)
 	}
 
@@ -294,7 +298,6 @@ func run(log *slog.Logger) error {
 		// Checking the return value of Close() satisfies the 'errcheck' linter rule.
 		_ = asynqClient.Close()
 	}()
-
 	mux := asynq.NewServeMux()
 	mux.Handle(TaskSluiceProcessDLQ, NewDLQTaskHandler(sl, log))
 
@@ -354,8 +357,8 @@ func run(log *slog.Logger) error {
 
 	// Activate payload healing logic in the contract
 	healBadRecords.Store(true)
-	log.Info("asynq: Healing flag activated! Enqueuing task for immediate execution...")
 
+	log.Info("asynq: Healing flag activated! Enqueuing task for immediate execution...")
 	// Enqueue the task immediately to bypass the 2-minute cron wait during functional verification
 	info, err := asynqClient.Enqueue(task)
 	if err != nil {
@@ -381,6 +384,7 @@ func run(log *slog.Logger) error {
 	shutCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	_ = sl.DrainAndClose(shutCtx)
+
 	log.Info("validation script finished cleanly")
 	return nil
 }

@@ -3,7 +3,9 @@ package docdb
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/hussainpithawala/sluice-go/sink"
@@ -75,9 +77,7 @@ func New(ctx context.Context, cfg Config) (*Sink, error) {
 
 // BulkWrite executes all models as a single ordered=false BulkWrite call.
 // Partial success is handled: failed records are returned in BulkWriteResult.Errors
-// with their Code field populated from the MongoDB write error code. Callers
-// use Code == 11000 to distinguish permanent failures (unique-index violation)
-// from transient ones.
+// with their Class field populated to drive retry vs. dead-letter decisions.
 func (s *Sink) BulkWrite(ctx context.Context, models []sink.WriteModel) (*sink.BulkWriteResult, error) {
 	if len(models) == 0 {
 		return &sink.BulkWriteResult{}, nil
@@ -95,23 +95,32 @@ func (s *Sink) BulkWrite(ctx context.Context, models []sink.WriteModel) (*sink.B
 
 	res, err := s.collection.BulkWrite(ctx, mongoModels, options.BulkWrite().SetOrdered(false))
 	if err != nil {
-		if bwe, ok := err.(mongo.BulkWriteException); ok {
+		var bwe mongo.BulkWriteException
+		if errors.As(err, &bwe) {
+			// 1. WriteConcernError is a total batch failure (transient).
+			// The primary accepted it, but replication failed. Do not return partial results.
+			if bwe.WriteConcernError != nil {
+				return nil, fmt.Errorf("sluice/documentdb: write concern error (total failure): %w", err)
+			}
+
+			// 2. Process individual WriteErrors with strict attribution and classification.
 			errs := make([]sink.SinkError, 0, len(bwe.WriteErrors))
 			for _, we := range bwe.WriteErrors {
 				key := ""
+				isUpsert := false
 				if we.Index >= 0 && we.Index < len(models) {
 					key = models[we.Index].CorrelationKey
+					isUpsert = models[we.Index].Upsert
 				}
+
 				errs = append(errs, sink.SinkError{
 					CorrelationKey: key,
-					// Code is populated directly from the MongoDB write error code.
-					// Code 11000 = duplicate key error (unique index violation).
-					// The engine uses this to route permanent failures to dead-letter
-					// instead of retrying them indefinitely.
-					Code: we.Code,
-					Err:  fmt.Errorf("code %d: %s", we.Code, we.Message),
+					Code:           we.Code,
+					Class:          classifyBulkErr(we, isUpsert),
+					Err:            fmt.Errorf("code %d: %s", we.Code, we.Message),
 				})
 			}
+
 			result := &sink.BulkWriteResult{Errors: errs}
 			if res != nil {
 				result.InsertedCount = res.InsertedCount
@@ -119,10 +128,12 @@ func (s *Sink) BulkWrite(ctx context.Context, models []sink.WriteModel) (*sink.B
 				result.ModifiedCount = res.ModifiedCount
 				result.UpsertedCount = res.UpsertedCount
 			}
-			// Return partial result without wrapping as a fatal error.
-			// The engine partitions errors by Code to decide the next action.
+			// Return partial result without a top-level error.
+			// The engine will use CheckAttribution and IsPermanent() to decide the next action.
 			return result, nil
 		}
+
+		// 3. Other errors (network, context cancel, etc.) are total transient failures.
 		return nil, fmt.Errorf("sluice/documentdb: bulkwrite: %w", err)
 	}
 
@@ -132,6 +143,20 @@ func (s *Sink) BulkWrite(ctx context.Context, models []sink.WriteModel) (*sink.B
 		ModifiedCount: res.ModifiedCount,
 		UpsertedCount: res.UpsertedCount,
 	}, nil
+}
+
+// classifyBulkErr determines the ErrorClass for a MongoDB write error.
+func classifyBulkErr(we mongo.BulkWriteError, isUpsert bool) sink.ErrorClass {
+	if we.Code == 11000 {
+		// 11000 on `_id_` for an upsert is transient (concurrent race with another pod).
+		// Any other 11000 (e.g., unique index on a business field) is permanent.
+		if isUpsert && strings.Contains(we.Message, "_id_") {
+			return sink.ClassTransient
+		}
+		return sink.ClassPermanent
+	}
+	// All other write errors (e.g., validation, schema mismatch) are treated as permanent.
+	return sink.ClassPermanent
 }
 
 // Write performs a single-document upsert. Used in degraded mode only.

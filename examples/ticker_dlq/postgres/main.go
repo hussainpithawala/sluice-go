@@ -151,20 +151,23 @@ func run(log *slog.Logger) error {
 
 	postgresURI := getEnv("POSTGRES_URI", "postgres://sluice:sluice@localhost:5432/sluice_test?sslmode=disable")
 	tableName := "nudge_inventory_dlq"
-
+	pool, err := pgxpool.New(ctx, postgresURI)
+	if err != nil {
+		return fmt.Errorf("error while creating pgxpool: %w", err)
+	}
 	// 1. Initialize PostgreSQL Sink
 	sk, err := pgsink.New(ctx, pgsink.Config{
-		ConnString: postgresURI,
-		TableName:  tableName,
-		MaxConns:   20,
-		MinConns:   5,
+		ConnString:      postgresURI,
+		TableName:       tableName,
+		ConflictColumns: []string{"id"}, // Required: specifies the ON CONFLICT target
+		OnConflict:      pgsink.OnConflictDoUpdate,
 	})
 	if err != nil {
 		return fmt.Errorf("postgres connection failure: %w", err)
 	}
 
 	// Ensure table exists for local testing (Operator's responsibility in production)
-	if err := ensureTableExists(ctx, sk.Pool(), tableName, log); err != nil {
+	if err := ensureTableExists(ctx, pool, tableName, log); err != nil {
 		return fmt.Errorf("ensure table exists: %w", err)
 	}
 

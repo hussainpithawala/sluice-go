@@ -83,9 +83,11 @@ func (r *countingRecorder) RecordDegradedWrite(string, error)         {}
 func (r *countingRecorder) RecordWarmUp(string, time.Duration, error) {}
 func (r *countingRecorder) RecordHotSetSize(string, int)              {}
 func (r *countingRecorder) RecordRedisOp(_ string, op string, _ time.Duration, _ error) {
+	r.mu.Lock()
 	if r.redisOpHook != nil {
 		r.redisOpHook(op)
 	}
+	r.mu.Unlock()
 }
 func (r *countingRecorder) RecordFlush(string, string, int, time.Duration, error) {}
 func (r *countingRecorder) RecordDirtyQueueDepth(string, string, int)             {}

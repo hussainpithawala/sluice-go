@@ -36,6 +36,7 @@ import (
 	"github.com/hussainpithawala/sluice-go/source"
 	pgsource "github.com/hussainpithawala/sluice-go/source/postgres"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 var (
@@ -291,9 +292,17 @@ func run(log *slog.Logger) (err error) {
 	defer stop()
 
 	postgresURI := getEnv("POSTGRES_URI", "postgres://sluice:sluice@localhost:5432/sluice_test?sslmode=disable")
+	pool, err := pgxpool.New(ctx, postgresURI)
+	tableName := "nudge_inventory"
 
 	// ── Initialize PostgreSQL Sink ───────────────────────────────────────
-	sk, err := pgsink.New(ctx, pgsink.DefaultConfig(postgresURI, "nudge_inventory"))
+	sk, err := pgsink.New(ctx, pgsink.Config{
+		ConnString:      postgresURI,
+		TableName:       tableName,
+		ConflictColumns: []string{"id"}, // Required: specifies the ON CONFLICT target
+		OnConflict:      pgsink.OnConflictDoUpdate,
+	})
+
 	if err != nil {
 		return fmt.Errorf("connect postgres: %w", err)
 	}
@@ -301,7 +310,7 @@ func run(log *slog.Logger) (err error) {
 	// ── Ensure Table Exists (operator's responsibility in production) ────
 	// For this example, we create the table inline. In production, use
 	// goose, golang-migrate, or Flyway.
-	_, err = sk.Pool().Exec(ctx, `
+	_, err = pool.Exec(ctx, `
 		CREATE TABLE IF NOT EXISTS nudge_inventory (
 			id TEXT PRIMARY KEY,
 			nudge_master_id TEXT NOT NULL,
@@ -318,7 +327,7 @@ func run(log *slog.Logger) (err error) {
 	log.Info("ensured nudge_inventory table exists")
 
 	// ── Initialize PostgreSQL Source (shares connection pool) ────────────
-	src := pgsource.NewSourceWithPool(sk.Pool())
+	src := pgsource.NewSourceWithPool(pool)
 
 	// ── Redis config ─────────────────────────────────────────────────────
 	redisAddrsRaw := getEnv("REDIS_ADDRS", "localhost:6379")

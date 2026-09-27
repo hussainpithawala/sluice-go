@@ -7,7 +7,7 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
@@ -21,13 +21,11 @@ func setupDynamoDBSink(t *testing.T) (*Sink, func()) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	// Connect to DynamoDB Local (default port 8000)
-	cfg, err := config.LoadDefaultConfig(ctx,
-		config.WithRegion("us-east-1"),
-	)
-	require.NoError(t, err)
-
-	// Use BaseEndpoint on the service client options instead of the deprecated global resolver
+	// Configure for DynamoDB Local
+	cfg := aws.Config{
+		Region:      "us-east-1",
+		Credentials: credentials.NewStaticCredentialsProvider("test", "test", "test"),
+	}
 	client := dynamodb.NewFromConfig(cfg, func(o *dynamodb.Options) {
 		o.BaseEndpoint = aws.String("http://localhost:8000")
 	})
@@ -35,7 +33,7 @@ func setupDynamoDBSink(t *testing.T) (*Sink, func()) {
 	tableName := "test_sluice_sink_" + t.Name()
 
 	// Create table
-	_, err = client.CreateTable(ctx, &dynamodb.CreateTableInput{
+	_, err := client.CreateTable(ctx, &dynamodb.CreateTableInput{
 		TableName: aws.String(tableName),
 		KeySchema: []types.KeySchemaElement{
 			{AttributeName: aws.String("PK"), KeyType: types.KeyTypeHash},
@@ -53,12 +51,18 @@ func setupDynamoDBSink(t *testing.T) (*Sink, func()) {
 		return res != nil && res.Table.TableStatus == types.TableStatusActive
 	}, 10*time.Second, 500*time.Millisecond)
 
-	s := NewSink(client, tableName)
+	// Use the NEW API signature
+	s, err := New(ctx, Config{
+		Endpoint:    "http://localhost:8000",
+		Region:      "us-east-1",
+		TableName:   tableName,
+		PKAttribute: "PK",
+	})
+	require.NoError(t, err)
 
 	cleanup := func() {
 		_, _ = client.DeleteTable(context.Background(), &dynamodb.DeleteTableInput{TableName: aws.String(tableName)})
 	}
-
 	return s, cleanup
 }
 
@@ -107,8 +111,8 @@ func TestDynamoDBSink_Write_DegradedMode(t *testing.T) {
 	err := s.Write(context.Background(), model)
 	require.NoError(t, err)
 
-	// Verify via direct GetItem
-	out, err := s.client.GetItem(context.Background(), &dynamodb.GetItemInput{
+	// Verify via direct GetItem using the exposed Client() method
+	out, err := s.Client().GetItem(context.Background(), &dynamodb.GetItemInput{
 		TableName: aws.String(s.tableName),
 		Key: map[string]types.AttributeValue{
 			"PK": &types.AttributeValueMemberS{Value: "degraded_key"},

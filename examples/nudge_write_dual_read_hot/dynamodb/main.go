@@ -316,7 +316,7 @@ func run(log *slog.Logger) (err error) {
 
 	// ── Initialize DynamoDB Client ───────────────────────────────────────
 	var cfg aws.Config
-	endpoint := os.Getenv("DYNAMODB_ENDPOINT")
+	endpoint := getEnv("DYNAMODB_ENDPOINT", "http://localhost:8000")
 
 	// Custom HTTP client with a longer timeout for DynamoDB Local stability
 	httpClient := &http.Client{Timeout: 30 * time.Second}
@@ -350,7 +350,14 @@ func run(log *slog.Logger) (err error) {
 	}
 
 	// ── Sink (write path) & Source (read path) ───────────────────────────
-	sk := dynsink.NewSink(client, tableName)
+	// 2. Initialize Sluice Sink
+	sk, err := dynsink.New(ctx, dynsink.Config{
+		Endpoint:    endpoint,
+		Region:      "us-east-1",
+		TableName:   tableName,
+		PKAttribute: "PK",
+	})
+
 	src := dynsource.NewSource(client, tableName)
 
 	// ── Redis config ─────────────────────────────────────────────────────

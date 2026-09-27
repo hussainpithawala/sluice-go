@@ -147,16 +147,26 @@ func run(log *slog.Logger) error {
 	defer stop()
 
 	postgresURI := getEnv("POSTGRES_URI", "postgres://sluice:sluice@localhost:5432/sluice_test?sslmode=disable")
+	pool, err := pgxpool.New(ctx, postgresURI)
+	if err != nil {
+		return fmt.Errorf("error while creating pgxpool: %w", err)
+	}
 
-	sk, err := pgsink.New(ctx, pgsink.Config{ConnString: postgresURI, TableName: tableName, MaxConns: 20, MinConns: 5})
+	sk, err := pgsink.New(ctx, pgsink.Config{
+		ConnString:      postgresURI,
+		TableName:       tableName,
+		ConflictColumns: []string{"id"}, // Required: specifies the ON CONFLICT target
+		OnConflict:      pgsink.OnConflictDoUpdate,
+	})
+
 	if err != nil {
 		return fmt.Errorf("connect PostgreSQL: %w", err)
 	}
-	if err := ensureTableExists(ctx, sk.Pool(), tableName, log); err != nil {
+	if err := ensureTableExists(ctx, pool, tableName, log); err != nil {
 		return fmt.Errorf("ensure table: %w", err)
 	}
 
-	src := pgsource.NewSourceWithPool(sk.Pool())
+	src := pgsource.NewSourceWithPool(pool)
 	redisAddrs := splitAddrs(getEnv("REDIS_ADDRS", "localhost:7001,localhost:7002,localhost:7003,localhost:7004"))
 	clusterMode, _ := strconv.ParseBool(getEnv("REDIS_CLUSTER_MODE", "true"))
 

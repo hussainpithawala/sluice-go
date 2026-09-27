@@ -80,7 +80,13 @@ func main() {
 
 	collectionName := "nudge_inventory"
 	// 2. Initialize Sluice
-	sk, err := pgsink.New(ctx, pgsink.DefaultConfig(postgresURI, collectionName))
+	sk, err := pgsink.New(ctx, pgsink.Config{
+		ConnString:      postgresURI,
+		TableName:       tableName,
+		ConflictColumns: []string{"id"}, // Required: specifies the ON CONFLICT target
+		OnConflict:      pgsink.OnConflictDoUpdate,
+	})
+
 	if err != nil {
 		slog.Error(fmt.Sprintf("Error while preparing the sink %s", collectionName))
 		return
