@@ -203,7 +203,10 @@ func (s *Sink) BulkWrite(ctx context.Context, models []sink.WriteModel) (*sink.B
 	}
 
 	// 3. Handle UnprocessedItems
+	// 3. Handle UnprocessedItems
+	successCount := int64(len(requestItems))
 	if len(out.UnprocessedItems[s.tableName]) > 0 {
+		successCount -= int64(len(out.UnprocessedItems[s.tableName]))
 		for _, wr := range out.UnprocessedItems[s.tableName] {
 			corrKey := findCorrelationKey(validModels, wr.PutRequest.Item, s.pkAttr, s.skAttr)
 			if corrKey == "" {
@@ -219,13 +222,18 @@ func (s *Sink) BulkWrite(ctx context.Context, models []sink.WriteModel) (*sink.B
 		}
 	}
 
-	return &sink.BulkWriteResult{Errors: preErrors}, nil
+	return &sink.BulkWriteResult{
+		UpsertedCount: successCount, // Track successful submissions
+		Errors:        preErrors,
+	}, nil
 }
 
+// fallbackPutItems executes per-item PutItem calls when BatchWriteItem fails with ValidationException.
 // fallbackPutItems executes per-item PutItem calls when BatchWriteItem fails with ValidationException.
 func (s *Sink) fallbackPutItems(ctx context.Context, models []sink.WriteModel, existingErrors []sink.SinkError) (*sink.BulkWriteResult, error) {
 	var errs []sink.SinkError
 	errs = append(errs, existingErrors...)
+	var successCount int64
 
 	for _, m := range models {
 		item, _ := m.Update.(map[string]any)
@@ -242,9 +250,14 @@ func (s *Sink) fallbackPutItems(ctx context.Context, models []sink.WriteModel, e
 			} else {
 				errs = append(errs, sink.SinkError{CorrelationKey: m.CorrelationKey, Class: sink.ClassPermanent, Err: err})
 			}
+		} else {
+			successCount++ // Track successful individual puts
 		}
 	}
-	return &sink.BulkWriteResult{Errors: errs}, nil
+	return &sink.BulkWriteResult{
+		UpsertedCount: successCount,
+		Errors:        errs,
+	}, nil
 }
 
 // Write performs a single-document put. Used in degraded mode only.
