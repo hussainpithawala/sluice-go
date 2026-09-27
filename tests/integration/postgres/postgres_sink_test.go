@@ -1,4 +1,4 @@
-package postgres
+package postgres_test
 
 import (
 	"context"
@@ -54,11 +54,13 @@ func TestPostgresBulkWrite_SilentLossPrevention(t *testing.T) {
 	`)
 	require.NoError(t, err)
 
+	tableName := "test_table"
+
 	// 3. Initialize the sink
 	s, err := sinkpostgres.New(ctx, sinkpostgres.Config{
 		ConnString:      connString,
-		TableName:       "test_table",
-		ConflictColumns: []string{"user_id"},
+		TableName:       tableName,
+		ConflictColumns: []string{"user_id"}, // Fixed: match the actual primary key
 		OnConflict:      sinkpostgres.OnConflictDoUpdate,
 	})
 	require.NoError(t, err)
@@ -83,7 +85,6 @@ func TestPostgresBulkWrite_SilentLossPrevention(t *testing.T) {
 		res, err := s.BulkWrite(ctx, models)
 		require.NoError(t, err) // No top-level error
 		require.Len(t, res.Errors, 1)
-
 		assert.Equal(t, "user2", res.Errors[0].CorrelationKey)
 		assert.Equal(t, sink.ClassPermanent, res.Errors[0].Class)
 
@@ -109,7 +110,6 @@ func TestPostgresBulkWrite_SilentLossPrevention(t *testing.T) {
 		res, err := s.BulkWrite(ctx, models)
 		require.NoError(t, err)
 		require.Len(t, res.Errors, 1)
-
 		assert.Equal(t, "user5", res.Errors[0].CorrelationKey)
 		assert.Equal(t, sink.ClassPermanent, res.Errors[0].Class)
 
@@ -144,7 +144,6 @@ func TestPostgresBulkWrite_SilentLossPrevention(t *testing.T) {
 		res, err := s.BulkWrite(ctx, models)
 		require.NoError(t, err)
 		require.Len(t, res.Errors, 1)
-
 		assert.Equal(t, "user7", res.Errors[0].CorrelationKey)
 		assert.Equal(t, sink.ClassPermanent, res.Errors[0].Class)
 

@@ -197,23 +197,24 @@ const tableName = "nudge_inventory_pushpull"
 
 // buildPod constructs a full Sluice instance backed by PostgreSQL.
 func buildPod(ctx context.Context, tag string, postgresURI string, redisAddrs []string, clusterMode bool, log *slog.Logger) (*sluice.Sluice, func(context.Context) error, error) {
+	pool, err := pgxpool.New(ctx, postgresURI)
 	sk, err := pgsink.New(ctx, pgsink.Config{
-		ConnString: postgresURI,
-		TableName:  tableName,
-		MaxConns:   20,
-		MinConns:   5,
+		ConnString:      postgresURI,
+		TableName:       tableName,
+		ConflictColumns: []string{"id"}, // Required: specifies the ON CONFLICT target
+		OnConflict:      pgsink.OnConflictDoUpdate,
 	})
 	if err != nil {
 		return nil, nil, fmt.Errorf("connect to PostgreSQL at %s: %w", postgresURI, err)
 	}
 
-	if err := ensureTableExists(ctx, sk.Pool(), tableName, log); err != nil {
+	if err := ensureTableExists(ctx, pool, tableName, log); err != nil {
 		_ = sk.Close(context.Background())
 		return nil, nil, fmt.Errorf("ensure table exists: %w", err)
 	}
 
 	// Source shares the exact same pgxpool.Pool to minimize connections
-	src := pgsource.NewSourceWithPool(sk.Pool())
+	src := pgsource.NewSourceWithPool(pool)
 
 	sl, err := sluice.New("nudge_inventory_postgres").
 		WithRedis(sluice.RedisConfig{
