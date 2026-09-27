@@ -480,7 +480,7 @@ writes across node loss. The bundled `docker-compose.yml` runs Redis with `noevi
 `appendfsync everysec`.
 
 The sink-level silent-loss paths found during the event-log review have been closed. The design and
-test plan are in [RFP #18](docs/issues/sink-silent-loss.md).
+test plan are in [RFP #19](docs/issues/sink-silent-loss.md).
 
 ---
 
@@ -738,9 +738,14 @@ make coverage           # HTML coverage report
 
 ## Roadmap
 
-- **Event log** ([RFP #17](docs/issues/event-log.md), proposed): `WriteEvent`, which records *every*
-  event exactly once alongside the coalesced state document. This is for reporting and growth analytics,
-  where each event is a fact. It builds on the sink error classification from RFP #18.
+- **Event ledger and reconciliation** ([RFP #18](docs/issues/event-log.md), proposed): an opt-in
+  record of acknowledged writes, kept outside Redis, plus a `Reconcile` job that finds and repairs
+  keys whose datastore state is behind what was acknowledged (for example, after losing Redis). By
+  default it never affects `Write`'s result.
+- **Strict mode** ([RFP #21](docs/issues/strict-mode.md), proposed): payment-grade namespaces, with
+  durable acknowledgement (`WAIT`/`WAITAOF` or a durable store such as MemoryDB), conditional writes
+  (`WriteIf`) and no silent expiry. It also adds a store-side version guard, available to every
+  namespace, which stops an older flush from overwriting a newer version in the store.
 - Design notes for shipped features: [bulk reader](docs/issues/bulkreader.md),
   [local journal](docs/issues/local-journal.md), [Prometheus](docs/issues/prometheus.md),
   [sink silent-loss fixes](docs/issues/sink-silent-loss.md).
