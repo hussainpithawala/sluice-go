@@ -13,293 +13,326 @@ package postgres
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
-	"strconv"
 	"strings"
-	"time"
 
 	"github.com/hussainpithawala/sluice-go/sink"
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// Config holds connection parameters for the PostgreSQL sink.
-type Config struct {
-	ConnString        string
-	TableName         string
-	MaxConns          int32
-	MinConns          int32
-	MaxConnLifetime   time.Duration
-	MaxConnIdleTime   time.Duration
-	HealthCheckPeriod time.Duration
-	StatementTimeout  time.Duration
-}
+// OnConflictAction defines the behavior when a conflict occurs.
+type OnConflictAction int
 
-// DefaultConfig returns safe defaults tuned for connection multiplexing.
-func DefaultConfig(connString, tableName string) Config {
-	return Config{
-		ConnString:        connString,
-		TableName:         tableName,
-		MaxConns:          20,
-		MinConns:          5,
-		MaxConnLifetime:   30 * time.Minute,
-		MaxConnIdleTime:   5 * time.Minute,
-		HealthCheckPeriod: 30 * time.Second,
-		StatementTimeout:  10 * time.Second,
-	}
+const (
+	OnConflictDoUpdate OnConflictAction = iota
+	OnConflictDoNothing
+)
+
+// Config holds connection and table parameters for PostgreSQL.
+type Config struct {
+	ConnString      string
+	TableName       string
+	ConflictColumns []string         // e.g., []string{"id"} or []string{"user_id", "event_id"}
+	OnConflict      OnConflictAction // Default: OnConflictDoUpdate
+	UpdateColumns   []string         // Columns to update on conflict (if DoUpdate). If empty, updates all non-conflict columns.
 }
 
 // Sink implements sink.FlushSink against PostgreSQL.
 type Sink struct {
-	pool      *pgxpool.Pool
-	tableName string
+	pool            *pgxpool.Pool
+	tableName       string
+	conflictColumns []string
+	onConflict      OnConflictAction
+	updateColumns   []string
 }
 
 // New connects to PostgreSQL and returns a ready FlushSink.
 func New(ctx context.Context, cfg Config) (*Sink, error) {
-	poolConfig, err := pgxpool.ParseConfig(cfg.ConnString)
+	if cfg.TableName == "" {
+		return nil, errors.New("sluice/postgres: table name is required")
+	}
+	if len(cfg.ConflictColumns) == 0 {
+		return nil, errors.New("sluice/postgres: conflict columns are required")
+	}
+
+	pool, err := pgxpool.New(ctx, cfg.ConnString)
 	if err != nil {
-		return nil, fmt.Errorf("postgres: parse config: %w", err)
-	}
-
-	if cfg.MaxConns > 0 {
-		poolConfig.MaxConns = cfg.MaxConns
-	}
-	if cfg.MinConns > 0 {
-		poolConfig.MinConns = cfg.MinConns
-	}
-	if cfg.MaxConnLifetime > 0 {
-		poolConfig.MaxConnLifetime = cfg.MaxConnLifetime
-	}
-	if cfg.MaxConnIdleTime > 0 {
-		poolConfig.MaxConnIdleTime = cfg.MaxConnIdleTime
-	}
-	if cfg.HealthCheckPeriod > 0 {
-		poolConfig.HealthCheckPeriod = cfg.HealthCheckPeriod
-	}
-
-	// Enforce statement timeout to prevent hung queries from exhausting the pool
-	if cfg.StatementTimeout > 0 {
-		poolConfig.ConnConfig.RuntimeParams["statement_timeout"] = fmt.Sprintf("%d", cfg.StatementTimeout.Milliseconds())
-	}
-
-	pool, err := pgxpool.NewWithConfig(ctx, poolConfig)
-	if err != nil {
-		return nil, fmt.Errorf("postgres: connect: %w", err)
+		return nil, fmt.Errorf("sluice/postgres: connect: %w", err)
 	}
 
 	if err := pool.Ping(ctx); err != nil {
 		pool.Close()
-		return nil, fmt.Errorf("postgres: initial ping: %w", err)
+		return nil, fmt.Errorf("sluice/postgres: ping: %w", err)
 	}
 
 	return &Sink{
-		pool:      pool,
-		tableName: cfg.TableName,
+		pool:            pool,
+		tableName:       cfg.TableName,
+		conflictColumns: cfg.ConflictColumns,
+		onConflict:      cfg.OnConflict,
+		updateColumns:   cfg.UpdateColumns,
 	}, nil
 }
 
-// BulkWrite executes a multi-row INSERT ... ON CONFLICT DO UPDATE.
-//
-// WriteModel.Update must be map[string]any representing the full row.
-// WriteModel.Filter must be a string representing the conflict target
-// (e.g., "id" or "tenant_id, user_id"). Defaults to "id" if empty.
-//
-// This flattens write rates and eliminates per-row BEGIN/COMMIT overhead.
+// BulkWrite executes all models as a single INSERT ... ON CONFLICT statement.
+// It handles partial success, column mismatches, and duplicate conflict keys.
 func (s *Sink) BulkWrite(ctx context.Context, models []sink.WriteModel) (*sink.BulkWriteResult, error) {
 	if len(models) == 0 {
 		return &sink.BulkWriteResult{}, nil
 	}
 
-	// Extract columns from the first model (assuming uniform schema per batch)
-	firstRow, ok := models[0].Update.(map[string]any)
-	if !ok {
-		return nil, fmt.Errorf("postgres sink requires model.Update to be map[string]any")
-	}
+	var preErrors []sink.SinkError
+	var validModels []sink.WriteModel
+	var expectedCols []string
+	seenConflictKeys := make(map[string]bool)
 
-	cols := sortedKeys(firstRow)
-	conflictTarget := resolveConflictTarget(models[0].Filter)
-
-	// Build: INSERT INTO table (col1, col2) VALUES ($1, $2), ($3, $4)
-	//        ON CONFLICT (target) DO UPDATE SET col1=EXCLUDED.col1, col2=EXCLUDED.col2
-	var query strings.Builder
-	query.WriteString("INSERT INTO ")
-	query.WriteString(s.tableName)
-	query.WriteString(" (")
-	query.WriteString(strings.Join(cols, ", "))
-	query.WriteString(") VALUES ")
-
-	args := make([]any, 0, len(models)*len(cols))
-	placeholderIdx := 1
-
-	for i, model := range models {
-		row, ok := model.Update.(map[string]any)
+	for _, m := range models {
+		// RFP Fix: Catch type assertion failures per-item.
+		item, ok := m.Update.(map[string]any)
 		if !ok {
-			return nil, fmt.Errorf("postgres sink requires all model.Update to be map[string]any")
+			preErrors = append(preErrors, sink.SinkError{
+				CorrelationKey: m.CorrelationKey,
+				Class:          sink.ClassPermanent,
+				Err:            errors.New("Update field must be map[string]any"),
+			})
+			continue
 		}
 
-		query.WriteString("(")
-		for j, col := range cols {
-			query.WriteString(fmt.Sprintf("$%d", placeholderIdx))
-			args = append(args, row[col])
-			placeholderIdx++
-			if j < len(cols)-1 {
-				query.WriteString(", ")
-			}
+		cols := sortedColumnsFromMap(item)
+		if expectedCols == nil {
+			expectedCols = cols
+		} else if !sameColumns(expectedCols, cols) {
+			// RFP Fix: Column mismatch gets a permanent per-row error instead of NULL-overwriting fields.
+			preErrors = append(preErrors, sink.SinkError{
+				CorrelationKey: m.CorrelationKey,
+				Class:          sink.ClassPermanent,
+				Err:            errors.New("column mismatch in batch"),
+			})
+			continue
 		}
-		query.WriteString(")")
-		if i < len(models)-1 {
-			query.WriteString(", ")
+
+		conflictKey := buildConflictKeyFromMap(item, s.conflictColumns)
+		if seenConflictKeys[conflictKey] {
+			// RFP Fix: Duplicate conflict keys become permanent per-row errors (avoids 21000).
+			preErrors = append(preErrors, sink.SinkError{
+				CorrelationKey: m.CorrelationKey,
+				Class:          sink.ClassPermanent,
+				Err:            errors.New("duplicate conflict key in batch"),
+			})
+			continue
 		}
+		seenConflictKeys[conflictKey] = true
+		validModels = append(validModels, m)
 	}
 
-	query.WriteString(" ON CONFLICT (")
-	query.WriteString(conflictTarget)
-	query.WriteString(") DO UPDATE SET ")
-	for i, col := range cols {
-		query.WriteString(col)
-		query.WriteString("=EXCLUDED.")
-		query.WriteString(col)
-		if i < len(cols)-1 {
-			query.WriteString(", ")
-		}
+	if len(validModels) == 0 {
+		return &sink.BulkWriteResult{Errors: preErrors}, nil
 	}
 
-	tag, err := s.pool.Exec(ctx, query.String(), args...)
-	if err != nil {
-		// Check for permanent constraint violations (e.g., unique index, check constraint)
-		// These should be routed to DLQ, not retried.
-		var pgErr *pgconn.PgError
-		if isPermanentError(err, &pgErr) {
-			errs := make([]sink.SinkError, len(models))
-			for i, m := range models {
-				code, err := strconv.Atoi(pgErr.Code)
-				if err != nil {
-					return nil, fmt.Errorf("unable to convert pg-error code %s", pgErr.Code)
-				}
-				errs[i] = sink.SinkError{
-					CorrelationKey: m.CorrelationKey,
-					Code:           code,
-					Err:            fmt.Errorf("postgres permanent error %s: %s", pgErr.Code, pgErr.Message),
-				}
-			}
-			return &sink.BulkWriteResult{Errors: errs}, nil
-		}
-		return nil, fmt.Errorf("postgres: bulk write: %w", err)
+	// Execute bulk insert
+	err := s.executeBulk(ctx, validModels, expectedCols)
+	if err == nil {
+		return &sink.BulkWriteResult{Errors: preErrors}, nil
 	}
 
-	return &sink.BulkWriteResult{
-		InsertedCount: tag.RowsAffected(),
-		MatchedCount:  tag.RowsAffected(),
-		ModifiedCount: tag.RowsAffected(),
-		UpsertedCount: tag.RowsAffected(),
-	}, nil
+	// Handle errors
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		// RFP Fix: SQLSTATE classes 23xxx, 42P01, 42703 and 21000 are ClassPermanent.
+		if isPermanentSQLState(pgErr.Code) {
+			// RFP Fix: A permanent multi-row error is retried row by row to isolate the bad rows.
+			return s.retryRowByRow(ctx, validModels, expectedCols, preErrors)
+		}
+		// Transient error for all valid models
+		for _, m := range validModels {
+			preErrors = append(preErrors, sink.SinkError{
+				CorrelationKey: m.CorrelationKey,
+				Class:          sink.ClassTransient,
+				Err:            err,
+			})
+		}
+		return &sink.BulkWriteResult{Errors: preErrors}, nil
+	}
+
+	// Unmapped error
+	return nil, fmt.Errorf("sluice/postgres: unmapped bulkwrite error: %w", err)
 }
 
-// Write performs a single-row upsert. Used in degraded mode only.
-func (s *Sink) Write(ctx context.Context, model sink.WriteModel) error {
-	row, ok := model.Update.(map[string]any)
-	if !ok {
-		return fmt.Errorf("postgres sink requires model.Update to be map[string]any")
+// executeBulk builds and executes a single INSERT ... ON CONFLICT statement.
+func (s *Sink) executeBulk(ctx context.Context, models []sink.WriteModel, cols []string) error {
+	if len(models) == 0 {
+		return nil
 	}
 
-	cols := sortedKeys(row)
-	conflictTarget := resolveConflictTarget(model.Filter)
+	var sb strings.Builder
+	sb.WriteString("INSERT INTO ")
+	sb.WriteString(s.tableName)
+	sb.WriteString(" (")
+	sb.WriteString(strings.Join(cols, ", "))
+	sb.WriteString(") VALUES ")
 
-	var query strings.Builder
-	query.WriteString("INSERT INTO ")
-	query.WriteString(s.tableName)
-	query.WriteString(" (")
-	query.WriteString(strings.Join(cols, ", "))
-	query.WriteString(") VALUES (")
+	args := make([]any, 0, len(models)*len(cols))
+	for i, m := range models {
+		if i > 0 {
+			sb.WriteString(", ")
+		}
+		sb.WriteString("(")
+		item := m.Update.(map[string]any)
+		for j, col := range cols {
+			if j > 0 {
+				sb.WriteString(", ")
+			}
+			sb.WriteString(fmt.Sprintf("$%d", len(args)+1))
+			args = append(args, item[col])
+		}
+		sb.WriteString(")")
+	}
 
-	args := make([]any, 0, len(cols))
-	for i, col := range cols {
-		query.WriteString(fmt.Sprintf("$%d", i+1))
-		args = append(args, row[col])
-		if i < len(cols)-1 {
-			query.WriteString(", ")
+	sb.WriteString(" ON CONFLICT (")
+	sb.WriteString(strings.Join(s.conflictColumns, ", "))
+	sb.WriteString(") ")
+
+	if s.onConflict == OnConflictDoNothing {
+		sb.WriteString("DO NOTHING")
+	} else {
+		sb.WriteString("DO UPDATE SET ")
+		updateCols := s.updateColumns
+		if len(updateCols) == 0 {
+			// Default to all non-conflict columns
+			updateCols = make([]string, 0, len(cols))
+			for _, c := range cols {
+				if !contains(s.conflictColumns, c) {
+					updateCols = append(updateCols, c)
+				}
+			}
+		}
+		for i, c := range updateCols {
+			if i > 0 {
+				sb.WriteString(", ")
+			}
+			sb.WriteString(c)
+			sb.WriteString(" = EXCLUDED.")
+			sb.WriteString(c)
 		}
 	}
-	query.WriteString(") ON CONFLICT (")
-	query.WriteString(conflictTarget)
-	query.WriteString(") DO UPDATE SET ")
-	for i, col := range cols {
-		query.WriteString(col)
-		query.WriteString("=EXCLUDED.")
-		query.WriteString(col)
-		if i < len(cols)-1 {
-			query.WriteString(", ")
-		}
-	}
 
-	_, err := s.pool.Exec(ctx, query.String(), args...)
+	_, err := s.pool.Exec(ctx, sb.String(), args...)
 	return err
 }
 
-// Ping verifies connectivity to PostgreSQL.
+// retryRowByRow executes each model individually to isolate permanent failures.
+func (s *Sink) retryRowByRow(ctx context.Context, models []sink.WriteModel, cols []string, existingErrors []sink.SinkError) (*sink.BulkWriteResult, error) {
+	var errs []sink.SinkError
+	errs = append(errs, existingErrors...)
+
+	for _, m := range models {
+		err := s.executeBulk(ctx, []sink.WriteModel{m}, cols)
+		if err != nil {
+			var pgErr *pgconn.PgError
+			if errors.As(err, &pgErr) {
+				if isPermanentSQLState(pgErr.Code) {
+					errs = append(errs, sink.SinkError{
+						CorrelationKey: m.CorrelationKey,
+						Class:          sink.ClassPermanent,
+						Err:            err,
+					})
+				} else {
+					errs = append(errs, sink.SinkError{
+						CorrelationKey: m.CorrelationKey,
+						Class:          sink.ClassTransient,
+						Err:            err,
+					})
+				}
+			} else {
+				errs = append(errs, sink.SinkError{
+					CorrelationKey: m.CorrelationKey,
+					Class:          sink.ClassTransient,
+					Err:            err,
+				})
+			}
+		}
+	}
+
+	return &sink.BulkWriteResult{Errors: errs}, nil
+}
+
+// Write performs a single-document upsert. Used in degraded mode only.
+func (s *Sink) Write(ctx context.Context, model sink.WriteModel) error {
+	item, ok := model.Update.(map[string]any)
+	if !ok {
+		return errors.New("Update field must be map[string]any")
+	}
+	cols := sortedColumnsFromMap(item)
+	return s.executeBulk(ctx, []sink.WriteModel{model}, cols)
+}
+
 func (s *Sink) Ping(ctx context.Context) error {
 	return s.pool.Ping(ctx)
 }
 
-// Close closes the connection pool.
 func (s *Sink) Close(ctx context.Context) error {
 	s.pool.Close()
 	return nil
 }
 
-// Pool returns the underlying pgxpool.Pool, allowing it to be shared
-// with source/postgres.Source to maintain a single connection pool.
-func (s *Sink) Pool() *pgxpool.Pool {
-	return s.pool
-}
+// --- Helper Functions ---
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
-
-// sortedKeys returns the keys of a map in deterministic sorted order.
-func sortedKeys(m map[string]any) []string {
-	keys := make([]string, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
+func sortedColumnsFromMap(item map[string]any) []string {
+	cols := make([]string, 0, len(item))
+	for k := range item {
+		cols = append(cols, k)
 	}
-	sort.Strings(keys)
-	return keys
+	sort.Strings(cols)
+	return cols
 }
 
-// resolveConflictTarget extracts the ON CONFLICT target from the Filter field.
-// Defaults to "id" if the filter is empty or not a string.
-func resolveConflictTarget(filter interface{}) string {
-	if ct, ok := filter.(string); ok && ct != "" {
-		return ct
+func sameColumns(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
 	}
-	return "id"
-}
-
-// isPermanentError checks if a PostgreSQL error is a permanent constraint
-// violation that should be routed to the DLQ rather than retried.
-// PostgreSQL error classes: 23xxx = Integrity Constraint Violation.
-func isPermanentError(err error, pgErr **pgconn.PgError) bool {
-	if e, ok := err.(*pgconn.PgError); ok {
-		*pgErr = e
-		// 23505 = unique_violation
-		// 23503 = foreign_key_violation
-		// 23514 = check_violation
-		// 23502 = not_null_violation
-		// 42P01 = undefined_table (schema drift)
-		// 42703 = undefined_column (schema drift)
-
-		if e.Code[:2] == "23" {
-			return true
+	for i := range a {
+		if a[i] != b[i] {
+			return false
 		}
-		switch e.Code {
-		case "42P01", "42703":
+	}
+	return true
+}
+
+func buildConflictKeyFromMap(item map[string]any, conflictCols []string) string {
+	var parts []string
+	for _, c := range conflictCols {
+		parts = append(parts, fmt.Sprintf("%v", item[c]))
+	}
+	return strings.Join(parts, "|")
+}
+
+func contains(slice []string, item string) bool {
+	for _, s := range slice {
+		if s == item {
 			return true
 		}
 	}
 	return false
 }
 
-// Ensure pgx import is used (for RowToMap in source).
-var _ pgx.Row
+// isPermanentSQLState checks if the PostgreSQL SQLSTATE code indicates a permanent failure.
+// RFP Fix: Codes are kept as strings, not Atoi'd.
+func isPermanentSQLState(code string) bool {
+	// 23xxx: Integrity Constraint Violation (e.g., 23505 unique_violation)
+	if strings.HasPrefix(code, "23") {
+		return true
+	}
+	// 42P01: Undefined Table
+	// 42703: Undefined Column
+	if code == "42P01" || code == "42703" {
+		return true
+	}
+	// 21000: Cardinality Violation
+	if code == "21000" {
+		return true
+	}
+	return false
+}
