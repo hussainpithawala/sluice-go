@@ -1,5 +1,5 @@
 // Package main demonstrates a production-grade nudge inventory consumer
-// using sluice as the write buffer between Kafka/SQS and AWS DynamoDB.
+// using sluice as the write buffer between Kafka/SQS and AWS DocumentDB.
 //
 // It exercises BOTH regimes:
 //   - Cold regime: high-velocity bulk writes via Write() → time-drain flush.
@@ -7,13 +7,13 @@
 //
 // It also demonstrates IndexContract (secondary indexes) and Query() (compound lookups).
 //
-// Run against DynamoDB Local:
+// Run against DocumentDB Local (MongoDB):
 //
-//	DYNAMODB_ENDPOINT=http://localhost:8000 REDIS_ADDRS=localhost:6379 go run ./examples/nudge_hot_reload_dynamodb/main.go
+//	MONGODB_URI=mongodb://localhost:27017 REDIS_ADDRS=localhost:6379 go run ./examples/nudge_hot_reload_documentdb/main.go
 //
-// Run against AWS DynamoDB:
+// Run against AWS DocumentDB:
 //
-//	AWS_REGION=us-east-1 REDIS_ADDRS=localhost:6379 go run ./examples/nudge_hot_reload_dynamodb/main.go
+//	MONGODB_URI=mongodb://<username>:<password>@<cluster-endpoint>:27017/?tls=true&tlsCaFile=global-bundle.pem REDIS_ADDRS=localhost:6379 go run ./examples/nudge_hot_reload_documentdb/main.go
 package main
 
 import (
@@ -21,7 +21,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
@@ -31,15 +30,15 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
-	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 	"github.com/hussainpithawala/sluice-go"
 	"github.com/hussainpithawala/sluice-go/internal/localjournal"
-	dynsink "github.com/hussainpithawala/sluice-go/sink/dynamodb"
+	docdbsink "github.com/hussainpithawala/sluice-go/sink/docdb"
 	"github.com/hussainpithawala/sluice-go/source"
-	dynsource "github.com/hussainpithawala/sluice-go/source/dynamodb"
+	docdbsource "github.com/hussainpithawala/sluice-go/source/docdb"
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
+	"go.mongodb.org/mongo-driver/mongo/readpref"
 )
 
 var (
@@ -49,43 +48,47 @@ var (
 )
 
 type NudgeInventoryPayload struct {
-	NudgeMasterID string    `json:"nudge_master_id"`
-	Channel       string    `json:"channel"`
-	Priority      int       `json:"priority"`
-	CampaignID    string    `json:"campaign_id"`
-	ExpiresAt     time.Time `json:"expires_at"`
-	LastUpdated   time.Time `json:"last_updated"`
+	NudgeMasterID string    `json:"nudge_master_id" bson:"nudge_master_id"`
+	Channel       string    `json:"channel" bson:"channel"`
+	Priority      int       `json:"priority" bson:"priority"`
+	CampaignID    string    `json:"campaign_id" bson:"campaign_id"`
+	ExpiresAt     time.Time `json:"expires_at" bson:"expires_at"`
+	LastUpdated   time.Time `json:"last_updated" bson:"last_updated"`
 }
 
 // ─── WriteContract ───────────────────────────────────────────────────────────
-// DynamoDB requires the full item map for a PutItem operation.
+// DocumentDB requires MongoDB-style update operations.
 func nudgeWriteContract(correlationKey string, rawPayload []byte) (*sluice.WriteModel, error) {
 	var p NudgeInventoryPayload
 	if err := json.Unmarshal(rawPayload, &p); err != nil {
 		return nil, fmt.Errorf("nudge contract: invalid payload for correlation_key %s: %w", correlationKey, err)
 	}
 
-	item := map[string]any{
-		"PK":              correlationKey,
-		"nudge_master_id": p.NudgeMasterID,
-		"channel":         p.Channel,
-		"priority":        p.Priority,
-		"campaign_id":     p.CampaignID,
-		"expires_at":      p.ExpiresAt.Format(time.RFC3339),
-		"last_updated":    p.LastUpdated.Format(time.RFC3339),
+	// MongoDB update operation with $set
+	update := bson.M{
+		"$set": bson.M{
+			"_id":             correlationKey,
+			"nudge_master_id": p.NudgeMasterID,
+			"channel":         p.Channel,
+			"priority":        p.Priority,
+			"campaign_id":     p.CampaignID,
+			"expires_at":      p.ExpiresAt,
+			"last_updated":    p.LastUpdated,
+		},
 	}
 
 	return &sluice.WriteModel{
-		Update: item,
+		Filter: bson.M{"_id": correlationKey},
+		Update: update,
 		Upsert: true,
 	}, nil
 }
 
 // ─── ReadContract ────────────────────────────────────────────────────────────
-// ReadContract translates a correlation key into a DynamoDB GetItem Key.
+// ReadContract translates a correlation key into a MongoDB filter.
 func nudgeReadContract(correlationKey string) (*source.ReadModel, error) {
 	return &source.ReadModel{
-		Filter: map[string]any{"PK": correlationKey},
+		Filter: bson.M{"_id": correlationKey},
 	}, nil
 }
 
@@ -154,9 +157,12 @@ func (m *logMetrics) RecordLocalCacheMiss(namespace string, reason localjournal.
 func (m *logMetrics) RecordLocalSetSize(namespace string, size int) {
 	m.log.Info("record-local-set-size", "ns", namespace, "size", size)
 }
+func (m *logMetrics) RecordUnflushedExpiry(ns, band string, count int) {
+	m.log.Error("unflushed payload lost", "ns", ns, "band", band, "count", count)
+}
 
 // ─── Cold Regime: Simulated Bulk Consumer ────────────────────────────────────
-// Kept at a sustainable functional load (~80 events/sec) to prevent DynamoDB Local timeouts.
+// Kept at a sustainable functional load (~80 events/sec) to prevent MongoDB timeouts.
 func simulatedConsumer(ctx context.Context, workerID int, sl *sluice.Sluice, log *slog.Logger, written *atomic.Int64, wg *sync.WaitGroup) {
 	defer wg.Done()
 	nudgeMasters := []string{"nm_spring_retarget_2026", "nm_cart_abandonment", "nm_win_back_q2", "nm_first_purchase", "nm_loyalty_upgrade"}
@@ -192,10 +198,11 @@ func simulatedConsumer(ctx context.Context, workerID int, sl *sluice.Sluice, log
 // ─── Hot Regime: Simulated User Sessions ─────────────────────────────────────
 func hotRegimeSimulator(ctx context.Context, sl *sluice.Sluice, log *slog.Logger, wg *sync.WaitGroup) {
 	defer wg.Done()
-	ticker := time.NewTicker(3 * time.Second) // Slowed down slightly for DynamoDB Local stability
-	defer ticker.Stop()
-	sessionCount := 0
 
+	ticker := time.NewTicker(3 * time.Second) // Slowed down slightly for MongoDB stability
+	defer ticker.Stop()
+
+	sessionCount := 0
 	for {
 		select {
 		case <-ctx.Done():
@@ -213,10 +220,11 @@ func hotRegimeSimulator(ctx context.Context, sl *sluice.Sluice, log *slog.Logger
 			}
 			log.Info("hot regime: pre-login state", "correlationKey", correlationKey, "is_hot", isHot)
 
-			// Step 2: HotLoad — simulates user login. Loads from DynamoDB into Redis.
+			// Step 2: HotLoad — simulates user login. Loads from DocumentDB into Redis.
 			if err := sl.HotLoad(ctx, correlationKey); err != nil {
 				log.Error("hotload failed", "err", err)
 			}
+
 			// If you need the payload immediately, use Read() instead:
 			payload, err := sl.Read(ctx, correlationKey)
 			if err != nil {
@@ -234,7 +242,7 @@ func hotRegimeSimulator(ctx context.Context, sl *sluice.Sluice, log *slog.Logger
 				}
 				payload = newPayload
 			} else {
-				log.Info("hot regime: HotLoad success (warmed from DynamoDB)", "correlationKey", correlationKey, "payload_bytes", len(payload))
+				log.Info("hot regime: HotLoad success (warmed from DocumentDB)", "correlationKey", correlationKey, "payload_bytes", len(payload))
 			}
 
 			// Step 3: Confirm correlation_key is now hot.
@@ -310,48 +318,64 @@ func main() {
 }
 
 func run(log *slog.Logger) (err error) {
-	log.Info("sluice dynamodb hot/cold example", "version", version, "commit", commit, "built", buildDate)
+	log.Info("sluice documentdb hot/cold example", "version", version, "commit", commit, "built", buildDate)
+
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	// ── Initialize DynamoDB Client ───────────────────────────────────────
-	var cfg aws.Config
-	endpoint := os.Getenv("DYNAMODB_ENDPOINT")
+	// ── Initialize MongoDB Client ───────────────────────────────────────
+	mongoURI := getEnv("MONGODB_URI", "mongodb://localhost:27017")
+	database := getEnv("MONGODB_DATABASE", "nudge_inventory")
+	collection := getEnv("MONGODB_COLLECTION", "nudge_hot_cold")
 
-	// Custom HTTP client with a longer timeout for DynamoDB Local stability
-	httpClient := &http.Client{Timeout: 30 * time.Second}
+	log.Info("connecting to documentdb", "uri", mongoURI, "database", database, "collection", collection)
 
-	if endpoint != "" {
-		log.Info("using local dynamodb endpoint", "endpoint", endpoint)
-		cfg, err = config.LoadDefaultConfig(ctx,
-			config.WithRegion("us-east-1"),
-			config.WithHTTPClient(httpClient),
-		)
-	} else {
-		log.Info("using default aws config (production mode)")
-		cfg, err = config.LoadDefaultConfig(ctx, config.WithHTTPClient(httpClient))
-	}
+	clientOpts := options.Client().
+		ApplyURI(mongoURI).
+		SetMaxPoolSize(100).
+		SetMinPoolSize(10).
+		SetConnectTimeout(10 * time.Second).
+		SetServerSelectionTimeout(5 * time.Second)
+
+	mongoClient, err := mongo.Connect(ctx, clientOpts)
 	if err != nil {
-		return fmt.Errorf("load aws config: %w", err)
+		return fmt.Errorf("connect to documentdb: %w", err)
 	}
 
-	// Use BaseEndpoint on the service client options instead of the deprecated global resolver
-	client := dynamodb.NewFromConfig(cfg, func(o *dynamodb.Options) {
-		if endpoint != "" {
-			o.BaseEndpoint = aws.String(endpoint)
-		}
-	})
+	// Verify connection
+	pingCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if err := mongoClient.Ping(pingCtx, readpref.Primary()); err != nil {
+		return fmt.Errorf("ping documentdb: %w", err)
+	}
+	log.Info("documentdb connection established")
 
-	tableName := "NudgeInventoryHotCold"
-
-	// ── Ensure Table Exists ──────────────────────────────────────────────
-	if err := ensureTableExists(ctx, client, tableName, log); err != nil {
-		return fmt.Errorf("ensure table exists: %w", err)
+	// ── Ensure Collection Exists ──────────────────────────────────────────
+	if err := ensureCollectionExists(ctx, mongoClient, database, collection, log); err != nil {
+		return fmt.Errorf("ensure collection exists: %w", err)
 	}
 
 	// ── Sink (write path) & Source (read path) ───────────────────────────
-	sk := dynsink.NewSink(client, tableName)
-	src := dynsource.NewSource(client, tableName)
+	sk, err := docdbsink.New(ctx, docdbsink.Config{
+		URI:                    mongoURI,
+		Database:               database,
+		Collection:             collection,
+		MaxPoolSize:            100,
+		MinPoolSize:            10,
+		ConnectTimeout:         10 * time.Second,
+		ServerSelectionTimeout: 5 * time.Second,
+	})
+	if err != nil {
+		return fmt.Errorf("create documentdb sink: %w", err)
+	}
+
+	cfg := docdbsource.Config{
+		URI:        mongoURI,
+		Database:   database,
+		Collection: collection,
+	}
+
+	src, err := docdbsource.NewSource(ctx, cfg)
 
 	// ── Redis config ─────────────────────────────────────────────────────
 	redisAddrsRaw := getEnv("REDIS_ADDRS", "localhost:6379")
@@ -367,7 +391,7 @@ func run(log *slog.Logger) (err error) {
 	}
 
 	// ── Build Sluice with all contracts ──────────────────────────────────
-	sl, err := sluice.New("nudge_inventory_dynamodb").
+	sl, err := sluice.New("nudge_inventory_documentdb").
 		WithRedis(sluice.RedisConfig{
 			Addrs:        redisAddrs,
 			ClusterMode:  clusterMode,
@@ -405,7 +429,7 @@ func run(log *slog.Logger) (err error) {
 		closeCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		if cerr := sk.Close(closeCtx); cerr != nil {
-			log.Warn("closing dynamodb sink after failed build", "err", cerr)
+			log.Warn("closing documentdb sink after failed build", "err", cerr)
 		}
 		return fmt.Errorf("build sluice: %w", err)
 	}
@@ -453,8 +477,8 @@ func run(log *slog.Logger) (err error) {
 	// ── Stats reporter ───────────────────────────────────────────────────
 	statsTicker := time.NewTicker(5 * time.Second)
 	defer statsTicker.Stop()
-	start := time.Now()
 
+	start := time.Now()
 	go func() {
 		for {
 			select {
@@ -483,42 +507,40 @@ func run(log *slog.Logger) (err error) {
 		"elapsed", elapsed.Round(time.Second),
 		"avg_rate", fmt.Sprintf("%.0f events/sec", float64(total)/elapsed.Seconds()),
 	)
+
 	return nil
 }
 
-// ensureTableExists creates the table if it doesn't exist and waits for it to become ACTIVE.
-func ensureTableExists(ctx context.Context, client *dynamodb.Client, tableName string, log *slog.Logger) error {
-	_, err := client.CreateTable(ctx, &dynamodb.CreateTableInput{
-		TableName: aws.String(tableName),
-		KeySchema: []types.KeySchemaElement{
-			{AttributeName: aws.String("PK"), KeyType: types.KeyTypeHash},
-		},
-		AttributeDefinitions: []types.AttributeDefinition{
-			{AttributeName: aws.String("PK"), AttributeType: types.ScalarAttributeTypeS},
-		},
-		BillingMode: types.BillingModePayPerRequest,
-	})
+// ensureCollectionExists creates the collection and indexes if they don't exist.
+func ensureCollectionExists(ctx context.Context, client *mongo.Client, database, collection string, log *slog.Logger) error {
+	coll := client.Database(database).Collection(collection)
 
-	if err != nil {
-		if !strings.Contains(err.Error(), "ResourceInUseException") {
-			return fmt.Errorf("create table: %w", err)
-		}
-		log.Info("table already exists, skipping creation", "table", tableName)
-	} else {
-		log.Info("table creation initiated", "table", tableName)
+	// Create indexes for common query patterns
+	indexes := []mongo.IndexModel{
+		{
+			Keys:    bson.D{{Key: "channel", Value: 1}},
+			Options: options.Index().SetName("idx_channel"),
+		},
+		{
+			Keys:    bson.D{{Key: "campaign_id", Value: 1}},
+			Options: options.Index().SetName("idx_campaign_id"),
+		},
+		{
+			Keys:    bson.D{{Key: "priority", Value: 1}},
+			Options: options.Index().SetName("idx_priority"),
+		},
+		{
+			Keys:    bson.D{{Key: "expires_at", Value: 1}},
+			Options: options.Index().SetName("idx_expires_at"),
+		},
 	}
 
-	log.Info("waiting for table to become active...", "table", tableName)
-	waiter := dynamodb.NewTableExistsWaiter(client)
-	err = waiter.Wait(ctx, &dynamodb.DescribeTableInput{
-		TableName: aws.String(tableName),
-	}, 2*time.Minute)
-
+	_, err := coll.Indexes().CreateMany(ctx, indexes)
 	if err != nil {
-		return fmt.Errorf("wait for table active: %w", err)
+		return fmt.Errorf("create indexes: %w", err)
 	}
 
-	log.Info("table is active", "table", tableName)
+	log.Info("documentdb collection and indexes ready", "database", database, "collection", collection)
 	return nil
 }
 
@@ -527,8 +549,4 @@ func getEnv(key, def string) string {
 		return v
 	}
 	return def
-}
-
-func (m *logMetrics) RecordUnflushedExpiry(ns, band string, count int) {
-	m.log.Error("unflushed payload lost", "ns", ns, "band", band, "count", count)
 }
