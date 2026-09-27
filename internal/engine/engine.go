@@ -217,20 +217,22 @@ func (e *Engine) runBand(band int) {
 //     mid-flush stays dirty so its newer payload is flushed next cycle.
 //     - Transient failure  → no action; keys remain in dirty set for retry.
 //     - Total failure      → no action; all keys remain in dirty set for retry.
-//
 // This ensures a BulkWrite failure — including a unique-ID collision during
 // DrainAndClose — never causes silent record loss.
+
+// UPDATED: Now enforces CheckAttribution to prevent success-by-elimination silent loss,
+// and uses SinkError.IsPermanent() for accurate dead-letter routing.
+
+// ... [Keep imports, Config, MetricsRecorder, Contracts, Engine struct, New, Start, SignalVolume, DrainAndStop, startPreEvictionFlusher, runBand exactly as they are] ...
 func (e *Engine) flushBand(ctx context.Context, band int) error {
 	start := time.Now()
 	bandStr := fmt.Sprintf("%d", band)
 
-	// Emit pre-flush dirty queue depth for observability.
 	if depth, err := e.shield.DirtyQueueDepth(ctx, band); err == nil {
 		e.metrics.RecordDirtyQueueDepth(e.cfg.Namespace, bandStr, int(depth))
 	}
 
-	// Phase 1: read without removing. Every key — including any whose payload
-	// is missing — stays in the dirty set until CommitKeys/MoveToDeadLetter.
+	// Phase 1: read without removing.
 	records, err := e.shield.DrainBand(ctx, band, e.cfg.MaxBatchSize)
 	if err != nil {
 		e.metrics.RecordFlush(e.cfg.Namespace, bandStr, 0, time.Since(start), err)
@@ -240,12 +242,8 @@ func (e *Engine) flushBand(ctx context.Context, band int) error {
 		return nil
 	}
 
-	// Write sequence of each drained version. Commit and dead-letter are
-	// conditional on it, so a write landing mid-flush is never dropped.
 	seqs := make(map[string]string, len(records))
 	var missing []shield.VersionedKey
-
-	// Apply WriteContract — build sink models.
 	models := make([]sink.WriteModel, 0, len(records))
 	corrKeys := make([]string, 0, len(records))
 
@@ -255,13 +253,8 @@ func (e *Engine) flushBand(ctx context.Context, band int) error {
 			continue
 		}
 		seqs[rec.CorrelationKey] = rec.Seq
-
 		wm, contractErr := e.writeContract(rec.CorrelationKey, rec.Payload)
 		if contractErr != nil {
-			// Contract violation is a permanent failure for this key.
-			// Move to dead-letter to break an infinite retry loop — unless
-			// the key was rewritten meanwhile, in which case the new
-			// payload deserves its own attempt.
 			e.metrics.RecordContractError(e.cfg.Namespace, rec.CorrelationKey, contractErr)
 			e.deadLetter(ctx, band, bandStr,
 				[]shield.VersionedKey{{CorrelationKey: rec.CorrelationKey, Seq: rec.Seq}}, "contract_violation")
@@ -270,8 +263,7 @@ func (e *Engine) flushBand(ctx context.Context, band int) error {
 					[]string{rec.CorrelationKey},
 					&sink.BulkWriteResult{
 						Errors: []sink.SinkError{
-							{CorrelationKey: rec.CorrelationKey,
-								Err: fmt.Errorf("%w: %v", sink.ErrContractViolation, contractErr)},
+							{CorrelationKey: rec.CorrelationKey, Err: fmt.Errorf("%w: %v", sink.ErrContractViolation, contractErr)},
 						},
 					},
 					contractErr,
@@ -289,7 +281,6 @@ func (e *Engine) flushBand(ctx context.Context, band int) error {
 	}
 
 	e.handleMissingPayloads(ctx, band, bandStr, missing)
-
 	if len(models) == 0 {
 		return nil
 	}
@@ -300,36 +291,37 @@ func (e *Engine) flushBand(ctx context.Context, band int) error {
 	e.metrics.RecordFlush(e.cfg.Namespace, bandStr, len(models), duration, flushErr)
 
 	if flushErr != nil {
-		// Total failure — network, timeout, or unrecognised error.
-		// Do not commit any keys. All keys remain in the dirty set and will
-		// be retried on the next flush cycle.
+		// Total failure — network, timeout, write concern, or unrecognised error.
+		// Do not commit any keys. All keys remain in the dirty set and will be retried.
 		if e.callback != nil {
 			e.callback(corrKeys, result, flushErr)
 		}
 		return flushErr
 	}
 
-	// Partial or full success — partition results.
+	// NEW: Attribution Guard. Prevents success-by-elimination silent loss.
+	// If the sink returns partial errors but fails to attribute them to a key, we abort the commit.
+	if err := sink.CheckAttribution(models, result); err != nil {
+		slog.Error("sluice: flush aborted due to unattributed sink error", "err", err, "namespace", e.cfg.Namespace, "band", band)
+		if e.callback != nil {
+			e.callback(corrKeys, result, err)
+		}
+		return err // Return error to keep all keys in the dirty set for retry
+	}
+
+	// Partition results using the new IsPermanent() method.
 	permanentKeys := make([]string, 0)
 	transientKeys := make(map[string]bool)
-
 	if result != nil {
 		for _, se := range result.Errors {
-			if se.Code == ErrCodeDuplicateKey {
-				// Non-retryable: unique-index violation.
-				// Moving to dead-letter prevents an infinite retry loop
-				// while preserving the payload for investigation and replay.
+			if se.IsPermanent() {
 				permanentKeys = append(permanentKeys, se.CorrelationKey)
 			} else {
-				// Retryable: transient sink error (write concern, timeout, etc.).
-				// No action needed — key stays in dirty set.
 				transientKeys[se.CorrelationKey] = true
 			}
 		}
 	}
 
-	// Build the set of successfully written keys:
-	// all corrKeys minus permanent failures minus transient failures.
 	failedKeys := make(map[string]bool, len(permanentKeys)+len(transientKeys))
 	for _, k := range permanentKeys {
 		failedKeys[k] = true
@@ -345,24 +337,19 @@ func (e *Engine) flushBand(ctx context.Context, band int) error {
 		}
 	}
 
-	// Commit successful keys: remove from the dirty set and apply the
-	// post-flush TTL (until now they were persistent, since Redis held the
-	// only copy). Keys rewritten mid-flush stay dirty for the next cycle.
 	e.commitFlushed(ctx, band, successKeys, seqs)
 
-	// Route permanently failed keys to dead-letter.
 	if len(permanentKeys) > 0 {
 		items := make([]shield.VersionedKey, len(permanentKeys))
 		for i, k := range permanentKeys {
 			items[i] = shield.VersionedKey{CorrelationKey: k, Seq: seqs[k]}
 		}
-		e.deadLetter(ctx, band, bandStr, items, "duplicate_key")
+		e.deadLetter(ctx, band, bandStr, items, "permanent_sink_error")
 	}
 
 	if e.callback != nil {
 		e.callback(corrKeys, result, nil)
 	}
-
 	return nil
 }
 

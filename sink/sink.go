@@ -3,44 +3,43 @@
 package sink
 
 import (
-	"context"
 	"errors"
+	"fmt"
 )
-
-// BulkWriteResult carries the outcome of a sink BulkWrite call.
-type BulkWriteResult struct {
-	InsertedCount int64
-	MatchedCount  int64
-	ModifiedCount int64
-	UpsertedCount int64
-	Errors        []SinkError
-}
-
-// SinkError ties a write failure back to its originating correlation key.
-// Code carries the document-store error code when available (e.g. 11000 for
-// a MongoDB/DocumentDB duplicate-key violation). Zero means unknown or
-// not applicable.
-type SinkError struct {
-	CorrelationKey string
-	Code           int
-	Err            error
-}
 
 // ErrContractViolation indicates the write contract returned an error.
 var ErrContractViolation = errors.New("sink: write contract returned error")
 
-// FlushSink is the write-side persistence contract for sluice.
-type FlushSink interface {
-	BulkWrite(ctx context.Context, models []WriteModel) (*BulkWriteResult, error)
-	Write(ctx context.Context, model WriteModel) error
-	Ping(ctx context.Context) error
-	Close(ctx context.Context) error
+func (e SinkError) Error() string {
+	if e.Err != nil {
+		return fmt.Sprintf("sink error (key=%s, code=%d): %v", e.CorrelationKey, e.Code, e.Err)
+	}
+	return fmt.Sprintf("sink error (key=%s, code=%d): %s", e.CorrelationKey, e.Code, e.Message)
 }
 
-// WriteModel is the resolved upsert instruction handed to the FlushSink.
-type WriteModel struct {
-	CorrelationKey string
-	Filter         interface{}
-	Update         interface{}
-	Upsert         bool
+// IsPermanent determines if the error should be dead-lettered or retried.
+// Preserves legacy behavior where ClassUnknown with Code 11000 is treated as permanent.
+func (e SinkError) IsPermanent() bool {
+	if e.Class == ClassPermanent {
+		return true
+	}
+	if e.Class == ClassUnknown && e.Code == 11000 {
+		return true
+	}
+	return false
+}
+
+// CheckAttribution validates that all errors in a partial-failure result have a valid CorrelationKey.
+// If any error lacks a key, it returns ErrUnattributedSinkError, preventing the engine
+// from silently committing keys that might have actually failed (success-by-elimination).
+func CheckAttribution(models []WriteModel, result *BulkWriteResult) error {
+	if result == nil || len(result.Errors) == 0 {
+		return nil
+	}
+	for _, se := range result.Errors {
+		if se.CorrelationKey == "" {
+			return fmt.Errorf("%w: %v", ErrUnattributedSinkError, se)
+		}
+	}
+	return nil
 }

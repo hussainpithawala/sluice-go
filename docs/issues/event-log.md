@@ -1,8 +1,8 @@
 # RFP #17: Event Log — Recording Every Incoming Event in `sluice-go`
 
-**Status:** Proposed (design agreed 2026-09-27; to be implemented in a separate session)  
+**Status:** Proposed (design agreed 2026-09-27); **blocked on RFP #18**  
 **Target Release:** next minor after v1.0.8  
-**Dependencies:** Durability hardening in `[Unreleased]` (conditional commit via per-key sequence `v`, `DeadLetterIfUnchanged`, ack-on-commit batching, NOSCRIPT recovery, safe degraded mode), RFP #16 (Prometheus metrics)
+**Dependencies:** **RFP #18 (Closing silent-loss paths in the sink and engine layers)**, durability hardening in `[Unreleased]` (conditional commit via per-key sequence `v`, `DeadLetterIfUnchanged`, ack-on-commit batching, NOSCRIPT recovery, safe degraded mode), RFP #16 (Prometheus metrics)
 
 ---
 
@@ -20,22 +20,17 @@ So when the stream and the API each emit an event for user_id X within one flush
 
 A datastore-side version guard was considered first and rejected. It only decides *which single version* survives, so it still keeps one event of the two.
 
-### 1.1 Silent-loss paths found in the sink/engine layer (affect state writes today)
+### 1.1 Prerequisite: silent-loss paths in the sink/engine layer
 
-While designing this, the review found that the engine and the DLQ processor decide success **by elimination**: every key not named in a `SinkError` is committed. The sinks produce unattributed or missing errors, so records are committed without having been written:
+While designing this, the review found that the engine and the DLQ processor decide success **by elimination**, and the sinks produce unattributed or misclassified errors, so records can be committed without having been written. These defects affect state writes today and are tracked separately in **RFP #18** (`sink-silent-loss.md`).
 
-| Where | Defect | Effect |
-|---|---|---|
-| `sink/dynamodb` `flushBatch` | A failed `Update.(map[string]any)` assertion or a marshal failure returns early | The rest of the chunk is never written but is counted as success |
-| `sink/dynamodb` | Context cancel or retries exhausted return **zero-value** `SinkError`s (empty `CorrelationKey`) | Unprocessed items are committed as success |
-| `sink/dynamodb` | `BulkWrite` never returns an error; all Codes are 0 | No permanent/transient distinction |
-| `sink/docdb` | `BulkWriteException.WriteConcernError` is ignored; value type assertion instead of `errors.As` | A write-concern failure is committed as success |
-| `sink/docdb` | 11000 is always permanent | A concurrent-upsert race on `_id` is wrongly dead-lettered |
-| `sink/postgres` | Columns and conflict target come from the **first row only** | Later rows get NULLs or dropped fields |
-| `sink/postgres` | 23xxx become ints ≠ 11000, so they are treated as transient; `42P01`/`42703` fail `Atoi` | A poison batch retries forever and stalls its band |
-| `internal/dlq` `handleUpsert` | The same success-by-elimination logic | The same risk on DLQ replay |
+The event log reuses the same flush, commit and DLQ machinery, and relies on RFP #18 for:
+- `CheckAttribution` in the engine and in `handleUpsert` (no success by elimination);
+- `SinkError.Class` / `IsPermanent()`, so 11000 on `_id_` during an upsert race is retried rather than dead-lettered;
+- DynamoDB duplicate-key and Postgres duplicate-conflict-key pre-checks returning permanent per-row errors (see §7, trap 2);
+- Postgres `Config.OnConflict: DoNothing` (§4.5).
 
-These must be fixed first (Phase 1), because the event log depends on the same machinery.
+RFP #18 must ship before Phase 1 below starts.
 
 ---
 
@@ -45,7 +40,7 @@ These must be fixed first (Phase 1), because the event log depends on the same m
 2. **Keep the per-user_id state document working as today**: the current-state inventory that `Read`/`Query`/`HotLoad` serve, latest wins.
 3. **Work on all three sinks**: DocumentDB, Postgres and DynamoDB.
 4. **Stay available for events during a full Redis outage** by writing them directly to the datastore.
-5. **Close the silent-loss paths** in §1.1 for both state and events.
+5. **Inherit the silent-loss fixes** from RFP #18 for events, with no event-specific success-by-elimination path.
 
 ## 3. Resolved Decisions
 
@@ -136,7 +131,7 @@ var ErrEventLogNotConfigured = errors.New("sluice: event log not configured — 
 
 | Sink | Contract / config | Why |
 |---|---|---|
-| DocumentDB | `Filter {_id: ev.Key()}`, `Update {$setOnInsert: {...}}`, `Upsert: true` | The first write wins, and replays are no-ops. An 11000 on `_id_` (an upsert race) is retryable (Phase 1). |
+| DocumentDB | `Filter {_id: ev.Key()}`, `Update {$setOnInsert: {...}}`, `Upsert: true` | The first write wins, and replays are no-ops. An 11000 on `_id_` (an upsert race) is retryable (RFP #18). |
 | Postgres | The event sink uses `OnConflict: DoNothing`; `PRIMARY KEY (user_id, event_id)` | No dead tuples or WAL on replay; the first write wins. |
 | DynamoDB | `PK=user_id`, `SK=event_id`, `PutRequest` | `BatchWriteItem` can't be conditional, so it is idempotent only because the item is deterministic (a pure contract). Also serves queries by user_id. The degraded single write may use `attribute_not_exists(PK)`, with `ConditionalCheckFailed` counted as success. |
 
@@ -173,48 +168,27 @@ With the event log enabled, the default Redis `PoolSize` rises to `max(20, 2*Ban
 
 Each phase ends with gofmt, `go build`, `go vet` (also `-tags integration`), and a green full `go test ./...`. Mutation-check each new test (stash the fix and confirm the test fails).
 
-### Phase 1: sink and engine correctness (fixes §1.1; valuable on its own)
-- `sink/sink.go`:
-  - `ErrorClass` (`ClassUnknown`, `ClassTransient`, `ClassPermanent`); `SinkError.Class`;
-  - `SinkError.IsPermanent()` = Permanent, or Unknown with 11000, which keeps today's behaviour;
-  - `ErrUnattributedSinkError`;
-  - `CheckAttribution(models, res) error`.
-- `internal/engine/engine.go`: after a nil `flushErr`, run `CheckAttribution`; on failure, commit nothing. Classify with `IsPermanent()` instead of `Code == 11000`.
-- `internal/dlq/dlq.go`: the same attribution guard in `handleUpsert`.
-- `sink/dynamodb`:
-  - an `API` interface and `NewSinkWithAPI` (so tests can use a fake);
-  - key attributes from an option, or `DescribeTable` loaded once;
-  - per-item permanent errors instead of returning early;
-  - duplicate keys in a chunk become permanent errors;
-  - `UnprocessedItems`, context cancel and retries-exhausted mapped back to real keys as transient; an item that can't be mapped makes `BulkWrite` return an error;
-  - on a whole-call ValidationException, fall back to per-item `PutItem`.
-- `sink/docdb`: `errors.As`; a `WriteConcernError` is a total failure; 11000 on `_id_` for an upsert is transient, any other 11000 is permanent; a pure `classifyBulkErr` helper.
-- `sink/postgres`:
-  - `Config.OnConflict` (`DoUpdate` default, or `DoNothing`);
-  - every row must have the same columns and conflict target;
-  - duplicate conflict keys become permanent per-row errors;
-  - 23xxx, 42P01, 42703 and 21000 are `ClassPermanent`;
-  - a permanent multi-row error is retried row by row to isolate the bad rows.
+Prerequisite: RFP #18 (sink and engine correctness) is merged.
 
-### Phase 2: shield support
+### Phase 1: shield support
 - `Derive`, `ownsClient`, a no-op `Close` for derived Shields.
 - `PERSIST` when the DLQ TTL is 0.
 - Log and count the entries `drainAction` discards.
 - `internal/eventlog/envelope.go` (`EncodeKey`, `Encode`, `Decode`, versioned).
 
-### Phase 3: event log
+### Phase 2: event log
 - `eventlog.go` (the API in §4.1).
 - `Build` wiring: ping the event sink, `Derive`, the second engine, the event batcher, pool size.
 - `WriteEvent` (§4.4), the event DLQ (§4.6), `eventmetrics.go` (§4.7), `DrainAndClose` (§4.8).
 - Validation: a nil sink or contract is rejected; `KeyTTL` must be > 0.
 
-### Phase 4: docs and example
+### Phase 3: docs and example
 - README "Event log" section:
   - the identity requirement and pure-contract rule;
   - the per-sink contracts;
   - `PartialWriteError` handling (don't ack unless nil);
   - the known limits.
-- CHANGELOG with breaking notes (`SinkError.Class` semantics, DLQ TTL 0 = never).
+- CHANGELOG with breaking notes (DLQ TTL 0 = never).
 - Extend `examples/banner_write_dual_read_hot/documentdb` with two concurrent sources writing events.
 
 ---
@@ -233,27 +207,12 @@ Each phase ends with gofmt, `go build`, `go vet` (also `-tags integration`), and
 | Event DLQ | A contract failure dead-letters the event with DLQ `PTTL == -1`. Upsert and ReInsert both keep the event with no loss metric. Ignore is refused by default. |
 | Shutdown | `DrainAndClose` with a 1h flush window flushes pending events and produces no "client is closed" errors. A derived `Close` leaves the client usable. |
 | Isolation | The state Shield's hot-marker, index and pending probes ignore event keys. |
-| Engine attribution | A fake sink returning `SinkError{CorrelationKey:""}` or an unknown key commits nothing and the keys stay dirty. Same for the DLQ. `ClassPermanent` with 23505 dead-letters; `ClassTransient` with 11000 retries. |
 | Metrics | A Prometheus registry shows separate `dirty_queue_depth` series for `3` and `ev-3`. |
 
-**Sink tests:**
-- **DynamoDB, fake API**:
-  - `UnprocessedItems` for items 3 and 7 map to exactly {k3, k7} as transient;
-  - context cancel is mapped to keys, with none empty;
-  - an item that can't be mapped makes `BulkWrite` return an error;
-  - a ValidationException falls back to per-item puts.
-- **DynamoDB Local**:
-  - a 30-item chunk with one non-map item and one unmarshalable item writes the other 28, with 2 permanent errors carrying the correct keys;
-  - a duplicate PK in one batch gives a permanent error for the duplicate, and the rest are written.
-- **DocDB**:
-  - a write-concern exception returns an error;
-  - 11000 on `_id_` is transient, 11000 on a unique field is permanent;
-  - a `$setOnInsert` replay leaves the doc unchanged.
-- **Postgres**:
-  - a `DoNothing` replay keeps the first row;
-  - a column mismatch gives a permanent error with no NULL overwrite;
-  - a duplicate key in a batch fails only that row;
-  - a 23505 in a 5-row batch fails 1 row and commits 4.
+**Event contract tests** (sink-level attribution and classification tests live in RFP #18):
+- **DocDB**: a `$setOnInsert` replay leaves the doc unchanged.
+- **Postgres**: a `DoNothing` replay keeps the first row.
+- **DynamoDB**: a replayed `PutRequest` from a pure contract leaves the item unchanged; the degraded single write with `attribute_not_exists(PK)` counts `ConditionalCheckFailed` as success.
 
 **Live run:** two concurrent sources write the same user_ids for about 60s.
 - The event-doc count equals the number of `WriteEvent` calls that returned nil.
@@ -270,7 +229,7 @@ Each phase ends with gofmt, `go build`, `go vet` (also `-tags integration`), and
 4. **`PEXPIRE 0` deletes the key.** A "never expire" DLQ TTL must be `PERSIST`.
 5. **DLQ payloads expire after 7 days** and `drainAction` drops them with no signal. Events need a TTL of 0 plus a log and metric on discard.
 6. **Prometheus collisions and cardinality.** The recorder ignores the namespace, and `correlation_key` labels become per-event.
-7. **The engine treats every 11000 as permanent.** Multiple pods flush the same band with no lease, so upsert races on `_id` happen. They must be retried, not dead-lettered.
+7. **The engine treats every 11000 as permanent.** Multiple pods flush the same band with no lease, so upsert races on `_id` happen. They must be retried, not dead-lettered. Fixed by RFP #18.
 8. **A post-flush TTL of 0** leaves committed events in Redis forever (`commitFlushedLua` skips the PEXPIRE). The event `KeyTTL` must be > 0.
 
 ## 8. Known Limits (not solved by this RFP)
