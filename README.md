@@ -233,9 +233,18 @@ fires first:
 | Backlog | A band's oldest dirty entry has waited ~`KeyTTL` (checked every `KeyTTL/2`) | Bounds flush latency for backlogged bands |
 | Hot | `Write` lands on a hot key (`HotAwareFlush`) | Keeps the store current for keys under active use |
 
-Only after the sink confirms the batch are the keys committed. A commit is conditional: it removes a
-dirty entry only if the key's sequence is unchanged. A newer write that lands mid-flush therefore
-stays dirty and goes out in the next batch.
+Keys are committed only after the sink confirms the batch, and the engine handles each result like this:
+
+| Sink result | Engine action |
+|---|---|
+| Top-level error (network, timeout, write-concern failure) | Commit nothing; the whole batch stays dirty and is retried |
+| A per-key error with an empty correlation key | Commit nothing (`sink.ErrUnattributedSinkError` goes to `OnFlush`); the whole batch is retried |
+| A per-key error that is transient | That key stays dirty and is retried |
+| A per-key error that is permanent | That key is dead-lettered (`permanent_sink_error`) |
+| No error for a key | The key is committed |
+
+A commit is conditional: it removes a dirty entry only if the key's sequence is unchanged. A newer
+write that lands mid-flush therefore stays dirty and goes out in the next batch.
 
 ### Write-path options
 
@@ -412,9 +421,16 @@ a live-state lookup, not a replacement for querying your datastore.
 
 ## Recover: dead-letter queue
 
-Records that fail non-retryably are moved to a per-band DLQ instead of being retried forever or dropped. Examples include a
-`WriteContract` error, a unique-index collision, a schema violation, or a payload missing at flush
-time. Their payloads are kept for 7 days.
+Records that fail non-retryably are moved to a per-band DLQ instead of being retried forever or dropped.
+Examples include a `WriteContract` error, a unique-index collision, a schema violation, or a payload
+missing at flush time. Their payloads are kept for 7 days. Each sink isolates a permanent failure to
+the offending rows, so one poison record never stalls its band; the rest of the batch commits.
+
+| Dead-letter reason | Cause |
+|---|---|
+| `contract_violation` | `WriteContract` returned an error |
+| `permanent_sink_error` | The sink classified the key's error as permanent (see [Error classification](#error-classification-for-sinks)) |
+| `payload_missing_before_flush` | The key was dirty but its payload was gone |
 
 ```go
 result, err := s.ProcessDLQ(ctx, sluice.DLQUpsert,
@@ -451,6 +467,8 @@ loud failure to a quiet drop:
 | **Ack means journaled** | `Write` returns `nil` only after its entry is in Redis. This holds in batched mode too: each caller gets its own entry's result. |
 | **Unflushed state never expires** | Payloads are persistent until the sink confirms them. TTLs (`KeyTTL`, `ActivityWindow`) apply only *after* a commit, and TTL refreshes are extend-only. |
 | **Commits can't lose concurrent writes** | Every write bumps a per-key sequence, and commit and dead-lettering are conditional on it. A write that races an in-flight flush stays dirty. |
+| **No commit without attribution** | A sink error with no correlation key aborts the commit for the whole batch, both in the flush engine and in DLQ `Upsert` replay. Nothing is committed just because no error named it. |
+| **Retry vs. dead-letter is explicit** | Every bundled sink classifies each error as transient or permanent. A concurrent-upsert race between pods is retried, not dead-lettered. |
 | **At-least-once to the store, idempotent by upsert** | A crash between `BulkWrite` and commit re-flushes the batch. Upsert semantics make that safe. |
 | **Losses are loud** | A dirty key whose payload is gone at flush time gets `ErrPayloadMissing` (via `OnFlush`), an error log, a `RecordUnflushedExpiry` count and a DLQ entry. **Any non-zero count should page.** |
 | **Degraded mode preserves order** | If Redis fails, `WithDegradedModeDirect` (default on) writes straight to the store *only* when no older version of the key is pending in Redis. Otherwise, including when Redis is unreachable, `Write` returns `ErrDegradedWriteUnsafe`. Retry it; don't ack it. |
@@ -461,9 +479,8 @@ unflushed state) plus AOF and replicas, or MemoryDB. ElastiCache alone does not 
 writes across node loss. The bundled `docker-compose.yml` runs Redis with `noeviction` and
 `appendfsync everysec`.
 
-> **Known gaps.** The review behind [RFP #17](docs/issues/event-log.md) (§1.1) found sink-level error
-> attribution gaps. For example, some DynamoDB and DocumentDB failure modes are reported as success and
-> committed. Fixing them is Phase 1 of that RFP.
+The sink-level silent-loss paths found during the event-log review have been closed. The design and
+test plan are in [RFP #18](docs/issues/sink-silent-loss.md).
 
 ---
 
@@ -499,8 +516,20 @@ Each adapter uses the journal to remove the bottleneck specific to its store:
 | Store | Sink | Source | Bottleneck removed |
 |---|---|---|---|
 | DocumentDB / MongoDB | `sink/docdb`: unordered `BulkWrite` | `source/docdb`: `FindOne`; `Find` for bulk | Per-write index I/O on a single primary; connection caps |
-| DynamoDB | `sink/dynamodb`: `BatchWriteItem`, 25-item chunks, exponential backoff on `UnprocessedItems` | `source/dynamodb`: `GetItem` with `ConsistentRead: true`; `Query` for bulk | WCU spend: bursts flatten to a low, steady provisioned baseline; secondary lookups use Redis indexes instead of GSIs; idempotency uses `SETNX` instead of `TransactWriteItems` |
-| PostgreSQL | `sink/postgres`: multi-row `INSERT … ON CONFLICT DO UPDATE` over a bounded `pgxpool` (5–20 conns by default) | `source/postgres`: parameterised query + `Projector`, which supports joins and aggregations | Connection saturation, per-row transaction overhead, WAL/MVCC churn from repeated updates |
+| DynamoDB | `sink/dynamodb`: `BatchWriteItem`, with `UnprocessedItems` mapped back to their keys and retried | `source/dynamodb`: `GetItem` with `ConsistentRead: true`; `Query` for bulk | WCU spend: bursts flatten to a low, steady provisioned baseline; secondary lookups use Redis indexes instead of GSIs; idempotency uses `SETNX` instead of `TransactWriteItems` |
+| PostgreSQL | `sink/postgres`: multi-row `INSERT … ON CONFLICT DO UPDATE` (or `DO NOTHING` via `Config.OnConflict`) | `source/postgres`: parameterised query + `Projector`, which supports joins and aggregations | Connection saturation, per-row transaction overhead, WAL/MVCC churn from repeated updates |
+
+How each bundled sink classifies failures:
+
+| Sink | Transient (retried) | Permanent (dead-lettered) | Whole batch retried |
+|---|---|---|---|
+| `sink/docdb` | 11000 on `_id_` for an upsert (a race with another pod) | Any other write error, including 11000 on a business unique index | Write-concern error, network or context error |
+| `sink/dynamodb` | `UnprocessedItems`, context cancel/deadline | `Update` not a `map[string]any`, missing PK/SK attribute, marshal failure, duplicate key in the batch, a per-item `PutItem` failure after a `ValidationException` fallback | An unprocessed item that can't be mapped to a key; any other API error |
+| `sink/postgres` | Any other SQLSTATE | `23xxx`, `42P01`, `42703`, `21000`; a row whose columns differ from the batch's first row; a duplicate conflict key in the batch | A non-Postgres error (for example, a connection failure) |
+
+On a permanent multi-row error, `sink/postgres` retries the batch row by row, so only the bad rows are
+dead-lettered. On a batch-wide `ValidationException`, `sink/dynamodb` falls back to per-item `PutItem`
+calls for the same reason.
 
 `sluice` never creates tables or emits DDL. Your contracts define the data shape, and your migrations
 own the schema. The design RFCs for each adapter are in [`docs/issues/`](docs/issues)
@@ -523,6 +552,34 @@ type Source interface {
     Close(ctx context.Context) error
 }
 ```
+
+### Error classification for sinks
+
+The engine never infers success. A custom `FlushSink` must report every failure it knows about:
+
+- **Total failure:** return a non-nil `error` and nothing is committed. Use this when the sink can't
+  tell which keys failed.
+- **Per-key failure:** return a `sink.SinkError` in `BulkWriteResult.Errors` with the key's
+  `CorrelationKey` and a `Class`. An error with an empty `CorrelationKey` aborts the commit for the
+  whole batch (`sink.ErrUnattributedSinkError`).
+
+```go
+res.Errors = append(res.Errors, sink.SinkError{
+    CorrelationKey: m.CorrelationKey,
+    Code:           code,                // store-specific; optional
+    Class:          sink.ClassPermanent, // or sink.ClassTransient
+    Err:            err,
+})
+```
+
+| `Class` | Engine action |
+|---|---|
+| `ClassTransient` | The key stays dirty and is retried |
+| `ClassPermanent` | The key is dead-lettered as `permanent_sink_error` |
+| `ClassUnknown` (zero value) | Legacy behaviour: dead-lettered if `Code == 11000`, otherwise retried |
+
+`SinkError.IsPermanent()` implements this rule, and `sink.CheckAttribution(models, result)` is the
+same guard the engine runs.
 
 ---
 
@@ -683,10 +740,10 @@ make coverage           # HTML coverage report
 
 - **Event log** ([RFP #17](docs/issues/event-log.md), proposed): `WriteEvent`, which records *every*
   event exactly once alongside the coalesced state document. This is for reporting and growth analytics,
-  where each event is a fact. It also closes the sink attribution gaps noted in
-  [Durability model](#durability-model).
+  where each event is a fact. It builds on the sink error classification from RFP #18.
 - Design notes for shipped features: [bulk reader](docs/issues/bulkreader.md),
-  [local journal](docs/issues/local-journal.md), [Prometheus](docs/issues/prometheus.md).
+  [local journal](docs/issues/local-journal.md), [Prometheus](docs/issues/prometheus.md),
+  [sink silent-loss fixes](docs/issues/sink-silent-loss.md).
 
 Release history and breaking changes are in [CHANGELOG.md](CHANGELOG.md).
 
