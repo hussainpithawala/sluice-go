@@ -3,7 +3,7 @@
 **Status:** Proposed (revised 2026-09-29; the ledger store changes from bundled datastore adapters to an embedded Pebble store backed by object storage; earlier revision 2026-09-27 replaced the "second journal in the same Redis" draft)  
 **Target Release:** next minor after v1.0.8  
 **Dependencies:** RFP #18 (sink silent-loss fixes, merged), durability hardening in `[Unreleased]`, RFP #16 (Prometheus metrics). Sink-side version stamping is RFP #21 (§5.2).
- 
+
 ---
 
 ## 1. Context & Problem Statement
@@ -15,8 +15,9 @@ Upstream systems already cover every failure that **returns an error**:
 
 - **Synchronous hot writes** (mobile app, web) are retried by the client when `Write` fails.
 - **Asynchronous writes** (webhooks, SQS, Kafka) are redelivered when the consumer doesn't ack.
-  Since the durability hardening, `Write` returns nil only after the entry is journaled, so a failed
-  `Write` is always retried by someone. What upstream retries **cannot** cover is a loss *after* the ack:
+
+Since the durability hardening, `Write` returns nil only after the entry is journaled, so a failed
+`Write` is always retried by someone. What upstream retries **cannot** cover is a loss *after* the ack:
 
 | Silent loss after ack | Why no one retries |
 |---|---|
@@ -37,12 +38,13 @@ acknowledged, and let a reconciler compare it with the datastore.
 2. **It gated the write path.** A side feature could fail the primary write.
 3. **It was the most complex option**: a derived Shield, a second engine, an event DLQ that never
    expires, and a reordered `DrainAndClose`.
-   **Draft 2: bundled ledgers in DocumentDB, PostgreSQL and DynamoDB (revised 2026-09-27).** This fixed the
-   Redis dependency, but it put a per-key append stream on a datastore the operator then had to size,
-   index, partition and expire, and each adapter needed its own schema, idempotency and retention story.
-   The revised design keeps the ledger local and cheap to write (an embedded Pebble store) and uses
-   object storage only for durability and for cross-pod reads. There is one storage engine, one record
-   format and one conformance suite, instead of three datastore adapters.
+
+**Draft 2: bundled ledgers in DocumentDB, PostgreSQL and DynamoDB (revised 2026-09-27).** This fixed the
+Redis dependency, but it put a per-key append stream on a datastore the operator then had to size,
+index, partition and expire, and each adapter needed its own schema, idempotency and retention story.
+The revised design keeps the ledger local and cheap to write (an embedded Pebble store) and uses
+object storage only for durability and for cross-pod reads. There is one storage engine, one record
+format and one conformance suite, instead of three datastore adapters.
 
 ### 1.2 Not a reporting source
 
@@ -50,7 +52,7 @@ Recording every event for analytics (the coalescing problem: two events for one 
 window reach the store as one) is **not** a goal. Reporting should consume the stream or an
 analytics pipeline directly. The ledger records acknowledged state so that it can be verified and
 repaired.
- 
+
 ---
 
 ## 2. Goals
@@ -63,6 +65,9 @@ repaired.
 5. **Enough to correct.** After a Redis loss, a reconciler can find keys whose datastore state is
    behind an acknowledged write and replay them.
 6. **Durable on request.** In `Required` mode a record is in object storage before `Write` returns, so a pod crash after the ack loses nothing the caller was told was recorded.
+
+---
+
 ## 3. Non-Goals
 
 - Exactly-once recording of every event for reporting (§1.2).
@@ -71,6 +76,7 @@ repaired.
 - A datastore-side version guard (compare-and-set on the state document).
 - Stamping the version into datastore documents. That is RFP #21's sink-side stamping; this RFP only records and compares versions (§5.2).
 - Bundled datastore ledgers (DocumentDB, PostgreSQL, DynamoDB). Removed in this revision (§9).
+
 ---
 
 ## 4. Resolved Decisions
@@ -78,7 +84,7 @@ repaired.
 | Question | Decision |
 |---|---|
 | Where the ledger lives | An embedded **Pebble** store on each pod, with SSTables and (in `Required` mode) WAL segments in **object storage** behind a small `objstore.Storage` interface. Adapters: S3, GCS, Azure Blob, local filesystem. **Never Redis.** |
-| Escape hatch | `ledger.Func` is kept for forwarding records to Kafka, Firehose or raw S3. |
+| Escape hatch | `ledger.Func` is kept for forwarding records to Kafka, Firehose or raw S3. The consumer is responsible for its own idempotency; the natural dedup key is `(Namespace, CorrelationKey, Version)` for `LatestPerKey` or `(Namespace, CorrelationKey, EventID)` for `PerEvent`. |
 | What is recorded | Only **acknowledged** writes: those where `Write` returns nil, including degraded direct writes. |
 | Effect on `Write` | `BestEffort` (default): none. `Required` (opt-in): `Write` also waits for the record's WAL segment to be uploaded to object storage. |
 | Granularity | `LatestPerKey` (default): one record per key; within one ledger flush window a pod keeps only the latest, and Pebble compaction keeps the latest version. `PerEvent`: one record per write, never merged. |
@@ -91,7 +97,7 @@ repaired.
 
 `LatestPerKey` is the default because reconciliation only needs the latest acknowledged state per
 key. `PerEvent` keeps every write, so its storage grows with event volume rather than key count.
- 
+
 ---
 
 ## 5. Proposed Design
@@ -100,7 +106,7 @@ key. `PerEvent` keeps every write, so its storage grows with event volume rather
 
 ```go
 package ledger
- 
+
 type Record struct {
     Namespace      string
     CorrelationKey string
@@ -111,50 +117,54 @@ type Record struct {
     AckedAt        time.Time // pod clock when Write acknowledged; informational, not used for ordering
     Pod            string    // instance ID
 }
- 
+
 // Version orders writes to one key. Compare Epoch first, then Seq.
 type Version struct {
     Epoch int64 // ms timestamp of the write that created the key's current payload hash
     Seq   int64 // per-key sequence 'v' within that hash; 0 is reserved for degraded direct writes
 }
- 
+
 func (a Version) Less(b Version) bool
- 
+
 // Func adapts a function (e.g. a Kafka producer) to a record sink. Escape hatch only.
+// The function receives a batch of records and must handle its own idempotency.
+// The natural dedup key is (Namespace, CorrelationKey, Version) for LatestPerKey
+// or (Namespace, CorrelationKey, EventID) for PerEvent.
 type Func func(ctx context.Context, records []Record) error
- 
+
 type Mode int
 const (
     BestEffort Mode = iota // default
     Required
 )
- 
+
 type Granularity int
 const (
     LatestPerKey Granularity = iota // default
     PerEvent
 )
- 
+
 // Config is passed to WithLedger. Defaults are listed in §5.4 and §5.5.
 type Config struct {
-    Storage objstore.Storage // required: S3, GCS, Azure or FS adapter
-    Sync    SyncConfig       // Required mode only
+    Store  objstore.Storage // required: S3, GCS, Azure or FS adapter
+    PodID  string           // identifies this pod in object storage paths; default: hostname-random8
+    Sync   SyncConfig       // Required mode only
     // Mode, Granularity, FlushWindow, BatchSize, BufferSize, IncludePayload and
     // Retry are set through the LedgerOption values below.
 }
- 
+
 type SyncConfig struct {
-    SyncWindow    time.Duration // [10ms]
-    SyncBatchSize int           // [500]
-    SyncRetries   int           // [3]
-    SyncBackoff   time.Duration // [50ms], exponential
-    SyncTimeout   time.Duration
+    SyncWindow    time.Duration // max wait before object-store PUT [10ms]
+    SyncBatchSize int           // max records per PUT [500]
+    SyncRetries   int           // object-store PUT retries [3]
+    SyncBackoff   time.Duration // base backoff, exponential [50ms]
+    SyncTimeout   time.Duration // per-PUT timeout [5s]
 }
 ```
 
 ```go
 package objstore
- 
+
 // Storage is the only thing the ledger needs from a bucket.
 type Storage interface {
     // Put, Get (returns ErrNotFound), Delete (idempotent), List (ordered by key),
@@ -166,9 +176,9 @@ var ErrNotFound, ErrAlreadyClosed error
 
 ```go
 package sluice
- 
+
 func (b *Builder) WithLedger(cfg ledger.Config, opts ...LedgerOption) *Builder
- 
+
 // LedgerOptions (defaults in brackets):
 //   LedgerMode(m)             [BestEffort]
 //   LedgerGranularity(g)      [LatestPerKey]
@@ -177,12 +187,12 @@ func (b *Builder) WithLedger(cfg ledger.Config, opts ...LedgerOption) *Builder
 //   LedgerBufferSize(n)       [100_000]   records held in memory before BestEffort drops
 //   LedgerIncludePayload(b)   [true]      needed to correct, not just detect
 //   LedgerRetry(max, backoff)
- 
+
 // Write is unchanged. WriteWith is Write plus per-call options; with no
 // options it behaves exactly like Write.
 func (s *Sluice) WriteWith(ctx context.Context, key string, payload []byte, opts ...WriteOption) error
 func WithEventID(id string) WriteOption // stored as Record.EventID
- 
+
 var ErrLedgerUnavailable     = errors.New("sluice: ledger sync failed; the write is journaled but not durably ledgered")
 var ErrInvalidCorrelationKey = errors.New("sluice: correlation key is empty or contains a null byte")
 ```
@@ -196,14 +206,16 @@ recreated:
 - after a cold key's post-flush TTL (`KeyTTL`, default 30s) expires;
 - after hydration seeds a hash (hydration doesn't set `v`);
 - after Redis is lost, which is exactly the case reconciliation is for.
-  Comparing a ledger record's `v` with the store's `v` across one of these resets would call a stale
-  record "newer" and replay it. The fix is an **epoch**: the timestamp of the write that created the
-  current hash. The version is `(Epoch, Seq)`, compared lexicographically.
+
+Comparing a ledger record's `v` with the store's `v` across one of these resets would call a stale
+record "newer" and replay it. The fix is an **epoch**: the timestamp of the write that created the
+current hash. The version is `(Epoch, Seq)`, compared lexicographically.
 
 - **Within one hash lifetime**, `Seq` gives the exact arrival order, with no clock involved.
 - **Across lifetimes**, `Epoch` orders them. A hash is only recreated after it expires (at least
   `KeyTTL` after its last flush) or after a Redis loss, so consecutive epochs are far apart compared with clock skew between pods.
-  **Script changes** (internal only; this ships as Phase 0, independently of the ledger):
+
+**Script changes** (internal only; this ships as Phase 0, independently of the ledger):
 
 - `atomicWriteLua` and `atomicDedupWriteLua` add `HSETNX <hash> e <ts>` (one command) and return
   `{e, v}` instead of `1`. A deduplicated write still returns `0`.
@@ -219,10 +231,11 @@ recreated:
   directly only when nothing is pending for the key, so no journal version competes with it.
 - A `\x00` byte is rejected in correlation keys, next to the existing empty-key check, because the
   ledger key format (§5.4) uses it as a separator.
-  **Getting the version into the store.** This RFP does not add a versioned write contract. Stamping the
-  version into datastore documents is deferred to RFP #21 (sink-side stamping). Until then, reconciliation
-  compares versions only where a `VersionOf` can read one from the stored document, and otherwise falls back to a user-supplied
-  `VerifyContract` (§5.7).
+
+**Getting the version into the store.** This RFP does not add a versioned write contract. Stamping the
+version into datastore documents is deferred to RFP #21 (sink-side stamping). Until then, reconciliation
+compares versions only where a `VersionOf` can read one from the stored document, and otherwise falls back to a user-supplied
+`VerifyContract` (§5.7).
 
 ### 5.3 Write path
 
@@ -242,7 +255,7 @@ the version of the payload already in the journal.
 ### 5.4 Ledger store (Pebble) and writer
 
 **Record encoding.** A record is a 44-byte fixed header followed by its variable-length fields
-(namespace, correlation key, event ID, payload).
+(namespace, correlation key, event ID, pod, payload).
 
 **Key encoding.**
 
@@ -257,11 +270,13 @@ greatest `Version`. Under `PerEvent`, nothing is merged.
 
 **Store.** `ledger.Store` owns the Pebble lifecycle:
 
-- `Open` creates an ephemeral local WAL directory and opens Pebble with a `PebbleFactory` (in `objstore`)
-  that bridges `objstore.Storage` to Pebble's remote-storage interface, so SSTables live in object storage.
+- `Open` creates an ephemeral local WAL directory (`/tmp/sluice-ledger/{namespace}/{pod-id}/wal/`)
+  and opens Pebble with a `PebbleFactory` (in `objstore`) that bridges `objstore.Storage` to Pebble's
+  remote-storage interface, so SSTables live in object storage.
 - `WriteBatch` writes a slice of records as one atomic Pebble batch.
 - `Scan(namespace, from, to, fn)` iterates records in key order.
-  **Writer.** One writer per `Sluice` instance, in process:
+
+**Writer.** One writer per `Sluice` instance, in process:
 
 - A bounded buffer (`LedgerBufferSize`, default 100,000) and a flusher goroutine that drains it into
   Pebble every `LedgerFlushWindow` (1s), or sooner once `LedgerBatchSize` (1,000) records are waiting.
@@ -274,7 +289,8 @@ greatest `Version`. Under `PerEvent`, nothing is merged.
 - `Drain(ctx)` stops the flusher, does a final Pebble flush, triggers a best-effort compaction, and closes Pebble.
 - A **compaction monitor** goroutine tracks which WAL segments are covered by uploaded SSTables and
   deletes covered segments from object storage (a watermark: once compaction covers segment N, segments 1..N are removed).
-  **`Required` mode: WAL sync.** A sync goroutine makes each record durable before `Write` returns:
+
+**`Required` mode: WAL sync.** A sync goroutine makes each record durable before `Write` returns:
 
 - Required-mode records are collected in a sync buffer, each with a waiter channel.
 - Every `SyncWindow` (10ms) or `SyncBatchSize` (500) records, the batch is encoded as a segment and
@@ -284,10 +300,15 @@ greatest `Version`. Under `PerEvent`, nothing is merged.
   waiters are released with nil; when retries run out, they get `ErrLedgerUnavailable`.
 - Re-uploading a segment overwrites the same object, so a retry is idempotent.
 - `Drain` stops the sync goroutine only after the final segment is uploaded, then releases any remaining waiters.
-  **Lifecycle.** `WithLedger` opens Pebble in `Build`, validates object-store connectivity, and starts the
-  ledger goroutines on a context independent of `Build`'s. `DrainAndClose` stops accepting writes, closes
-  the sink, then drains the ledger, and closes the object store last. The ledger has no Redis dependency,
-  so the position of the Redis client close doesn't matter.
+
+**Lifecycle.** `WithLedger` opens Pebble in `Build`, validates object-store connectivity, and starts the
+ledger goroutines on a context independent of `Build`'s. `DrainAndClose` stops accepting writes, closes
+the sink, then drains the ledger, and closes the object store last. The ledger has no Redis dependency,
+so the position of the Redis client close doesn't matter.
+
+**Pod identity.** `Config.PodID` identifies this pod's prefix in object storage. If empty, it defaults
+to `{hostname}-{random8}`. Each pod writes exclusively under its own prefix; the reconciler reads
+across all pod prefixes.
 
 ### 5.5 Object storage
 
@@ -325,8 +346,9 @@ New `MetricsRecorder` methods (a breaking change for custom recorders, as with `
 - `RecordLedgerAppend(namespace string, records int, d time.Duration, err error)`
 - `RecordLedgerDrop(namespace, reason string, records int)`, where reason is `buffer_full`, `append_failed` or `shutdown_timeout`
 - `RecordLedgerBufferDepth(namespace string, depth int)`
-  `noopMetrics` and the Prometheus recorder are updated, and the Grafana dashboard
-  (`dashboards/sluice-overview.json`) gains a ledger panel.
+
+`noopMetrics` and the Prometheus recorder are updated, and the Grafana dashboard
+(`dashboards/sluice-overview.json`) gains a ledger panel.
 
 A reference alert fires on any non-zero `ledger_dropped_total`. That's a warning, not critical: a
 drop weakens the reconciliation's coverage but doesn't lose data by itself.
@@ -337,17 +359,17 @@ drop weakens the reconciliation's coverage but doesn't lose data by itself.
 // Extracts the version stored in a datastore document, if the document carries one.
 // ok is false for a document without a stamped version.
 type VersionOf func(stored []byte) (v ledger.Version, ok bool)
- 
+
 // Without one: decide from the document itself.
 type VerifyContract func(key string, rec ledger.Record, stored []byte) (Verdict, error)
- 
+
 type Verdict int
 const (
     InSync Verdict = iota
     Behind  // the store is older than rec: correct it
     Unknown // can't tell: report it, don't correct it
 )
- 
+
 type ReconcileOptions struct {
     From, To           time.Time
     VersionOf          VersionOf      // set this or Verify; VersionOf is preferred
@@ -359,7 +381,7 @@ type ReconcileOptions struct {
     CheckpointInterval time.Duration  // default 30s
     VerifyWorkers      int            // default 16
 }
- 
+
 type ReconcileResult struct {
     Checked   int64
     InSync    int64
@@ -370,7 +392,7 @@ type ReconcileResult struct {
     Pruned    int  // pod prefixes deleted
     Resumed   bool // true if resumed from a checkpoint
 }
- 
+
 func (s *Sluice) Reconcile(ctx context.Context, opts ReconcileOptions) (*ReconcileResult, error)
 ```
 
@@ -384,7 +406,8 @@ func (s *Sluice) Reconcile(ctx context.Context, opts ReconcileOptions) (*Reconci
    but not yet compacted (for example, after a pod crash) are still seen.
 3. **K-way merge** (`heap.go`). A min-heap across the pod iterators keeps the record with the greatest
    `Version` per key. Under `PerEvent`, events are grouped by key and the latest version per key is verified.
-   **Verify side.** The merge goroutine feeds a bounded channel drained by `VerifyWorkers` workers. For each key:
+
+**Verify side.** The merge goroutine feeds a bounded channel drained by `VerifyWorkers` workers. For each key:
 
 1. Skip records newer than `now - Settle`.
 2. Skip keys still pending in Redis (`HasPendingVersion`) when Redis is reachable. Those are unflushed, not lost. When Redis is unreachable this filter is skipped.
@@ -395,21 +418,29 @@ func (s *Sluice) Reconcile(ctx context.Context, opts ReconcileOptions) (*Reconci
 4. With `Correct`, re-`Write` the ledger payload for each `Behind` key. It goes through the journal,
    so ordering against new traffic follows normal latest-arrival semantics.
 5. Count `Checked`, `InSync`, `Behind`, `Corrected`, `Unknown` and `Skipped`, and record them as metrics.
-   **Checkpoints.** A run is resumable. The checkpoint (`{ns}/_reconcile/current.json`) holds `RunID`,
-   `LastKey`, `Phase`, the frozen pod list, running counters, `LockedBy` and `Heartbeat`. It is written every
-   `CheckpointEvery` keys or `CheckpointInterval`, whichever comes first.
+
+**Checkpoints.** A run is resumable. The checkpoint (`{ns}/_reconcile/current.json`) holds `RunID`,
+`LastKey`, `Phase`, the frozen pod list, running counters, `LockedBy` and `Heartbeat`. It is written every
+`CheckpointEvery` keys or `CheckpointInterval`, whichever comes first.
 
 - **Phases:** `PhaseMerge` → `PhaseVerify` → `PhasePrune`.
 - **Concurrent runs:** a second reconciler sees a fresh heartbeat and returns `ErrReconcileInProgress`.
   If the heartbeat is stale (twice the checkpoint interval), the second reconciler takes over and resumes from the checkpoint (`Resumed: true`).
 - **History:** a completed run's summary is written to `{ns}/_reconcile/history/{run_id}.json`.
-  **Pruning.** A pod's prefix is deleted (`DeletePrefix`) only when the pod has been stale for at least
-  `PruneStaleAfter` **and** every key read from it was verified as `InSync` or `Corrected`. One `Unknown`
-  or unverified key keeps the whole prefix.
+
+**Pruning.** A pod's prefix is deleted (`DeletePrefix`) only when the pod has been stale for at least
+`PruneStaleAfter` **and** every key read from it was verified as `InSync` or `Corrected`. One `Unknown`
+or unverified key keeps the whole prefix.
+
+**`PerEvent` retention.** Under `PerEvent`, storage grows with event volume rather than key count. The
+reconciler cleans up old records using `DeleteRange` over the time-prefixed key space: after
+reconciliation verifies all records in a time window, it issues a `DeleteRange` from the start of time
+to the retention cutoff (e.g. 7 days ago). The next Pebble compaction reclaims the space. Under
+`LatestPerKey`, compaction naturally drops superseded records, so no explicit cleanup is needed.
 
 `Reconcile` is a one-shot call, like `ProcessDLQ`. Schedule it yourself (a ticker, Asynq, a cron
 job), typically after a Redis incident or on a slow periodic cadence.
- 
+
 ---
 
 ## 6. Implementation Plan
@@ -454,7 +485,8 @@ Ships independently. Prerequisite for the ledger (this RFP) and for RFP #21. No 
 - Degraded direct writes produce `{Epoch: now, Seq: 0}`; document that `Seq: 0` is reserved for them.
 - `\x00` rejected in correlation keys at `Write`/`WriteIdempotent` validation, alongside the empty-key check.
 - Does **not** include a versioned write contract: deferred to RFP #21's sink-side stamping.
-  Files:
+
+Files:
 
 ```
 ledger/version.go              NEW  — Version type, Less
@@ -473,7 +505,8 @@ No Pebble, no ledger logic. Pure storage abstraction.
 - `ledger/objstore/helpers.go`: `DeletePrefix`, `PutBytes`, `GetBytes`.
 - `ledger/objstore/pebble.go`: `PebbleFactory`, the bridge to Pebble's `remote.StorageFactory`.
 - Four adapters (§5.5) and the shared conformance suite.
-  Files:
+
+Files:
 
 ```
 ledger/objstore/
@@ -496,7 +529,8 @@ The core storage engine. `BestEffort` mode only; no object-store WAL sync yet.
 - `ledger/store.go`: `Open`, `Close`, `WriteBatch`, `Scan`.
 - `ledger/writer.go`: bounded buffer, flusher, `LatestPerKey` dedup, `Enqueue`, `Drain`.
 - Compaction monitor: tracks SSTable coverage and deletes covered WAL segments from object storage via a watermark.
-  Files:
+
+Files:
 
 ```
 ledger/
@@ -516,7 +550,8 @@ Builds on Phase 2. Adds synchronous durability.
 - `ledger/sync.go`: sync goroutine and segment encoding (§5.4).
 - `ledger/writer.go`: `Enqueue` in `Required` mode writes to Pebble, enqueues to the sync buffer, and blocks on the waiter; `Drain` stops the sync goroutine after the final segment is uploaded.
 - `SyncConfig` added to `ledger.Config`.
-  Files:
+
+Files:
 
 ```
 ledger/
@@ -532,7 +567,8 @@ Wires the ledger into sluice's public API and lifecycle.
 - `sluice.go`: `WithLedger(ledger.Config)`; `Build` opens Pebble, validates object-store connectivity and starts the ledger goroutines on a context independent of `Build`'s; `DrainAndClose` drains the ledger after the sink closes and closes the object store last; `Write`/`WriteIdempotent` capture the version from the script return and enqueue after journal success; `WriteWith` and `WithEventID`.
 - `types.go`: `Sluice` gains `ledgerWriter`, `ledgerDB`, `objStore`; `Builder` gains `ledgerCfg`; the `LedgerOption` types (`LedgerMode`, `LedgerGranularity`, `LedgerFlushWindow`, `LedgerBatchSize`, `LedgerBufferSize`, `LedgerIncludePayload`, `LedgerRetry`), `WriteOption`, `WithEventID`, `ErrLedgerUnavailable`.
 - Metrics (§5.6): the three new `MetricsRecorder` methods, `noopMetrics`, the Prometheus recorder, and the Grafana ledger panel.
-  Files:
+
+Files:
 
 ```
 sluice.go                              — WithLedger, Build, DrainAndClose, Write, WriteWith
@@ -568,6 +604,7 @@ sluice.go                     — Reconcile method on Sluice
 - README: "Event ledger and reconciliation" section.
 - CHANGELOG: breaking note (`MetricsRecorder` gains ledger methods) and the new features.
 - Update `docs/issues/event-log.md` status from Proposed to Implemented, noting the design changes (Pebble + object storage replaces the bundled ledger adapters).
+
 ---
 
 ## 7. Success Criteria / Test Plan
@@ -580,7 +617,7 @@ sluice.go                     — Reconcile method on Sluice
 | Version is arrival order | 200 concurrent writes to one key: the returned versions are distinct and totally ordered; the journal holds the greatest. |
 | Pre-versioning hash | A hash with `v` but no `e` gets `e` on its next write; `Seq` continues. |
 | Degraded write version | A degraded direct write produces `{Epoch: now, Seq: 0}`. |
-| Null byte rejection | `Write("key\\x00bad", payload)` returns `ErrInvalidCorrelationKey`. |
+| Null byte rejection | `Write("key\x00bad", payload)` returns `ErrInvalidCorrelationKey`. |
 
 ### Phase 1: object storage (every adapter passes `RunConformance`)
 
@@ -650,7 +687,8 @@ sluice.go                     — Reconcile method on Sluice
 | Frozen pod list | A new pod starts mid-reconciliation: it is not included in the current run and is picked up by the next. |
 | Dead pod pruning | A dead pod's keys are all `InSync`: its prefix is deleted. One key `Unknown`: the prefix is preserved. |
 | `PerEvent` reconciliation | 500 events across 3 pods, grouped by key: the latest version per key is verified. |
- 
+| `PerEvent` retention cleanup | After reconciliation, a `DeleteRange` over records older than the retention cutoff removes them; the next compaction reclaims space. |
+
 ---
 
 ## 8. Known Limits
@@ -681,6 +719,9 @@ sluice.go                     — Reconcile method on Sluice
    mode, WAL segment PUTs, rather than one request per record. `PerEvent` storage grows with event
    volume. To keep an async path out of the ledger entirely, run it on an instance without `WithLedger`.
 8. **Breaking change.** `MetricsRecorder` gains three methods; custom recorders must implement them.
+
+---
+
 ## 9. Decisions Log
 
 Resolved 2026-09-27:
@@ -691,7 +732,8 @@ Resolved 2026-09-27:
    no real compute and doesn't undo coalescing. Because `v` restarts when a hash is recreated, it is
    paired with a hash-creation epoch.
 3. **A ledgered instance records all writes.** Enabling the ledger is an instance-level decision, not a per-call choice.
-   Resolved 2026-09-29:
+
+Resolved 2026-09-29:
 
 4. **Pebble on object storage replaces the bundled ledgers.** `ledger/docdb`, `ledger/postgres`,
    `ledger/dynamodb`, the `ledger.Ledger` interface and `ledger.Reader` are removed. Reads go through
@@ -706,3 +748,6 @@ Resolved 2026-09-27:
 8. **Correlation keys may not contain `\x00`**, because it separates the namespace and key in the ledger key encoding.
 9. **The reconciler is resumable and prunes dead pods**: checkpointed in object storage, protected by a heartbeat lock, with a frozen pod list per run.
 10. **Crash window changes.** Was: up to `LedgerFlushWindow` of in-memory records. Now: `BestEffort` is bounded by compaction cadence; `Required` is effectively zero from the caller's perspective.
+11. **`ledger.Func` idempotency is the consumer's responsibility.** The natural dedup key is `(Namespace, CorrelationKey, Version)` for `LatestPerKey` or `(Namespace, CorrelationKey, EventID)` for `PerEvent`.
+12. **`PerEvent` retention** is handled by the reconciler via `DeleteRange` over old time-prefixed keys, not by a per-backend TTL mechanism.
+13. **`Config.PodID`** identifies the pod's object-storage prefix. Defaults to `{hostname}-{random8}` when empty.

@@ -116,8 +116,26 @@ full pod, a reader-only gateway, a bulk pre-warmer or a write-only ingester. See
 ## Install
 
 ```bash
-go get github.com/hussainpithawala/sluice-go@latest
+go get github.com/hussainpithawala/sluice-go@v1.0.8
 ```
+
+### Upgrading to 1.0.8
+
+1.0.8 contains breaking changes. Check these before you upgrade:
+
+| Change | What to do |
+|---|---|
+| `HotLoad(ctx, key)` now returns only `error` and hydrates in the background | Call `Read` after `HotLoad` if you need the payload right away |
+| `source.Source` gains `ReadBulk` | Add `ReadBulk` to custom `Source` implementations |
+| `MetricsRecorder` gains `RecordUnflushedExpiry` | Add it to custom recorders, and alert on any non-zero count |
+| `ErrMissingContract` is renamed `ErrMissingWriteContract` | Update `errors.Is` checks |
+| `Build()` no longer requires `Sink` or `WriteContract` | Handle `ErrMissingSink` / `ErrMissingWriteContract` from write-path methods |
+| Degraded mode refuses writes that could be reordered (`ErrDegradedWriteUnsafe`), including during a full Redis outage | Retry these writes, and don't ack them upstream |
+| `KeyTTL` is now the post-flush TTL for cold payloads, not a TTL on unflushed writes | Unflushed writes no longer expire, so size Redis for your worst-case backlog and run it with `noeviction` |
+| Examples moved to `examples/<scenario>/<adapter>/` | Update any paths or scripts that use them |
+
+`ReadOld` is deprecated. Use `Read`, or `ReadFresh` when you need strict consistency. The full list is
+in [CHANGELOG.md](CHANGELOG.md#108---2026-10-03).
 
 ## Quickstart
 
@@ -480,7 +498,7 @@ writes across node loss. The bundled `docker-compose.yml` runs Redis with `noevi
 `appendfsync everysec`.
 
 The sink-level silent-loss paths found during the event-log review have been closed. The design and
-test plan are in [RFP #19](docs/issues/sink-silent-loss.md).
+test plan are in [RFP #18](docs/issues/sink-silent-loss.md).
 
 ---
 
@@ -738,11 +756,11 @@ make coverage           # HTML coverage report
 
 ## Roadmap
 
-- **Event ledger and reconciliation** ([RFP #18](docs/issues/event-log.md), proposed): an opt-in
-  record of acknowledged writes, kept outside Redis, plus a `Reconcile` job that finds and repairs
-  keys whose datastore state is behind what was acknowledged (for example, after losing Redis). By
-  default it never affects `Write`'s result.
-- **Strict mode** ([RFP #21](docs/issues/strict-mode.md), proposed): payment-grade namespaces, with
+- **Event ledger and reconciliation** ([RFP #17](docs/issues/event-log.md), proposed): an opt-in
+  record of acknowledged writes, kept outside Redis in an embedded Pebble store backed by object
+  storage. A `Reconcile` job uses it to find and repair keys whose datastore state is behind what was
+  acknowledged (for example, after losing Redis). By default it never affects `Write`'s result.
+- **Strict mode** ([RFP #19](docs/issues/strict-mode.md), proposed): payment-grade namespaces, with
   durable acknowledgement (`WAIT`/`WAITAOF` or a durable store such as MemoryDB), conditional writes
   (`WriteIf`) and no silent expiry. It also adds a store-side version guard, available to every
   namespace, which stops an older flush from overwriting a newer version in the store.
