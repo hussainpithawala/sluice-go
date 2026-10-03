@@ -9,7 +9,7 @@ before:
 
 builds:
   - id: sluice-example-nudge
-    main: ./examples/nudge/main.go
+    main: ./examples/nudge/documentdb/main.go
     binary: sluice-example-nudge
     goos: [linux, darwin, windows]
     goarch: [amd64, arm64]
