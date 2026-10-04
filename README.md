@@ -15,6 +15,7 @@
 One library and one state plane work with any datastore. First-class adapters exist for **AWS DocumentDB / MongoDB**,
 **AWS DynamoDB**, and **PostgreSQL**.
 
+[Architectural deep-dive into 🌊 sluice](https://hussainpithawala.github.io/sluice/deep-dive.html)
 ---
 
 ## Why a velocity platform
@@ -773,3 +774,6 @@ Release history and breaking changes are in [CHANGELOG.md](CHANGELOG.md).
 ## License
 
 MIT; see [LICENSE](LICENSE).
+
+### Author @ LinkedIn: [Hussain Pithawala](https://www.linkedin.com/in/hussainpithawala/) 
+### Portfolio: [https://hussainpithawala.github.io](https://hussainpithawala.github.io/)
