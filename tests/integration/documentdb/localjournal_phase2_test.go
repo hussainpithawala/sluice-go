@@ -20,9 +20,9 @@ import (
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"go.mongodb.org/mongo-driver/bson"
-	"go.mongodb.org/mongo-driver/mongo"
-	"go.mongodb.org/mongo-driver/mongo/options"
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
 
 const defaultMongoUrl = "mongodb://localhost:27017"
@@ -80,7 +80,8 @@ func buildRealTestSluice(t *testing.T, sluiceNamespace string, dbSuffix string, 
 
 	readContract := func(correlationKey string) (*source.ReadModel, error) {
 		return &source.ReadModel{
-			Filter: bson.D{{Key: "_id", Value: correlationKey}},
+			Filter:  bson.D{{Key: "_id", Value: correlationKey}},
+			Options: options.Find().SetLimit(100).SetBatchSize(50),
 		}, nil
 	}
 
@@ -218,7 +219,7 @@ func TestHotLoad_EmitsSeedBroadcast(t *testing.T) {
 	// ── Clean slate: drop the database before seeding ──────────────────────
 	// This ensures the test is idempotent even if a previous run crashed
 	// before cleanup, or if tests are re-run without dropping the DB.
-	tempClient, err := mongo.Connect(ctx, options.Client().ApplyURI(mongoURI))
+	tempClient, err := mongo.Connect(options.Client().ApplyURI(mongoURI))
 	require.NoError(t, err)
 	require.NoError(t, tempClient.Database(dbName).Drop(ctx))
 	_ = tempClient.Disconnect(ctx)
@@ -240,7 +241,10 @@ func TestHotLoad_EmitsSeedBroadcast(t *testing.T) {
 		}, nil
 	}
 	readContract := func(correlationKey string) (*source.ReadModel, error) {
-		return &source.ReadModel{Filter: bson.D{{Key: "_id", Value: correlationKey}}}, nil
+		return &source.ReadModel{
+			Filter:  bson.D{{Key: "_id", Value: correlationKey}},
+			Options: options.Find().SetLimit(100).SetBatchSize(50),
+		}, nil
 	}
 
 	redisClient := redis.NewClient(&redis.Options{Addr: l1RedisAddr(), DB: l1TestDB})

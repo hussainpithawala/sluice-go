@@ -35,10 +35,10 @@ import (
 	docdbsink "github.com/hussainpithawala/sluice-go/sink/docdb"
 	"github.com/hussainpithawala/sluice-go/source"
 	docdbsource "github.com/hussainpithawala/sluice-go/source/docdb"
-	"go.mongodb.org/mongo-driver/bson"
-	"go.mongodb.org/mongo-driver/mongo"
-	"go.mongodb.org/mongo-driver/mongo/options"
-	"go.mongodb.org/mongo-driver/mongo/readpref"
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
+	"go.mongodb.org/mongo-driver/v2/mongo/readpref"
 )
 
 var (
@@ -88,7 +88,8 @@ func nudgeWriteContract(correlationKey string, rawPayload []byte) (*sluice.Write
 // ReadContract translates a correlation key into a MongoDB filter.
 func nudgeReadContract(correlationKey string) (*source.ReadModel, error) {
 	return &source.ReadModel{
-		Filter: bson.M{"_id": correlationKey},
+		Filter:  bson.M{"_id": correlationKey},
+		Options: options.Find().SetLimit(100).SetBatchSize(50),
 	}, nil
 }
 
@@ -337,7 +338,7 @@ func run(log *slog.Logger) (err error) {
 		SetConnectTimeout(10 * time.Second).
 		SetServerSelectionTimeout(5 * time.Second)
 
-	mongoClient, err := mongo.Connect(ctx, clientOpts)
+	mongoClient, err := mongo.Connect(clientOpts)
 	if err != nil {
 		return fmt.Errorf("connect to documentdb: %w", err)
 	}

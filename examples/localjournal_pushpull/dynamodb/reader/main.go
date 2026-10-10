@@ -41,6 +41,7 @@ import (
 	dynsink "github.com/hussainpithawala/sluice-go/sink/dynamodb"
 	"github.com/hussainpithawala/sluice-go/source"
 	dynsource "github.com/hussainpithawala/sluice-go/source/dynamodb"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
 
 // ─── Shared constants (must match writer) ───────────────────────────────────
@@ -84,7 +85,8 @@ func nudgeWriteContract(ck string, raw []byte) (*sluice.WriteModel, error) {
 
 func nudgeReadContract(ck string) (*source.ReadModel, error) {
 	return &source.ReadModel{
-		Filter: map[string]any{"PK": ck},
+		Filter:  map[string]any{"PK": ck},
+		Options: options.Find().SetLimit(100).SetBatchSize(50),
 	}, nil
 }
 

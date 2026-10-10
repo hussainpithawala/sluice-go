@@ -15,7 +15,7 @@ import (
 	sluice "github.com/hussainpithawala/sluice-go"
 	"github.com/segmentio/kafka-go"
 	"github.com/stretchr/testify/require"
-	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/v2/bson"
 )
 
 type kafkaEvent struct {

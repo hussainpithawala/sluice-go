@@ -55,6 +55,7 @@ import (
 	"github.com/hussainpithawala/sluice-go/source"
 	dynsource "github.com/hussainpithawala/sluice-go/source/dynamodb"
 	"github.com/redis/go-redis/v9"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
 
 var (
@@ -101,7 +102,8 @@ func nudgeWriteContract(correlationKey string, rawPayload []byte) (*sluice.Write
 // nudgeReadContract translates a correlation key into a DynamoDB GetItem Key.
 func nudgeReadContract(correlationKey string) (*source.ReadModel, error) {
 	return &source.ReadModel{
-		Filter: map[string]any{"PK": correlationKey},
+		Filter:  map[string]any{"PK": correlationKey},
+		Options: options.Find().SetLimit(100).SetBatchSize(50),
 	}, nil
 }
 
