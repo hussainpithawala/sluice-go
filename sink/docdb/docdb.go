@@ -9,9 +9,9 @@ import (
 	"time"
 
 	"github.com/hussainpithawala/sluice-go/sink"
-	"go.mongodb.org/mongo-driver/mongo"
-	"go.mongodb.org/mongo-driver/mongo/options"
-	"go.mongodb.org/mongo-driver/mongo/readpref"
+	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
+	"go.mongodb.org/mongo-driver/v2/mongo/readpref"
 )
 
 // Config holds connection parameters for DocumentDB or MongoDB.
@@ -59,7 +59,7 @@ func New(ctx context.Context, cfg Config) (*Sink, error) {
 		SetConnectTimeout(cfg.ConnectTimeout).
 		SetServerSelectionTimeout(cfg.ServerSelectionTimeout)
 
-	client, err := mongo.Connect(ctx, opts)
+	client, err := mongo.Connect(opts)
 	if err != nil {
 		return nil, fmt.Errorf("sluice/documentdb: connect: %w", err)
 	}
@@ -164,7 +164,7 @@ func (s *Sink) Write(ctx context.Context, model sink.WriteModel) error {
 	upsert := model.Upsert
 	_, err := s.collection.UpdateOne(
 		ctx, model.Filter, model.Update,
-		options.Update().SetUpsert(upsert),
+		options.UpdateOne().SetUpsert(upsert),
 	)
 	if err != nil {
 		return fmt.Errorf("sluice/documentdb: single write: %w", err)

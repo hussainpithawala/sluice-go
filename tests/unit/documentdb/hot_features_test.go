@@ -12,9 +12,9 @@ import (
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"go.mongodb.org/mongo-driver/bson"
-	"go.mongodb.org/mongo-driver/mongo"
-	"go.mongodb.org/mongo-driver/mongo/options"
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
 
 	sluice "github.com/hussainpithawala/sluice-go"
 	"github.com/hussainpithawala/sluice-go/internal/shield"
@@ -51,7 +51,8 @@ func hotContract(key string, payload []byte) (*sluice.WriteModel, error) {
 func hotReadContract() sluice.ReadContract {
 	return func(key string) (*source.ReadModel, error) {
 		return &source.ReadModel{
-			Filter: bson.M{"_id": key},
+			Filter:  bson.M{"_id": key},
+			Options: options.Find().SetLimit(100).SetBatchSize(50),
 		}, nil
 	}
 }
@@ -81,7 +82,7 @@ func mustHotPayload(t *testing.T, value, channel string, priority int) []byte {
 // scoped to the hot-features unit tests.
 func mongoCollectionForHotTest(t *testing.T, name string) *mongo.Collection {
 	t.Helper()
-	client, err := mongo.Connect(context.Background(), options.Client().ApplyURI(testMongoURI))
+	client, err := mongo.Connect(options.Client().ApplyURI(testMongoURI))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = client.Disconnect(context.Background()) })
 	coll := client.Database(testDatabase).Collection(name)

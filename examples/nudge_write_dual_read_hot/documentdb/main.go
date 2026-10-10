@@ -38,6 +38,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
 
 	sluice "github.com/hussainpithawala/sluice-go"
 	"github.com/hussainpithawala/sluice-go/internal/localjournal"
@@ -46,7 +47,7 @@ import (
 	"github.com/hussainpithawala/sluice-go/sink/docdb"
 	"github.com/hussainpithawala/sluice-go/source"
 	sourcedocdb "github.com/hussainpithawala/sluice-go/source/docdb"
-	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/v2/bson"
 )
 
 var (
@@ -87,7 +88,8 @@ func nudgeWriteContract(crn string, rawPayload []byte) (*sluice.WriteModel, erro
 // ─── ReadContract (unified read — used by both HotLoad and cold fallback) ────
 func nudgeReadContract(crn string) (*source.ReadModel, error) {
 	return &source.ReadModel{
-		Filter: bson.D{{Key: "_id", Value: crn}},
+		Filter:  bson.D{{Key: "_id", Value: crn}},
+		Options: options.Find().SetLimit(100).SetBatchSize(50),
 	}, nil
 }
 

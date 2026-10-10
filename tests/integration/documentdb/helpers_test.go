@@ -15,9 +15,9 @@ import (
 	"github.com/hussainpithawala/sluice-go/source"
 	sourcedocdb "github.com/hussainpithawala/sluice-go/source/docdb"
 	"github.com/stretchr/testify/require"
-	"go.mongodb.org/mongo-driver/bson"
-	"go.mongodb.org/mongo-driver/mongo"
-	"go.mongodb.org/mongo-driver/mongo/options"
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
 
 func redisAddr() string   { return getEnv("REDIS_ADDR", "localhost:6379") }
@@ -87,7 +87,7 @@ func buildIntegrationSluice(t *testing.T, namespace string) (*sluice.Sluice, *do
 
 func mongoCollection(t *testing.T, namespace string) *mongo.Collection {
 	t.Helper()
-	client, err := mongo.Connect(context.Background(), options.Client().ApplyURI(mongoURI()))
+	client, err := mongo.Connect(options.Client().ApplyURI(mongoURI()))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = client.Disconnect(context.Background()) })
 	return client.Database("sluice_integration").Collection(namespace)
@@ -153,7 +153,8 @@ func buildHotIntegrationSluice(t *testing.T, namespace string) (*sluice.Sluice, 
 func inventoryReadContract() sluice.ReadContract {
 	return func(correlationKey string) (*source.ReadModel, error) {
 		return &source.ReadModel{
-			Filter: bson.M{"_id": correlationKey},
+			Filter:  bson.M{"_id": correlationKey},
+			Options: options.Find().SetLimit(100).SetBatchSize(50),
 		}, nil
 	}
 }

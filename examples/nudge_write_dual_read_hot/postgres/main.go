@@ -36,6 +36,7 @@ import (
 	pgsource "github.com/hussainpithawala/sluice-go/source/postgres"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
 
 var (
@@ -110,6 +111,7 @@ func nudgeReadContract(correlationKey string) (*source.ReadModel, error) {
 				return payload, nil
 			},
 		},
+		Options: options.Find().SetLimit(100).SetBatchSize(50),
 	}, nil
 }
 

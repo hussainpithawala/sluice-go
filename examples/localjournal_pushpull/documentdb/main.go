@@ -50,9 +50,9 @@ import (
 	"github.com/hussainpithawala/sluice-go/source"
 	sourcedocdb "github.com/hussainpithawala/sluice-go/source/docdb"
 	"github.com/redis/go-redis/v9"
-	"go.mongodb.org/mongo-driver/bson"
-	"go.mongodb.org/mongo-driver/mongo"
-	"go.mongodb.org/mongo-driver/mongo/options"
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
 
 var (
@@ -95,7 +95,8 @@ func nudgeWriteContract(correlationKey string, rawPayload []byte) (*sluice.Write
 
 func nudgeReadContract(correlationKey string) (*source.ReadModel, error) {
 	return &source.ReadModel{
-		Filter: bson.M{"_id": correlationKey},
+		Filter:  bson.M{"_id": correlationKey},
+		Options: options.Find().SetLimit(100).SetBatchSize(50),
 	}, nil
 }
 
@@ -191,7 +192,7 @@ func buildPod(ctx context.Context, tag string, mongoURI string, redisAddrs []str
 	}
 
 	// ── Source (read path for ReadContract / HotLoad / cold fallback) ────
-	readClient, err := mongo.Connect(ctx, options.Client().ApplyURI(mongoURI))
+	readClient, err := mongo.Connect(options.Client().ApplyURI(mongoURI))
 	if err != nil {
 		_ = sk.Close(context.Background())
 		return nil, nil, fmt.Errorf("connect read client: %w", err)

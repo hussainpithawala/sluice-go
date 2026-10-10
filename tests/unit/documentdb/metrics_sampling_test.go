@@ -10,7 +10,7 @@ import (
 	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo"
 
 	sluice "github.com/hussainpithawala/sluice-go"
 	sluiceprom "github.com/hussainpithawala/sluice-go/metrics/prometheus"

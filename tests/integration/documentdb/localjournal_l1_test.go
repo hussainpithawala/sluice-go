@@ -20,7 +20,8 @@ import (
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
 
 // ── Test Doubles ────────────────────────────────────────────────────────────
@@ -159,7 +160,8 @@ func buildTestSluice(t *testing.T, namespace string, mode localjournal.LocalCach
 
 	readContract := func(correlationKey string) (*source.ReadModel, error) {
 		return &source.ReadModel{
-			Filter: bson.D{{Key: "_id", Value: correlationKey}},
+			Filter:  bson.D{{Key: "_id", Value: correlationKey}},
+			Options: options.Find().SetLimit(100).SetBatchSize(50),
 		}, nil
 	}
 
