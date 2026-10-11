@@ -18,6 +18,12 @@ linters:
     - misspell
     - prealloc
     - whitespace
+  exclusions:
+    rules:
+      # Repeated literals in tests are fixtures; hoisting them hurts readability.
+      - path: _test\.go
+        linters:
+          - goconst
 
 
 issues:

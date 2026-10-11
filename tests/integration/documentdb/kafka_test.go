@@ -69,7 +69,7 @@ func ensureKafkaTopic(t *testing.T, topic string, partitions int) {
 	t.Helper()
 	conn, err := kafka.Dial("tcp", kafkaBroker())
 	require.NoError(t, err)
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	err = conn.CreateTopics(kafka.TopicConfig{
 		Topic:             topic,
@@ -87,7 +87,7 @@ func ensureKafkaTopic(t *testing.T, topic string, partitions int) {
 		if dialErr != nil {
 			return false
 		}
-		defer c.Close()
+		defer func() { _ = c.Close() }()
 		parts, readErr := c.ReadPartitions(topic)
 		return readErr == nil && len(parts) >= partitions
 	}, 30*time.Second, 500*time.Millisecond, "topic %s not ready with %d partitions", topic, partitions)

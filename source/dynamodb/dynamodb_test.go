@@ -126,7 +126,7 @@ func TestDynamoDBSource_ReadBulk_Success(t *testing.T) {
 				},
 			},
 			Projector: func(items []map[string]types.AttributeValue) ([]source.BulkReadResult, error) {
-				var results []source.BulkReadResult
+				results := make([]source.BulkReadResult, 0, len(items))
 				for _, item := range items {
 					var sk string
 					var name string

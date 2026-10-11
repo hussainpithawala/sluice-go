@@ -19,6 +19,7 @@ type WriteModel struct {
 	Filter         interface{}
 	Update         interface{}
 	Upsert         bool
+	Many           bool // When true, the sink applies UpdateMany / multi-row UPDATE.
 }
 
 // BulkWriteResult carries the outcome of a sink BulkWrite call.
