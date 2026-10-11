@@ -31,14 +31,11 @@ func newLocalStackSQS(t *testing.T) *sqs.Client {
 	cfg, err := config.LoadDefaultConfig(context.Background(),
 		config.WithRegion("us-east-1"),
 		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider("test", "test", "")),
-		config.WithEndpointResolverWithOptions(aws.EndpointResolverWithOptionsFunc(
-			func(service, region string, opts ...interface{}) (aws.Endpoint, error) {
-				return aws.Endpoint{URL: sqsEndpoint(), HostnameImmutable: true}, nil
-			},
-		)),
 	)
 	require.NoError(t, err)
-	return sqs.NewFromConfig(cfg)
+	return sqs.NewFromConfig(cfg, func(o *sqs.Options) {
+		o.BaseEndpoint = aws.String(sqsEndpoint())
+	})
 }
 
 func createSQSQueue(t *testing.T, client *sqs.Client, name string) string {

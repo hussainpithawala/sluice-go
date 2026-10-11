@@ -88,6 +88,7 @@ func TestWriteIdempotent_ExactlyOnce(t *testing.T) {
 
 	// Different idempotency key succeeds
 	err = sl.WriteIdempotent(ctx, correlationKey, payload, fmt.Sprintf("kafka_offset_100_%s", t.Name()))
+	require.NoError(t, err)
 
 	// Only 1 document should exist in Mongo despite 2 calls
 	n := countDocs(t, coll, bson.M{"_id": correlationKey})

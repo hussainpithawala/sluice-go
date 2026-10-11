@@ -523,7 +523,7 @@ func (s *Sluice) ReadFresh(ctx context.Context, correlationKey string) ([]byte, 
 // ReadOld returns current state from the journal.
 // Hot correlation_key: sub-millisecond Redis read with lazy TTL refresh.
 // Cold correlation_key: falls back to the configured Source via ReadContract.
-// ReadOld returns current state from the journal.
+//
 // Deprecated: Superseded by the new tiered Read() method.
 func (s *Sluice) ReadOld(ctx context.Context, correlationKey string) ([]byte, error) {
 	if s.closed.Load() {

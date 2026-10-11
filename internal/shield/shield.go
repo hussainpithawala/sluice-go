@@ -16,6 +16,12 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
+// Sorted-set score bounds for ZRANGEBYSCORE queries.
+const (
+	scoreNegInf = "-inf"
+	scorePosInf = "+inf"
+)
+
 // New initialises the Redis client and validates connectivity.
 func New(cfg RedisConfig, namespace string, bandCount int, keyTTL time.Duration, activityWindow time.Duration) (*Shield, error) {
 	if strings.ContainsAny(namespace, "{}") {
@@ -492,7 +498,7 @@ func (s *Shield) DrainBand(ctx context.Context, band, maxBatch int) ([]FlushReco
 	dirtyKey := s.dirtyKeyForBand(band)
 
 	members, err := s.client.ZRangeByScoreWithScores(ctx, dirtyKey, &redis.ZRangeBy{
-		Min: "-inf", Max: "+inf", Offset: 0, Count: int64(maxBatch),
+		Min: scoreNegInf, Max: scorePosInf, Offset: 0, Count: int64(maxBatch),
 	}).Result()
 	if err != nil {
 		return nil, fmt.Errorf("sluice/shield: zrangebyscore band %d: %w", band, err)
@@ -681,7 +687,7 @@ func (s *Shield) DrainDLQ(ctx context.Context, band, maxBatch int) ([]FlushRecor
 	dlqKey := s.dlqKey(band)
 
 	members, err := s.client.ZRangeByScoreWithScores(ctx, dlqKey, &redis.ZRangeBy{
-		Min: "-inf", Max: "+inf", Offset: 0, Count: int64(maxBatch),
+		Min: scoreNegInf, Max: scorePosInf, Offset: 0, Count: int64(maxBatch),
 	}).Result()
 	if err != nil {
 		return nil, fmt.Errorf("sluice/shield: zrangebyscore dlq band %d: %w", band, err)

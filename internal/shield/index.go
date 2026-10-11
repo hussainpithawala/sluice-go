@@ -189,7 +189,7 @@ func (s *Shield) PruneExpiredIndexes(ctx context.Context, band int, now time.Tim
 	expKey := IndexExpiryKey(s.namespace, band)
 	nowMs := now.UnixMilli()
 	due, err := s.client.ZRangeByScore(ctx, expKey, &redis.ZRangeBy{
-		Min: "-inf", Max: fmt.Sprintf("%d", nowMs), Count: int64(batch),
+		Min: scoreNegInf, Max: fmt.Sprintf("%d", nowMs), Count: int64(batch),
 	}).Result()
 	if err != nil || len(due) == 0 {
 		return 0, 0, err

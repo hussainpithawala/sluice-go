@@ -89,11 +89,10 @@ func TestDynamoDBSink_BulkWrite_MixedManyAndValid(t *testing.T) {
 	// We expect a panic when it tries to use the nil client for the Many:false model.
 	// But we want to verify the Many:true model was rejected FIRST.
 	defer func() {
-		if r := recover(); r != nil {
-			// Expected panic due to nil client for the valid model.
-			// The test passes if we reached this point, meaning the Many:true
-			// model was successfully added to preErrors before the panic.
-		}
+		// Expected panic due to nil client for the valid model.
+		// The test passes if we reached this point, meaning the Many:true
+		// model was successfully added to preErrors before the panic.
+		_ = recover()
 	}()
 
 	result, err := s.BulkWrite(ctx, models)

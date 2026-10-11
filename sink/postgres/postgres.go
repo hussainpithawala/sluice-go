@@ -264,7 +264,7 @@ func (s *Sink) executeBulk(ctx context.Context, models []sink.WriteModel, cols [
 			if j > 0 {
 				sb.WriteString(", ")
 			}
-			sb.WriteString(fmt.Sprintf("$%d", len(args)+1))
+			fmt.Fprintf(&sb, "$%d", len(args)+1)
 			args = append(args, item[col])
 		}
 		sb.WriteString(")")
