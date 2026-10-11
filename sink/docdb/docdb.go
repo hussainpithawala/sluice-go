@@ -85,12 +85,21 @@ func (s *Sink) BulkWrite(ctx context.Context, models []sink.WriteModel) (*sink.B
 
 	mongoModels := make([]mongo.WriteModel, 0, len(models))
 	for _, m := range models {
-		upsert := m.Upsert
-		mongoModels = append(mongoModels, &mongo.UpdateOneModel{
-			Filter: m.Filter,
-			Update: m.Update,
-			Upsert: &upsert,
-		})
+		if m.Many {
+			upsert := m.Upsert
+			mongoModels = append(mongoModels, &mongo.UpdateManyModel{
+				Filter: m.Filter,
+				Update: m.Update,
+				Upsert: &upsert,
+			})
+		} else {
+			upsert := m.Upsert
+			mongoModels = append(mongoModels, &mongo.UpdateOneModel{
+				Filter: m.Filter,
+				Update: m.Update,
+				Upsert: &upsert,
+			})
+		}
 	}
 
 	res, err := s.collection.BulkWrite(ctx, mongoModels, options.BulkWrite().SetOrdered(false))
@@ -161,6 +170,16 @@ func classifyBulkErr(we mongo.BulkWriteError, isUpsert bool) sink.ErrorClass {
 
 // Write performs a single-document upsert. Used in degraded mode only.
 func (s *Sink) Write(ctx context.Context, model sink.WriteModel) error {
+	if model.Many {
+		_, err := s.collection.UpdateMany(
+			ctx, model.Filter, model.Update,
+			options.UpdateMany().SetUpsert(model.Upsert),
+		)
+		if err != nil {
+			return fmt.Errorf("sluice/documentdb: single write (many): %w", err)
+		}
+		return nil
+	}
 	upsert := model.Upsert
 	_, err := s.collection.UpdateOne(
 		ctx, model.Filter, model.Update,

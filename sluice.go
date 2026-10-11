@@ -235,6 +235,7 @@ func (b *Builder) Build(ctx context.Context) (*Sluice, error) {
 				Filter:         wm.Filter,
 				Update:         wm.Update,
 				Upsert:         wm.Upsert,
+				Many:           wm.Many,
 			}, nil
 		}
 
@@ -1154,6 +1155,7 @@ func (s *Sluice) degradedWrite(ctx context.Context, correlationKey string, paylo
 		Filter:         wm.Filter,
 		Update:         wm.Update,
 		Upsert:         wm.Upsert,
+		Many:           wm.Many,
 	})
 	s.metrics.RecordDegradedWrite(s.cfg.Namespace, writeErr)
 	s.metrics.RecordRedisOp(s.cfg.Namespace, "degraded_write", time.Since(t), writeErr)
