@@ -38,6 +38,7 @@ type Config struct {
 	ConflictColumns []string         // e.g., []string{"id"} or []string{"user_id", "event_id"}
 	OnConflict      OnConflictAction // Default: OnConflictDoUpdate
 	UpdateColumns   []string         // Columns to update on conflict (if DoUpdate). If empty, updates all non-conflict columns.
+	DSN             string
 }
 
 // Sink implements sink.FlushSink against PostgreSQL.
@@ -85,12 +86,38 @@ func (s *Sink) BulkWrite(ctx context.Context, models []sink.WriteModel) (*sink.B
 	}
 
 	var preErrors []sink.SinkError
-	validModels := make([]sink.WriteModel, 0, len(models))
+	var upsertModels []sink.WriteModel
+	var manyModels []sink.WriteModel
 	var expectedCols []string
 	seenConflictKeys := make(map[string]bool)
 
 	for _, m := range models {
-		// RFP Fix: Catch type assertion failures per-item.
+		// --- RFP #23: Handle Many writes (Raw SQL updates) ---
+		if m.Many {
+			_, ok := m.Update.(string)
+			if !ok {
+				preErrors = append(preErrors, sink.SinkError{
+					CorrelationKey: m.CorrelationKey,
+					Class:          sink.ClassPermanent,
+					Err:            errors.New("postgres: UpdateMany requires a raw SQL string in the Update field"),
+				})
+				continue
+			}
+			if m.Filter != nil {
+				if _, ok := m.Filter.([]any); !ok {
+					preErrors = append(preErrors, sink.SinkError{
+						CorrelationKey: m.CorrelationKey,
+						Class:          sink.ClassPermanent,
+						Err:            errors.New("postgres: UpdateMany requires a []any slice in the Filter field for arguments"),
+					})
+					continue
+				}
+			}
+			manyModels = append(manyModels, m)
+			continue
+		}
+
+		// --- Existing Upsert validation ---
 		item, ok := m.Update.(map[string]any)
 		if !ok {
 			preErrors = append(preErrors, sink.SinkError{
@@ -125,36 +152,88 @@ func (s *Sink) BulkWrite(ctx context.Context, models []sink.WriteModel) (*sink.B
 			continue
 		}
 		seenConflictKeys[conflictKey] = true
-		validModels = append(validModels, m)
+		upsertModels = append(upsertModels, m)
 	}
 
-	if len(validModels) == 0 {
-		return &sink.BulkWriteResult{Errors: preErrors}, nil
+	// --- Execute Many writes ---
+	var manyErrors []sink.SinkError
+	for _, m := range manyModels {
+		sql := m.Update.(string)
+		var args []any
+		if m.Filter != nil {
+			args = m.Filter.([]any)
+		}
+
+		_, err := s.pool.Exec(ctx, sql, args...)
+		if err != nil {
+			var pgErr *pgconn.PgError
+			errClass := sink.ClassTransient
+			// Reuse your existing SQLSTATE classifier for the raw UPDATE queries
+			if errors.As(err, &pgErr) && isPermanentSQLState(pgErr.Code) {
+				errClass = sink.ClassPermanent
+			}
+			manyErrors = append(manyErrors, sink.SinkError{
+				CorrelationKey: m.CorrelationKey,
+				Class:          errClass,
+				Err:            err,
+			})
+		}
 	}
 
-	// Execute bulk insert
-	err := s.executeBulk(ctx, validModels, expectedCols)
+	// Helper to safely merge error slices without mutating underlying arrays
+	mergeErrors := func(base []sink.SinkError, additions ...[]sink.SinkError) []sink.SinkError {
+		total := len(base)
+		for _, a := range additions {
+			total += len(a)
+		}
+		if total == 0 {
+			return nil
+		}
+
+		out := make([]sink.SinkError, 0, total)
+		out = append(out, base...)
+		for _, a := range additions {
+			out = append(out, a...)
+		}
+		return out
+	}
+
+	// If no upsert models, just return accumulated errors
+	if len(upsertModels) == 0 {
+		return &sink.BulkWriteResult{Errors: mergeErrors(preErrors, manyErrors)}, nil
+	}
+
+	// --- Execute bulk insert for upserts ---
+	err := s.executeBulk(ctx, upsertModels, expectedCols)
 	if err == nil {
-		return &sink.BulkWriteResult{Errors: preErrors}, nil
+		return &sink.BulkWriteResult{Errors: mergeErrors(preErrors, manyErrors)}, nil
 	}
 
-	// Handle errors
+	// Handle upsert errors
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) {
-		// RFP Fix: SQLSTATE classes 23xxx, 42P01, 42703 and 21000 are ClassPermanent.
 		if isPermanentSQLState(pgErr.Code) {
 			// RFP Fix: A permanent multi-row error is retried row by row to isolate the bad rows.
-			return s.retryRowByRow(ctx, validModels, expectedCols, preErrors)
+			res, retryErr := s.retryRowByRow(ctx, upsertModels, expectedCols, preErrors)
+			if retryErr != nil {
+				return nil, retryErr
+			}
+			// Merge Many errors into the retry result
+			res.Errors = mergeErrors(res.Errors, manyErrors)
+			return res, nil
 		}
-		// Transient error for all valid models
-		for _, m := range validModels {
-			preErrors = append(preErrors, sink.SinkError{
+
+		// Transient error for all valid upsert models
+		var upsertErrors []sink.SinkError
+		for _, m := range upsertModels {
+			upsertErrors = append(upsertErrors, sink.SinkError{
 				CorrelationKey: m.CorrelationKey,
 				Class:          sink.ClassTransient,
 				Err:            err,
 			})
 		}
-		return &sink.BulkWriteResult{Errors: preErrors}, nil
+
+		return &sink.BulkWriteResult{Errors: mergeErrors(preErrors, manyErrors, upsertErrors)}, nil
 	}
 
 	// Unmapped error
@@ -261,6 +340,28 @@ func (s *Sink) retryRowByRow(ctx context.Context, models []sink.WriteModel, cols
 
 // Write performs a single-document upsert. Used in degraded mode only.
 func (s *Sink) Write(ctx context.Context, model sink.WriteModel) error {
+	if model.Many {
+		// in case of model.Many it is expected that Update will be a string
+		sql, ok := model.Update.(string)
+		if !ok {
+			return errors.New("sluice/postgres: UpdateMany requires a raw SQL string in the Update field")
+		}
+
+		var args []any
+		if model.Filter != nil {
+			args, ok = model.Filter.([]any)
+			if !ok {
+				return errors.New("sluice/postgres: UpdateMany requires a []interface{} slice in the Filter field for arguments")
+			}
+		}
+
+		_, err := s.pool.Exec(ctx, sql, args...)
+		if err != nil {
+			return fmt.Errorf("sluice/postgres: single write (many): %w", err)
+		}
+		return nil
+	}
+
 	item, ok := model.Update.(map[string]any)
 	if !ok {
 		return errors.New("update field must be map[string]any")
