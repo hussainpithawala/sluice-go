@@ -2,7 +2,7 @@
 
 [![Release](https://github.com/hussainpithawala/sluice-go/actions/workflows/release.yml/badge.svg)](https://github.com/hussainpithawala/sluice-go/actions/workflows/release.yml)
 [![Go Reference](https://pkg.go.dev/badge/github.com/hussainpithawala/sluice-go.svg)](https://pkg.go.dev/github.com/hussainpithawala/sluice-go)
-[![Go Version](https://img.shields.io/badge/go-1.25-blue)](https://go.dev)
+[![Go Version](https://img.shields.io/badge/go-1.26-blue)](https://go.dev)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 > **A velocity data platform for Go.**
@@ -117,26 +117,24 @@ full pod, a reader-only gateway, a bulk pre-warmer or a write-only ingester. See
 ## Install
 
 ```bash
-go get github.com/hussainpithawala/sluice-go@v1.0.8
+go get github.com/hussainpithawala/sluice-go@v1.0.9
 ```
 
-### Upgrading to 1.0.8
+### Upgrading to 1.0.9
 
-1.0.8 contains breaking changes. Check these before you upgrade:
+1.0.9 requires Go 1.26 and moves the DocumentDB adapters to the MongoDB v2 driver:
 
 | Change | What to do |
 |---|---|
-| `HotLoad(ctx, key)` now returns only `error` and hydrates in the background | Call `Read` after `HotLoad` if you need the payload right away |
-| `source.Source` gains `ReadBulk` | Add `ReadBulk` to custom `Source` implementations |
-| `MetricsRecorder` gains `RecordUnflushedExpiry` | Add it to custom recorders, and alert on any non-zero count |
-| `ErrMissingContract` is renamed `ErrMissingWriteContract` | Update `errors.Is` checks |
-| `Build()` no longer requires `Sink` or `WriteContract` | Handle `ErrMissingSink` / `ErrMissingWriteContract` from write-path methods |
-| Degraded mode refuses writes that could be reordered (`ErrDegradedWriteUnsafe`), including during a full Redis outage | Retry these writes, and don't ack them upstream |
-| `KeyTTL` is now the post-flush TTL for cold payloads, not a TTL on unflushed writes | Unflushed writes no longer expire, so size Redis for your worst-case backlog and run it with `noeviction` |
-| Examples moved to `examples/<scenario>/<adapter>/` | Update any paths or scripts that use them |
+| `sink/docdb` and `source/docdb` use `go.mongodb.org/mongo-driver/v2` | Switch your contracts' `bson`, `mongo` and `options` imports to the `/v2` paths. A v1 `bson.D` is a different type and won't work with the v2 driver. `bson/primitive` types (`ObjectID`, `DateTime`, …) now live in `bson` |
+| `DocDBBulkReadModel.Options` is now `*options.FindOptionsBuilder` | Build it with `options.Find().SetSort(...).SetLimit(...)` |
+| `docdb.Sink.Client()` returns a v2 `*mongo.Client` | Pass a v2 client to `NewSourceWithClient` if you build one yourself |
+| `go.mod` requires Go 1.26 | Upgrade your toolchain |
 
-`ReadOld` is deprecated. Use `Read`, or `ReadFresh` when you need strict consistency. The full list is
-in [CHANGELOG.md](CHANGELOG.md#108---2026-10-03).
+`WriteModel.Many` is new and defaults to `false`, so existing contracts behave exactly as before. See
+[Multi-document writes](#multi-document-writes). Coming from 1.0.7 or earlier, also read the
+[1.0.8 upgrade notes](CHANGELOG.md#108---2026-10-03). The full list is in
+[CHANGELOG.md](CHANGELOG.md#109---2026-10-12).
 
 ## Quickstart
 
@@ -148,7 +146,7 @@ import (
     "github.com/hussainpithawala/sluice-go/sink/docdb"
     "github.com/hussainpithawala/sluice-go/source"
     sourcedocdb "github.com/hussainpithawala/sluice-go/source/docdb"
-    "go.mongodb.org/mongo-driver/bson"
+    "go.mongodb.org/mongo-driver/v2/bson"
 )
 
 sk, _ := docdb.New(ctx, docdb.DefaultConfig(mongoURI, "adroll", "nudge_inventory"))
@@ -273,6 +271,42 @@ write that lands mid-flush therefore stays dirty and goes out in the next batch.
 | `WithContentDedup(true)` | xxHash64 fingerprint per payload. An unchanged payload skips the dirty queue, indexes and flush, and the store never sees a write it already has. |
 | `WriteIdempotent(ctx, key, payload, msgID)` | `SETNX` guard against upstream redelivery. Returns `ErrDuplicateIdempotencyKey` on a repeat; the guard is kept for `IdempotencyTTL` (default 4h). |
 
+### Multi-document writes
+
+Some events update many records at once. For example, one conversion event marks **all** of a
+user's eligible campaigns as fulfilled. Set `Many: true` on the `WriteModel` and the sink applies the
+write to every matching document or row. The write is still journaled, coalesced and flushed under
+its correlation key like any other.
+
+```go
+// DocumentDB / MongoDB: UpdateMany
+return &sluice.WriteModel{
+    Filter: bson.M{"user_id": key, "campaign_id": bson.M{"$in": p.CampaignIDs}},
+    Update: bson.M{"$set": bson.M{"fulfilled": true, "status": "completed"}},
+    Many:   true,
+}, nil
+
+// PostgreSQL: raw parameterised UPDATE. Update is the SQL, Filter is the args.
+return &sluice.WriteModel{
+    Update: `UPDATE campaigns SET fulfilled = true, status = 'completed'
+             WHERE user_id = $1 AND campaign_id = ANY($2)`,
+    Filter: []any{key, p.CampaignIDs},
+    Many:   true,
+}, nil
+```
+
+| Sink | `Many: false` (default) | `Many: true` |
+|---|---|---|
+| `sink/docdb` | `UpdateOneModel` | `UpdateManyModel`; can be mixed with single-document models in one `BulkWrite` |
+| `sink/postgres` | Multi-row `INSERT … ON CONFLICT` | `pool.Exec(Update, Filter...)`; `Upsert` is ignored. Runs before the batch's upserts, not in a shared transaction |
+| `sink/dynamodb` | `BatchWriteItem` / `PutItem` | Not supported: permanent `SinkError`, dead-lettered |
+
+Flushes are at-least-once, so a `Many` write can be applied more than once. Make it **idempotent**:
+set terminal state (`fulfilled = true`) rather than incrementing counters. On PostgreSQL, the SQL
+comes from your `WriteContract` and runs as-is. Always pass values through `Filter` arguments, and
+never build the statement from payload strings. If `Update` is not a `string` or `Filter` is not a
+`[]any`, the write fails with a permanent error for that key only.
+
 ---
 
 ## Serve read velocity
@@ -390,7 +424,7 @@ payloads, ttls, err := sl.ReadBulkWithTTL(ctx, "user_123") // + remaining journa
 | Adapter | Native bulk plan | Projector input |
 |---|---|---|
 | `source/postgres` | `PostgresBulkReadModel{Query, Args}` | `pgx.Rows` |
-| `source/docdb` | `DocDBBulkReadModel{Filter, FindOptions}` | `*mongo.Cursor` |
+| `source/docdb` | `DocDBBulkReadModel{Filter, Options}` (`*options.FindOptionsBuilder`) | `*mongo.Cursor` |
 | `source/dynamodb` | `DynamoBulkReadModel{QueryInput}` (single page on a partition key) | `[]map[string]types.AttributeValue` |
 
 Keys already in the journal (for example, a pending `Write`) are returned from the journal, not
@@ -488,7 +522,7 @@ loud failure to a quiet drop:
 | **Commits can't lose concurrent writes** | Every write bumps a per-key sequence, and commit and dead-lettering are conditional on it. A write that races an in-flight flush stays dirty. |
 | **No commit without attribution** | A sink error with no correlation key aborts the commit for the whole batch, both in the flush engine and in DLQ `Upsert` replay. Nothing is committed just because no error named it. |
 | **Retry vs. dead-letter is explicit** | Every bundled sink classifies each error as transient or permanent. A concurrent-upsert race between pods is retried, not dead-lettered. |
-| **At-least-once to the store, idempotent by upsert** | A crash between `BulkWrite` and commit re-flushes the batch. Upsert semantics make that safe. |
+| **At-least-once to the store, idempotent by upsert** | A crash between `BulkWrite` and commit re-flushes the batch. Upsert semantics make that safe. `Many` writes must be idempotent themselves (see [Multi-document writes](#multi-document-writes)). |
 | **Losses are loud** | A dirty key whose payload is gone at flush time gets `ErrPayloadMissing` (via `OnFlush`), an error log, a `RecordUnflushedExpiry` count and a DLQ entry. **Any non-zero count should page.** |
 | **Degraded mode preserves order** | If Redis fails, `WithDegradedModeDirect` (default on) writes straight to the store *only* when no older version of the key is pending in Redis. Otherwise, including when Redis is unreachable, `Write` returns `ErrDegradedWriteUnsafe`. Retry it; don't ack it. |
 | **Survives script-cache loss** | Every Lua call site reloads and retries once on `NOSCRIPT`, which covers a Redis restart, failover or `SCRIPT FLUSH`. |
@@ -534,17 +568,17 @@ Each adapter uses the journal to remove the bottleneck specific to its store:
 
 | Store | Sink | Source | Bottleneck removed |
 |---|---|---|---|
-| DocumentDB / MongoDB | `sink/docdb`: unordered `BulkWrite` | `source/docdb`: `FindOne`; `Find` for bulk | Per-write index I/O on a single primary; connection caps |
+| DocumentDB / MongoDB | `sink/docdb`: unordered `BulkWrite` (`UpdateOne`, or `UpdateMany` with `Many`) | `source/docdb`: `FindOne`; `Find` for bulk | Per-write index I/O on a single primary; connection caps |
 | DynamoDB | `sink/dynamodb`: `BatchWriteItem`, with `UnprocessedItems` mapped back to their keys and retried | `source/dynamodb`: `GetItem` with `ConsistentRead: true`; `Query` for bulk | WCU spend: bursts flatten to a low, steady provisioned baseline; secondary lookups use Redis indexes instead of GSIs; idempotency uses `SETNX` instead of `TransactWriteItems` |
-| PostgreSQL | `sink/postgres`: multi-row `INSERT … ON CONFLICT DO UPDATE` (or `DO NOTHING` via `Config.OnConflict`) | `source/postgres`: parameterised query + `Projector`, which supports joins and aggregations | Connection saturation, per-row transaction overhead, WAL/MVCC churn from repeated updates |
+| PostgreSQL | `sink/postgres`: multi-row `INSERT … ON CONFLICT DO UPDATE` (or `DO NOTHING` via `Config.OnConflict`); raw parameterised `UPDATE` with `Many` | `source/postgres`: parameterised query + `Projector`, which supports joins and aggregations | Connection saturation, per-row transaction overhead, WAL/MVCC churn from repeated updates |
 
 How each bundled sink classifies failures:
 
 | Sink | Transient (retried) | Permanent (dead-lettered) | Whole batch retried |
 |---|---|---|---|
 | `sink/docdb` | 11000 on `_id_` for an upsert (a race with another pod) | Any other write error, including 11000 on a business unique index | Write-concern error, network or context error |
-| `sink/dynamodb` | `UnprocessedItems`, context cancel/deadline | `Update` not a `map[string]any`, missing PK/SK attribute, marshal failure, duplicate key in the batch, a per-item `PutItem` failure after a `ValidationException` fallback | An unprocessed item that can't be mapped to a key; any other API error |
-| `sink/postgres` | Any other SQLSTATE | `23xxx`, `42P01`, `42703`, `21000`; a row whose columns differ from the batch's first row; a duplicate conflict key in the batch | A non-Postgres error (for example, a connection failure) |
+| `sink/dynamodb` | `UnprocessedItems`, context cancel/deadline | `Many: true`, `Update` not a `map[string]any`, missing PK/SK attribute, marshal failure, duplicate key in the batch, a per-item `PutItem` failure after a `ValidationException` fallback | An unprocessed item that can't be mapped to a key; any other API error |
+| `sink/postgres` | Any other SQLSTATE | `23xxx`, `42P01`, `42703`, `21000`; a row whose columns differ from the batch's first row; a duplicate conflict key in the batch; a `Many` write whose `Update` is not a SQL `string` or whose `Filter` is not `[]any` | A non-Postgres error (for example, a connection failure) |
 
 On a permanent multi-row error, `sink/postgres` retries the batch row by row, so only the bad rows are
 dead-lettered. On a batch-wide `ValidationException`, `sink/dynamodb` falls back to per-item `PutItem`
@@ -767,7 +801,8 @@ make coverage           # HTML coverage report
   namespace, which stops an older flush from overwriting a newer version in the store.
 - Design notes for shipped features: [bulk reader](docs/issues/bulkreader.md),
   [local journal](docs/issues/local-journal.md), [Prometheus](docs/issues/prometheus.md),
-  [sink silent-loss fixes](docs/issues/sink-silent-loss.md).
+  [sink silent-loss fixes](docs/issues/sink-silent-loss.md),
+  [MongoDB driver v2](docs/issues/mongo-driver-v2.md), [multi-document writes](docs/issues/update-many-support.md).
 
 Release history and breaking changes are in [CHANGELOG.md](CHANGELOG.md).
 
