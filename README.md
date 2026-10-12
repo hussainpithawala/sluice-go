@@ -117,12 +117,12 @@ full pod, a reader-only gateway, a bulk pre-warmer or a write-only ingester. See
 ## Install
 
 ```bash
-go get github.com/hussainpithawala/sluice-go@v1.0.9
+go get github.com/hussainpithawala/sluice-go@v1.1.0
 ```
 
-### Upgrading to 1.0.9
+### Upgrading to 1.1.0
 
-1.0.9 requires Go 1.26 and moves the DocumentDB adapters to the MongoDB v2 driver:
+1.1.0 (and 1.0.9 before it) requires Go 1.26 and moves the DocumentDB adapters to the MongoDB v2 driver:
 
 | Change | What to do |
 |---|---|
@@ -134,7 +134,11 @@ go get github.com/hussainpithawala/sluice-go@v1.0.9
 `WriteModel.Many` is new and defaults to `false`, so existing contracts behave exactly as before. See
 [Multi-document writes](#multi-document-writes). Coming from 1.0.7 or earlier, also read the
 [1.0.8 upgrade notes](CHANGELOG.md#108---2026-10-03). The full list is in
-[CHANGELOG.md](CHANGELOG.md#109---2026-10-12).
+[CHANGELOG.md](CHANGELOG.md#110---2026-10-12).
+
+**On 1.0.9?** Upgrade before you replay `Many` writes from the DLQ. In 1.0.9, `DLQUpsert` dropped
+the flag, so DocumentDB/MongoDB updated only the first matching document. See the
+[1.1.0 fix](CHANGELOG.md#110---2026-10-12).
 
 ## Quickstart
 

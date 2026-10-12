@@ -184,6 +184,7 @@ func (p *Processor) handleUpsert(ctx context.Context, band int, records []shield
 			Filter:         wm.Filter,
 			Update:         wm.Update,
 			Upsert:         true,
+			Many:           wm.Many,
 		})
 		corrKeys = append(corrKeys, rec.CorrelationKey)
 	}

@@ -5,7 +5,22 @@ All notable changes to sluice will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2026-10-12
+
+### Fixed
+- **`Many` Dropped During DLQ Replay**: `ProcessDLQ(ctx, sluice.DLQUpsert)` rebuilt each replayed write without `WriteModel.Many`, so a multi-document write came back from the dead-letter queue as a single-document write. The flag is now carried through both the `ProcessDLQ` contract wrapper and the DLQ processor's upsert batch. The impact on 1.0.9 depended on the sink:
+  - `sink/docdb`: `UpdateOne` instead of `UpdateMany`. Only the first matching document was updated, the key was still committed out of the DLQ, and no error was reported.
+  - `sink/postgres`: the raw SQL `Update` was treated as an upsert row and failed as a permanent error. The key stayed in the DLQ.
+  - `sink/dynamodb`: a `Many` write that should be rejected was replayed as a single put.
+  - `DLQIgnore` and `DLQReInsert` were not affected.
+- **Recovery for 1.0.9 users**: If you ran `DLQUpsert` on 1.0.9 with a `Many` contract on DocumentDB/MongoDB, the documents after the first match were not updated. Re-emit those events, or re-apply the update, after upgrading.
+
+### Added
+- **DLQ `Many` Regression Tests**: `TestProcessDLQ_Upsert_PreservesMany` runs a `Many: true` contract through the real `ProcessDLQ` path against Redis and MongoDB and checks that every matching document is updated. `TestDLQReplay_ManyFlagPreserved` covers the model conversion and the sink's `UpdateMany` vs `UpdateOne` behaviour.
+
 ## [1.0.9] - 2026-10-12
+
+> **Known issue:** `ProcessDLQ` with `DLQUpsert` drops `WriteModel.Many`. On DocumentDB/MongoDB this silently updates only the first matching document. Fixed in [1.1.0](#110---2026-10-12). Upgrade before replaying `Many` writes from the DLQ.
 
 ### Added
 - **Multi-Document Writes (`WriteModel.Many`)** (RFP #23, `docs/issues/update-many-support.md`): A `WriteContract` can now return a write that touches every matching document or row, e.g. "mark all eligible campaigns for this user as fulfilled" from one conversion event. `Many` is threaded through the flush engine, degraded-mode `Write`, and `sink.WriteModel`. It defaults to `false`, so existing contracts keep single-document semantics unchanged.
