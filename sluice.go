@@ -890,6 +890,7 @@ func (s *Sluice) ProcessDLQ(ctx context.Context, strategy DLQStrategy, opts ...D
 			Filter: wm.Filter,
 			Update: wm.Update,
 			Upsert: wm.Upsert,
+			Many:   wm.Many,
 		}, nil
 	}
 
