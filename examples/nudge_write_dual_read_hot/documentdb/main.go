@@ -38,6 +38,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
 
 	sluice "github.com/hussainpithawala/sluice-go"
 	"github.com/hussainpithawala/sluice-go/internal/localjournal"
@@ -46,7 +47,14 @@ import (
 	"github.com/hussainpithawala/sluice-go/sink/docdb"
 	"github.com/hussainpithawala/sluice-go/source"
 	sourcedocdb "github.com/hussainpithawala/sluice-go/source/docdb"
-	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/v2/bson"
+)
+
+const (
+	fieldID       = "_id"
+	fieldChannel  = "channel"
+	fieldPriority = "priority"
+	channelPush   = "push"
 )
 
 var (
@@ -71,11 +79,11 @@ func nudgeWriteContract(crn string, rawPayload []byte) (*sluice.WriteModel, erro
 		return nil, fmt.Errorf("nudge contract: invalid payload for CRN %s: %w", crn, err)
 	}
 	return &sluice.WriteModel{
-		Filter: bson.D{{Key: "_id", Value: crn}},
+		Filter: bson.D{{Key: fieldID, Value: crn}},
 		Update: bson.D{{Key: "$set", Value: bson.D{
 			{Key: "nudge_master_id", Value: p.NudgeMasterID},
-			{Key: "channel", Value: p.Channel},
-			{Key: "priority", Value: p.Priority},
+			{Key: fieldChannel, Value: p.Channel},
+			{Key: fieldPriority, Value: p.Priority},
 			{Key: "campaign_id", Value: p.CampaignID},
 			{Key: "expires_at", Value: p.ExpiresAt},
 			{Key: "last_updated", Value: p.LastUpdated},
@@ -87,7 +95,8 @@ func nudgeWriteContract(crn string, rawPayload []byte) (*sluice.WriteModel, erro
 // ─── ReadContract (unified read — used by both HotLoad and cold fallback) ────
 func nudgeReadContract(crn string) (*source.ReadModel, error) {
 	return &source.ReadModel{
-		Filter: bson.D{{Key: "_id", Value: crn}},
+		Filter:  bson.D{{Key: fieldID, Value: crn}},
+		Options: options.Find().SetLimit(100).SetBatchSize(50),
 	}, nil
 }
 
@@ -98,10 +107,10 @@ func nudgeIndexContract(crn string, payload []byte) (map[string]interface{}, err
 		return nil, fmt.Errorf("index contract: invalid payload for CRN %s: %w", crn, err)
 	}
 	return map[string]interface{}{
-		"channel":  p.Channel,                        // equality SET
-		"campaign": p.CampaignID,                     // equality SET
-		"priority": float64(p.Priority),              // range ZSET
-		"expires":  float64(p.ExpiresAt.UnixMilli()), // range ZSET
+		fieldChannel:  p.Channel,                        // equality SET
+		"campaign":    p.CampaignID,                     // equality SET
+		fieldPriority: float64(p.Priority),              // range ZSET
+		"expires":     float64(p.ExpiresAt.UnixMilli()), // range ZSET
 	}, nil
 }
 
@@ -112,7 +121,7 @@ func nudgeIndexContract(crn string, payload []byte) (map[string]interface{}, err
 func coldWriteSimulator(ctx context.Context, workerID int, sl *sluice.Sluice, log *slog.Logger, written *atomic.Int64, wg *sync.WaitGroup) {
 	defer wg.Done()
 	nudgeMasters := []string{"nm_spring_retarget", "nm_cart_abandonment", "nm_win_back_q2", "nm_first_purchase", "nm_loyalty_upgrade"}
-	channels := []string{"push", "email", "sms", "in_app"}
+	channels := []string{channelPush, "email", "sms", "in_app"}
 	ticker := time.NewTicker(1 * time.Millisecond)
 	defer ticker.Stop()
 	for {
@@ -174,7 +183,7 @@ func hotWriteSimulator(ctx context.Context, sl *sluice.Sluice, log *slog.Logger,
 				log.Info("hot session: new CRN, seeding via direct write", "crn", crn)
 				payload, _ = json.Marshal(NudgeInventoryPayload{
 					NudgeMasterID: "nm_welcome_bonus",
-					Channel:       "push",
+					Channel:       channelPush,
 					Priority:      5,
 					CampaignID:    "camp_onboarding",
 					ExpiresAt:     time.Now().Add(48 * time.Hour),
@@ -226,8 +235,8 @@ func hotWriteSimulator(ctx context.Context, sl *sluice.Sluice, log *slog.Logger,
 			log.Info("hot session: READ served from journal",
 				"crn", crn,
 				"read_latency_us", readLatency.Microseconds(),
-				"priority", readResult.Priority,
-				"channel", readResult.Channel,
+				fieldPriority, readResult.Priority,
+				fieldChannel, readResult.Channel,
 			)
 			// ─── Step 5: QUERY — compound lookup via indexes ─────────────────
 			// Every Write() (cold or hot) maintains secondary indexes via
@@ -235,8 +244,8 @@ func hotWriteSimulator(ctx context.Context, sl *sluice.Sluice, log *slog.Logger,
 			// Query() resolves via band-scoped SINTER + ZRANGEBYSCORE.
 			if sessionCount%3 == 0 {
 				results, queryErr := sl.Query(ctx, sluice.Query{
-					Equality: map[string]string{"channel": "push"},
-					RangeMin: map[string]float64{"priority": 3},
+					Equality: map[string]string{fieldChannel: channelPush},
+					RangeMin: map[string]float64{fieldPriority: 3},
 				})
 				if queryErr != nil {
 					log.Warn("hot session: query failed", "err", queryErr)

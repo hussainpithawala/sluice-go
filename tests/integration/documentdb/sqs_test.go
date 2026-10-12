@@ -18,7 +18,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/sqs/types"
 	sluice "github.com/hussainpithawala/sluice-go"
 	"github.com/stretchr/testify/require"
-	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/v2/bson"
 )
 
 type sqsEvent struct {
@@ -31,14 +31,11 @@ func newLocalStackSQS(t *testing.T) *sqs.Client {
 	cfg, err := config.LoadDefaultConfig(context.Background(),
 		config.WithRegion("us-east-1"),
 		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider("test", "test", "")),
-		config.WithEndpointResolverWithOptions(aws.EndpointResolverWithOptionsFunc(
-			func(service, region string, opts ...interface{}) (aws.Endpoint, error) {
-				return aws.Endpoint{URL: sqsEndpoint(), HostnameImmutable: true}, nil
-			},
-		)),
 	)
 	require.NoError(t, err)
-	return sqs.NewFromConfig(cfg)
+	return sqs.NewFromConfig(cfg, func(o *sqs.Options) {
+		o.BaseEndpoint = aws.String(sqsEndpoint())
+	})
 }
 
 func createSQSQueue(t *testing.T, client *sqs.Client, name string) string {

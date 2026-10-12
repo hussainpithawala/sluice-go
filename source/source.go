@@ -5,6 +5,8 @@ package source
 import (
 	"context"
 	"errors"
+
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
 
 // ErrRecordNotFound indicates the requested document does not exist in the source.
@@ -14,6 +16,8 @@ var ErrRecordNotFound = errors.New("source: record not found")
 // It mirrors sink.WriteModel but for read operations.
 type ReadModel struct {
 	Filter interface{}
+	// Use the Builder type, or the Lister interface for maximum flexibility
+	Options *options.FindOptionsBuilder
 }
 
 // Source is the read-side persistence contract for sluice.

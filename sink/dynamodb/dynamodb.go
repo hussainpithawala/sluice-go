@@ -30,6 +30,7 @@ type Sink struct {
 	tableName string
 	pkAttr    string
 	skAttr    string
+	table     string
 }
 
 // New creates a new DynamoDB sink.
@@ -107,6 +108,15 @@ func (s *Sink) BulkWrite(ctx context.Context, models []sink.WriteModel) (*sink.B
 	validModels := make([]sink.WriteModel, 0, len(models))
 
 	for _, m := range models {
+		if m.Many {
+			preErrors = append(preErrors, sink.SinkError{
+				CorrelationKey: m.CorrelationKey,
+				Code:           0,
+				Class:          sink.ClassPermanent,
+				Err:            errors.New("dynamodb: UpdateMany not supported"),
+			})
+			continue
+		}
 		// RFP Fix: Catch type assertion failures per-item, do not return early.
 		item, ok := m.Update.(map[string]any)
 		if !ok {
@@ -262,6 +272,9 @@ func (s *Sink) fallbackPutItems(ctx context.Context, models []sink.WriteModel, e
 
 // Write performs a single-document put. Used in degraded mode only.
 func (s *Sink) Write(ctx context.Context, model sink.WriteModel) error {
+	if model.Many {
+		return errors.New("dynamodb: UpdateMany not supported")
+	}
 	item, ok := model.Update.(map[string]any)
 	if !ok {
 		return errors.New("update field must be map[string]any")

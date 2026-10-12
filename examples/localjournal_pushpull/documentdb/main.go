@@ -50,9 +50,16 @@ import (
 	"github.com/hussainpithawala/sluice-go/source"
 	sourcedocdb "github.com/hussainpithawala/sluice-go/source/docdb"
 	"github.com/redis/go-redis/v9"
-	"go.mongodb.org/mongo-driver/bson"
-	"go.mongodb.org/mongo-driver/mongo"
-	"go.mongodb.org/mongo-driver/mongo/options"
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
+)
+
+const (
+	fieldID       = "_id"
+	fieldChannel  = "channel"
+	fieldPriority = "priority"
+	channelPush   = "push"
 )
 
 var (
@@ -80,11 +87,11 @@ func nudgeWriteContract(correlationKey string, rawPayload []byte) (*sluice.Write
 		return nil, fmt.Errorf("nudge contract: invalid payload for correlation_key %s: %w", correlationKey, err)
 	}
 	return &sluice.WriteModel{
-		Filter: bson.D{{Key: "_id", Value: correlationKey}},
+		Filter: bson.D{{Key: fieldID, Value: correlationKey}},
 		Update: bson.D{{Key: "$set", Value: bson.D{
 			{Key: "nudge_master_id", Value: p.NudgeMasterID},
-			{Key: "channel", Value: p.Channel},
-			{Key: "priority", Value: p.Priority},
+			{Key: fieldChannel, Value: p.Channel},
+			{Key: fieldPriority, Value: p.Priority},
 			{Key: "campaign_id", Value: p.CampaignID},
 			{Key: "expires_at", Value: p.ExpiresAt},
 			{Key: "last_updated", Value: p.LastUpdated},
@@ -95,7 +102,8 @@ func nudgeWriteContract(correlationKey string, rawPayload []byte) (*sluice.Write
 
 func nudgeReadContract(correlationKey string) (*source.ReadModel, error) {
 	return &source.ReadModel{
-		Filter: bson.M{"_id": correlationKey},
+		Filter:  bson.M{fieldID: correlationKey},
+		Options: options.Find().SetLimit(100).SetBatchSize(50),
 	}, nil
 }
 
@@ -105,10 +113,10 @@ func nudgeIndexContract(correlationKey string, payload []byte) (map[string]inter
 		return nil, fmt.Errorf("index contract: invalid payload for correlation_key %s: %w", correlationKey, err)
 	}
 	return map[string]interface{}{
-		"channel":  p.Channel,
-		"campaign": p.CampaignID,
-		"priority": float64(p.Priority),
-		"expires":  float64(p.ExpiresAt.UnixMilli()),
+		fieldChannel:  p.Channel,
+		"campaign":    p.CampaignID,
+		fieldPriority: float64(p.Priority),
+		"expires":     float64(p.ExpiresAt.UnixMilli()),
 	}, nil
 }
 
@@ -191,7 +199,7 @@ func buildPod(ctx context.Context, tag string, mongoURI string, redisAddrs []str
 	}
 
 	// ── Source (read path for ReadContract / HotLoad / cold fallback) ────
-	readClient, err := mongo.Connect(ctx, options.Client().ApplyURI(mongoURI))
+	readClient, err := mongo.Connect(options.Client().ApplyURI(mongoURI))
 	if err != nil {
 		_ = sk.Close(context.Background())
 		return nil, nil, fmt.Errorf("connect read client: %w", err)
@@ -258,7 +266,7 @@ func runScenarios(ctx context.Context, podA, podB *sluice.Sluice, log *slog.Logg
 	crn := "pushpull_demo_session_001"
 	payloadV1, _ := json.Marshal(NudgeInventoryPayload{
 		NudgeMasterID: "nm_welcome_bonus",
-		Channel:       "push",
+		Channel:       channelPush,
 		Priority:      5,
 		CampaignID:    "camp_onboarding",
 		ExpiresAt:     time.Now().Add(48 * time.Hour),
@@ -268,7 +276,7 @@ func runScenarios(ctx context.Context, podA, podB *sluice.Sluice, log *slog.Logg
 	if err := podA.Write(ctx, crn, payloadV1); err != nil {
 		return fmt.Errorf("pod A write: %w", err)
 	}
-	log.Info("Pod A wrote payload", "crn", crn, "priority", 5)
+	log.Info("Pod A wrote payload", "crn", crn, fieldPriority, 5)
 
 	readStart := time.Now()
 	got, err := podA.Read(ctx, crn)
@@ -278,7 +286,7 @@ func runScenarios(ctx context.Context, podA, podB *sluice.Sluice, log *slog.Logg
 	readLatency := time.Since(readStart)
 	var result NudgeInventoryPayload
 	_ = json.Unmarshal(got, &result)
-	log.Info("Pod A read (L1 hit, sub-µs)", "crn", crn, "priority", result.Priority, "latency_us", readLatency.Microseconds())
+	log.Info("Pod A read (L1 hit, sub-µs)", "crn", crn, fieldPriority, result.Priority, "latency_us", readLatency.Microseconds())
 
 	// ── Scenario 2: Cross-pod convergence via broadcast ──────────────────
 	log.Info("═══ Scenario 2: Cross-pod convergence via broadcast ═══")
@@ -292,7 +300,7 @@ func runScenarios(ctx context.Context, podA, podB *sluice.Sluice, log *slog.Logg
 			_ = json.Unmarshal(got, &r)
 			if r.Priority == 5 {
 				converged = true
-				log.Info("Pod B converged via broadcast", "crn", crn, "priority", r.Priority, "attempts", i+1)
+				log.Info("Pod B converged via broadcast", "crn", crn, fieldPriority, r.Priority, "attempts", i+1)
 				break
 			}
 		}
@@ -312,7 +320,7 @@ func runScenarios(ctx context.Context, podA, podB *sluice.Sluice, log *slog.Logg
 
 	payloadV2, _ := json.Marshal(NudgeInventoryPayload{
 		NudgeMasterID: "nm_welcome_bonus",
-		Channel:       "push",
+		Channel:       channelPush,
 		Priority:      1, // user dismissed high-priority nudge
 		CampaignID:    "camp_onboarding",
 		ExpiresAt:     time.Now().Add(48 * time.Hour),
@@ -338,11 +346,11 @@ func runScenarios(ctx context.Context, podA, podB *sluice.Sluice, log *slog.Logg
 			var r NudgeInventoryPayload
 			_ = json.Unmarshal(got, &r)
 			// DIAGNOSTIC: log the actual payload and priority returned by Pod B
-			log.Debug("SCENARIO3-POLL", "priority", r.Priority, "payload_bytes", len(got), "attempt", i)
+			log.Debug("SCENARIO3-POLL", fieldPriority, r.Priority, "payload_bytes", len(got), "attempt", i)
 
 			if r.Priority == 1 {
 				converged = true
-				log.Info("Pod B converged to updated value", "crn", crn, "priority", r.Priority, "attempts", i+1)
+				log.Info("Pod B converged to updated value", "crn", crn, fieldPriority, r.Priority, "attempts", i+1)
 				break
 			}
 		}
@@ -362,15 +370,15 @@ func runScenarios(ctx context.Context, podA, podB *sluice.Sluice, log *slog.Logg
 	var freshResult NudgeInventoryPayload
 	_ = json.Unmarshal(fresh, &freshResult)
 	log.Info("Pod A ReadFresh (L2 journal, bypasses L1)",
-		"crn", crn, "priority", freshResult.Priority,
+		"crn", crn, fieldPriority, freshResult.Priority,
 		"latency_us", freshLatency.Microseconds(),
 		"note", "authoritative journal view")
 
 	// ── Scenario 5: Compound query via Redis indexes ─────────────────────
 	log.Info("═══ Scenario 5: Compound query via Redis indexes ═══")
 	results, err := podA.Query(ctx, sluice.Query{
-		Equality: map[string]string{"channel": "push"},
-		RangeMin: map[string]float64{"priority": 1},
+		Equality: map[string]string{fieldChannel: channelPush},
+		RangeMin: map[string]float64{fieldPriority: 1},
 	})
 	if err != nil {
 		log.Warn("compound query failed (expected if no other keys indexed)", "err", err)

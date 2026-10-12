@@ -36,6 +36,13 @@ import (
 	pgsource "github.com/hussainpithawala/sluice-go/source/postgres"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
+)
+
+const (
+	fieldChannel  = "channel"
+	fieldPriority = "priority"
+	channelPush   = "push"
 )
 
 var (
@@ -65,8 +72,8 @@ func nudgeWriteContract(correlationKey string, rawPayload []byte) (*sluice.Write
 	item := map[string]any{
 		"id":              correlationKey,
 		"nudge_master_id": p.NudgeMasterID,
-		"channel":         p.Channel,
-		"priority":        p.Priority,
+		fieldChannel:      p.Channel,
+		fieldPriority:     p.Priority,
 		"campaign_id":     p.CampaignID,
 		"expires_at":      p.ExpiresAt,
 		"last_updated":    p.LastUpdated,
@@ -110,6 +117,7 @@ func nudgeReadContract(correlationKey string) (*source.ReadModel, error) {
 				return payload, nil
 			},
 		},
+		Options: options.Find().SetLimit(100).SetBatchSize(50),
 	}, nil
 }
 
@@ -120,10 +128,10 @@ func nudgeIndexContract(correlationKey string, payload []byte) (map[string]inter
 		return nil, fmt.Errorf("index contract: invalid payload for correlation_key %s: %w", correlationKey, err)
 	}
 	return map[string]interface{}{
-		"channel":  p.Channel,                        // equality: SET
-		"campaign": p.CampaignID,                     // equality: SET
-		"priority": float64(p.Priority),              // range:    ZSET
-		"expires":  float64(p.ExpiresAt.UnixMilli()), // range:    ZSET
+		fieldChannel:  p.Channel,                        // equality: SET
+		"campaign":    p.CampaignID,                     // equality: SET
+		fieldPriority: float64(p.Priority),              // range:    ZSET
+		"expires":     float64(p.ExpiresAt.UnixMilli()), // range:    ZSET
 	}, nil
 }
 
@@ -177,7 +185,7 @@ func (m *logMetrics) RecordLocalSetSize(namespace string, size int)             
 func simulatedConsumer(ctx context.Context, workerID int, sl *sluice.Sluice, log *slog.Logger, written *atomic.Int64, wg *sync.WaitGroup) {
 	defer wg.Done()
 	nudgeMasters := []string{"nm_spring_retarget_2026", "nm_cart_abandonment", "nm_win_back_q2", "nm_first_purchase", "nm_loyalty_upgrade"}
-	channels := []string{"push", "email", "sms", "in_app"}
+	channels := []string{channelPush, "email", "sms", "in_app"}
 
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
@@ -238,7 +246,7 @@ func hotRegimeSimulator(ctx context.Context, sl *sluice.Sluice, log *slog.Logger
 				log.Info("hot regime: HotLoad (new correlation_key, writing directly)", "correlationKey", correlationKey, "err", err)
 				newPayload, _ := json.Marshal(NudgeInventoryPayload{
 					NudgeMasterID: "nm_welcome_bonus",
-					Channel:       "push",
+					Channel:       channelPush,
 					Priority:      5,
 					CampaignID:    "camp_onboarding",
 					ExpiresAt:     time.Now().Add(48 * time.Hour),
@@ -281,14 +289,14 @@ func hotRegimeSimulator(ctx context.Context, sl *sluice.Sluice, log *slog.Logger
 			log.Info("hot regime: sync HTTP response served from journal",
 				"correlationKey", correlationKey,
 				"read_latency_us", readLatency.Microseconds(),
-				"priority", readResult.Priority,
-				"channel", readResult.Channel,
+				fieldPriority, readResult.Priority,
+				fieldChannel, readResult.Channel,
 			)
 
 			if sessionCount%3 == 0 {
 				results, queryErr := sl.Query(ctx, sluice.Query{
-					Equality: map[string]string{"channel": "push"},
-					RangeMin: map[string]float64{"priority": 3},
+					Equality: map[string]string{fieldChannel: channelPush},
+					RangeMin: map[string]float64{fieldPriority: 3},
 				})
 				if queryErr != nil {
 					log.Warn("hot regime: Query failed", "err", queryErr)

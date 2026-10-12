@@ -5,7 +5,7 @@ import (
 
 	"github.com/hussainpithawala/sluice-go/sink"
 	"github.com/stretchr/testify/assert"
-	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo"
 )
 
 func TestClassifyBulkErr(t *testing.T) {

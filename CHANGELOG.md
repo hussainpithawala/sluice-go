@@ -5,6 +5,28 @@ All notable changes to sluice will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.9] - 2026-10-12
+
+### Added
+- **Multi-Document Writes (`WriteModel.Many`)** (RFP #23, `docs/issues/update-many-support.md`): A `WriteContract` can now return a write that touches every matching document or row, e.g. "mark all eligible campaigns for this user as fulfilled" from one conversion event. `Many` is threaded through the flush engine, degraded-mode `Write`, and `sink.WriteModel`. It defaults to `false`, so existing contracts keep single-document semantics unchanged.
+  - `sink/docdb`: `Many: true` maps to `mongo.UpdateManyModel` (`UpdateMany` in degraded mode). `UpdateOne` and `UpdateMany` models can be mixed in one unordered `BulkWrite`, and per-model error attribution and classification are unchanged.
+  - `sink/postgres`: `Many: true` runs a raw parameterised SQL statement via `pool.Exec`. `Update` carries the SQL string and `Filter` carries the `[]any` arguments (or `nil`). `Upsert` is ignored. A wrong `Update`/`Filter` type is a permanent `SinkError` for that key only. Execution errors are classified with the same SQLSTATE rules as upserts. `Many` statements run outside the multi-row `INSERT … ON CONFLICT`, not in a shared transaction, and before it.
+  - `sink/dynamodb`: `Many: true` is rejected with a permanent `SinkError` (dead-lettered) in `BulkWrite`, and with an error in `Write`. Other models in the batch are unaffected.
+- **`source.ReadModel.Options`**: Optional `*options.FindOptionsBuilder` on the read model. Not yet applied by `source/docdb.Read`.
+- **MongoDB Driver Migration Notes**: `docs/issues/mongo-driver-v2.md` (RFP #22) documents the v1 → v2 migration.
+- **`Many` Test Coverage**: Unit tests for each sink (`sink/{docdb,dynamodb,postgres}/*_update_many_test.go`) and integration suites under `tests/integration/{documentdb,dynamodb,postgres}/` covering mixed batches, rejection, degraded mode, and regression of `Many: false` behaviour.
+
+### Changed
+- **BREAKING — MongoDB Driver v2**: `sink/docdb` and `source/docdb` now depend on `go.mongodb.org/mongo-driver/v2` (v2.5.0) instead of `go.mongodb.org/mongo-driver` v1.15.0. A `bson.D` from v1 is a different type than one from v2, so contracts that build filters and updates must import `go.mongodb.org/mongo-driver/v2/bson`. `docdb.Sink.Client()` returns a v2 `*mongo.Client`, and `NewSourceWithClient` expects one.
+- **BREAKING — `DocDBBulkReadModel.Options`**: Type changed from `*options.FindOptions` to the v2 `*options.FindOptionsBuilder`. Build it with `options.Find().SetSort(...).SetLimit(...)`.
+- **BREAKING — Go 1.26**: `go.mod` now requires Go 1.26.0 (was 1.25.0). CI runs on Go 1.26.
+- **Lint Toolchain**: CI installs the latest golangci-lint v2. Repeated literals in the Prometheus recorder, the shield's sorted-set score bounds, and the examples are now named constants. `goconst` is disabled for `_test.go` files.
+- **Integration Test Modernization**: The LocalStack SQS client in the DocumentDB integration tests now uses service-specific `BaseEndpoint` instead of the deprecated global `EndpointResolverWithOptions`.
+
+### Fixed
+- **Unchecked Integration Test Results**: `TestWriteIdempotent_ExactlyOnce` now asserts that a write with a new idempotency key succeeds, and Kafka test connections check their `Close` errors.
+- **`ReadOld` Deprecation Notice**: The doc comment no longer repeats its summary line, and `Deprecated:` is in its own paragraph so tooling (pkg.go.dev, `staticcheck`) recognises it.
+
 ## [1.0.8] - 2026-10-03
 
 ### Added

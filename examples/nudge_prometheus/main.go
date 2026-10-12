@@ -39,9 +39,16 @@ import (
 	"github.com/hussainpithawala/sluice-go/source"
 	sourcedocdb "github.com/hussainpithawala/sluice-go/source/docdb"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/v2/bson"
 
 	sluiceprom "github.com/hussainpithawala/sluice-go/metrics/prometheus"
+)
+
+const (
+	fieldID       = "_id"
+	fieldChannel  = "channel"
+	fieldPriority = "priority"
+	channelPush   = "push"
 )
 
 type NudgeInventoryPayload struct {
@@ -59,11 +66,11 @@ func nudgeWriteContract(crn string, rawPayload []byte) (*sluice.WriteModel, erro
 		return nil, fmt.Errorf("nudge contract: invalid payload for CRN %s: %w", crn, err)
 	}
 	return &sluice.WriteModel{
-		Filter: bson.D{{Key: "_id", Value: crn}},
+		Filter: bson.D{{Key: fieldID, Value: crn}},
 		Update: bson.D{{Key: "$set", Value: bson.D{
 			{Key: "nudge_master_id", Value: p.NudgeMasterID},
-			{Key: "channel", Value: p.Channel},
-			{Key: "priority", Value: p.Priority},
+			{Key: fieldChannel, Value: p.Channel},
+			{Key: fieldPriority, Value: p.Priority},
 			{Key: "campaign_id", Value: p.CampaignID},
 			{Key: "expires_at", Value: p.ExpiresAt},
 			{Key: "last_updated", Value: p.LastUpdated},
@@ -74,7 +81,7 @@ func nudgeWriteContract(crn string, rawPayload []byte) (*sluice.WriteModel, erro
 
 func nudgeReadContract(crn string) (*source.ReadModel, error) {
 	return &source.ReadModel{
-		Filter: bson.D{{Key: "_id", Value: crn}},
+		Filter: bson.D{{Key: fieldID, Value: crn}},
 	}, nil
 }
 
@@ -84,10 +91,10 @@ func nudgeIndexContract(crn string, payload []byte) (map[string]interface{}, err
 		return nil, fmt.Errorf("index contract: invalid payload for CRN %s: %w", crn, err)
 	}
 	return map[string]interface{}{
-		"channel":  p.Channel,
-		"campaign": p.CampaignID,
-		"priority": float64(p.Priority),
-		"expires":  float64(p.ExpiresAt.UnixMilli()),
+		fieldChannel:  p.Channel,
+		"campaign":    p.CampaignID,
+		fieldPriority: float64(p.Priority),
+		"expires":     float64(p.ExpiresAt.UnixMilli()),
 	}, nil
 }
 
@@ -197,7 +204,7 @@ func run(log *slog.Logger) error {
 				crn := fmt.Sprintf("crn_%09d", written.Add(1))
 				payload, _ := json.Marshal(NudgeInventoryPayload{
 					NudgeMasterID: "nm_spring_retarget",
-					Channel:       "push",
+					Channel:       channelPush,
 					Priority:      3,
 					CampaignID:    "camp_001",
 					ExpiresAt:     time.Now().Add(24 * time.Hour),
@@ -231,7 +238,7 @@ func run(log *slog.Logger) error {
 					// Seed the CRN
 					payload, _ := json.Marshal(NudgeInventoryPayload{
 						NudgeMasterID: "nm_welcome_bonus",
-						Channel:       "push",
+						Channel:       channelPush,
 						Priority:      5,
 						CampaignID:    "camp_onboarding",
 						ExpiresAt:     time.Now().Add(48 * time.Hour),
@@ -248,8 +255,8 @@ func run(log *slog.Logger) error {
 
 				// Query for compound lookups
 				_, _ = sl.Query(ctx, sluice.Query{
-					Equality: map[string]string{"channel": "push"},
-					RangeMin: map[string]float64{"priority": 3},
+					Equality: map[string]string{fieldChannel: channelPush},
+					RangeMin: map[string]float64{fieldPriority: 3},
 				})
 			}
 		}

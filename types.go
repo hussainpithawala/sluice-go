@@ -153,6 +153,7 @@ type WriteModel struct {
 	Filter interface{}
 	Update interface{}
 	Upsert bool
+	Many   bool // When true, the sink applies UpdateMany / multi-row UPDATE.
 }
 
 // FlushRecord is the internal unit that travels through the pipeline.

@@ -157,7 +157,6 @@ func (e *Engine) startPreEvictionFlusher() {
 		defer e.wg.Done()
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
-
 		for {
 			select {
 			case <-e.stopCh:
@@ -267,6 +266,7 @@ func (e *Engine) flushBand(ctx context.Context, band int) error {
 			Filter:         wm.Filter,
 			Update:         wm.Update,
 			Upsert:         wm.Upsert,
+			Many:           wm.Many,
 		})
 		corrKeys = append(corrKeys, rec.CorrelationKey)
 	}

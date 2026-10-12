@@ -31,7 +31,8 @@ import (
 	"github.com/hussainpithawala/sluice-go/sink/docdb"
 	"github.com/hussainpithawala/sluice-go/source"
 	sourcedocdb "github.com/hussainpithawala/sluice-go/source/docdb"
-	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
 
 // ─── Shared constants (must match reader) ───────────────────────────────────
@@ -83,7 +84,10 @@ func nudgeWriteContract(ck string, raw []byte) (*sluice.WriteModel, error) {
 }
 
 func nudgeReadContract(ck string) (*source.ReadModel, error) {
-	return &source.ReadModel{Filter: bson.M{"_id": ck}}, nil
+	return &source.ReadModel{
+		Filter:  bson.M{"_id": ck},
+		Options: options.Find().SetLimit(100).SetBatchSize(50),
+	}, nil
 }
 
 func nudgeIndexContract(ck string, payload []byte) (map[string]interface{}, error) {

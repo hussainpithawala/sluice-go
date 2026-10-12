@@ -23,6 +23,12 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 )
 
+const (
+	metricNamespace = "sluice"
+	labelError      = "error"
+	labelBand       = "band"
+)
+
 // Recorder implements sluice.MetricsRecorder using Prometheus metrics.
 // All metrics are registered with the default Prometheus registry on creation.
 type Recorder struct {
@@ -71,97 +77,97 @@ func NewRecorderWithRegistry(namespace string, reg prometheus.Registerer) *Recor
 
 		// Write path
 		writeTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Namespace: "sluice",
+			Namespace: metricNamespace,
 			Subsystem: namespace,
 			Name:      "write_total",
 			Help:      "Total number of successful writes to the Redis journal.",
 		}, []string{}),
 
 		degradedWriteTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Namespace: "sluice",
+			Namespace: metricNamespace,
 			Subsystem: namespace,
 			Name:      "degraded_write_total",
 			Help:      "Total number of degraded writes (direct to sink when Redis is unavailable).",
-		}, []string{"error"}),
+		}, []string{labelError}),
 
 		redisOpDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
-			Namespace: "sluice",
+			Namespace: metricNamespace,
 			Subsystem: namespace,
 			Name:      "redis_op_duration_seconds",
 			Help:      "Duration of Redis operations in seconds.",
 			Buckets:   prometheus.DefBuckets,
-		}, []string{"op", "error"}),
+		}, []string{"op", labelError}),
 
 		flushDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
-			Namespace: "sluice",
+			Namespace: metricNamespace,
 			Subsystem: namespace,
 			Name:      "flush_duration_seconds",
 			Help:      "Duration of flush operations to the backing store in seconds.",
 			Buckets:   []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10},
-		}, []string{"band", "error"}),
+		}, []string{labelBand, labelError}),
 
 		flushBatchSize: prometheus.NewHistogramVec(prometheus.HistogramOpts{
-			Namespace: "sluice",
+			Namespace: metricNamespace,
 			Subsystem: namespace,
 			Name:      "flush_batch_size",
 			Help:      "Number of keys flushed per batch operation.",
 			Buckets:   []float64{1, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000},
-		}, []string{"band"}),
+		}, []string{labelBand}),
 
 		dirtyQueueDepth: prometheus.NewGaugeVec(prometheus.GaugeOpts{
-			Namespace: "sluice",
+			Namespace: metricNamespace,
 			Subsystem: namespace,
 			Name:      "dirty_queue_depth",
 			Help:      "Current depth of the dirty queue (pending flush) per band.",
-		}, []string{"band"}),
+		}, []string{labelBand}),
 
 		contractErrorTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Namespace: "sluice",
+			Namespace: metricNamespace,
 			Subsystem: namespace,
 			Name:      "contract_error_total",
 			Help:      "Total number of contract validation errors.",
 		}, []string{"correlation_key"}),
 
 		deadLetterTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Namespace: "sluice",
+			Namespace: metricNamespace,
 			Subsystem: namespace,
 			Name:      "dead_letter_total",
 			Help:      "Total number of records routed to the dead-letter queue.",
-		}, []string{"band"}),
+		}, []string{labelBand}),
 
 		dlqProcessTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Namespace: "sluice",
+			Namespace: metricNamespace,
 			Subsystem: namespace,
 			Name:      "dlq_process_total",
 			Help:      "Total number of DLQ records processed.",
 		}, []string{"strategy", "outcome"}),
 
 		unflushedLossTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Namespace: "sluice",
+			Namespace: metricNamespace,
 			Subsystem: namespace,
 			Name:      "unflushed_expiry_total",
 			Help:      "Dirty keys whose payload was gone before it could be flushed. Data loss; must stay 0.",
-		}, []string{"band"}),
+		}, []string{labelBand}),
 
 		// Hot/cold regime
 		warmupDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
-			Namespace: "sluice",
+			Namespace: metricNamespace,
 			Subsystem: namespace,
 			Name:      "warmup_duration_seconds",
 			Help:      "Duration of HotLoad (warm-up) operations in seconds.",
 			Buckets:   []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5},
-		}, []string{"error"}),
+		}, []string{labelError}),
 
 		readDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
-			Namespace: "sluice",
+			Namespace: metricNamespace,
 			Subsystem: namespace,
 			Name:      "read_duration_seconds",
 			Help:      "Duration of Read operations in seconds.",
 			Buckets:   prometheus.DefBuckets,
-		}, []string{"is_hot", "error"}),
+		}, []string{"is_hot", labelError}),
 
 		hotSetSize: prometheus.NewGaugeVec(prometheus.GaugeOpts{
-			Namespace: "sluice",
+			Namespace: metricNamespace,
 			Subsystem: namespace,
 			Name:      "hot_set_size",
 			Help:      "Current number of hot correlation keys in the journal.",
@@ -169,28 +175,28 @@ func NewRecorderWithRegistry(namespace string, reg prometheus.Registerer) *Recor
 
 		// L1 Local Journal
 		localCacheHitTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Namespace: "sluice",
+			Namespace: metricNamespace,
 			Subsystem: namespace,
 			Name:      "local_cache_hit_total",
 			Help:      "Total number of L1 local cache hits.",
 		}, []string{}),
 
 		localCacheMissTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Namespace: "sluice",
+			Namespace: metricNamespace,
 			Subsystem: namespace,
 			Name:      "local_cache_miss_total",
 			Help:      "Total number of L1 local cache misses.",
 		}, []string{"reason"}),
 
 		localSetSize: prometheus.NewGaugeVec(prometheus.GaugeOpts{
-			Namespace: "sluice",
+			Namespace: metricNamespace,
 			Subsystem: namespace,
 			Name:      "local_set_size",
 			Help:      "Current number of entries in the L1 local cache.",
 		}, []string{}),
 
 		broadcastLag: prometheus.NewHistogramVec(prometheus.HistogramOpts{
-			Namespace: "sluice",
+			Namespace: metricNamespace,
 			Subsystem: namespace,
 			Name:      "broadcast_lag_seconds",
 			Help:      "Lag between a write and its broadcast arrival at peer pods.",

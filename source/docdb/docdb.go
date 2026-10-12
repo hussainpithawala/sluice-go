@@ -8,10 +8,10 @@ import (
 	"time"
 
 	"github.com/hussainpithawala/sluice-go/source"
-	"go.mongodb.org/mongo-driver/bson"
-	"go.mongodb.org/mongo-driver/mongo"
-	"go.mongodb.org/mongo-driver/mongo/options"
-	"go.mongodb.org/mongo-driver/mongo/readpref"
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
+	"go.mongodb.org/mongo-driver/v2/mongo/readpref"
 )
 
 // Config holds connection parameters for the DocumentDB / MongoDB read source.
@@ -46,7 +46,7 @@ func NewSource(ctx context.Context, cfg Config) (*Source, error) {
 		SetConnectTimeout(cfg.ConnectTimeout).
 		SetServerSelectionTimeout(cfg.ServerSelectionTimeout)
 
-	client, err := mongo.Connect(ctx, opts)
+	client, err := mongo.Connect(opts)
 	if err != nil {
 		return nil, fmt.Errorf("sluice/source/documentdb: connect: %w", err)
 	}

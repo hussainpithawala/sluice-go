@@ -13,7 +13,7 @@ import (
 	sluice "github.com/hussainpithawala/sluice-go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/v2/bson"
 )
 
 func TestHotLoadAndRead_Regime(t *testing.T) {
@@ -88,6 +88,7 @@ func TestWriteIdempotent_ExactlyOnce(t *testing.T) {
 
 	// Different idempotency key succeeds
 	err = sl.WriteIdempotent(ctx, correlationKey, payload, fmt.Sprintf("kafka_offset_100_%s", t.Name()))
+	require.NoError(t, err)
 
 	// Only 1 document should exist in Mongo despite 2 calls
 	n := countDocs(t, coll, bson.M{"_id": correlationKey})

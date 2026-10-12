@@ -35,10 +35,17 @@ import (
 	docdbsink "github.com/hussainpithawala/sluice-go/sink/docdb"
 	"github.com/hussainpithawala/sluice-go/source"
 	docdbsource "github.com/hussainpithawala/sluice-go/source/docdb"
-	"go.mongodb.org/mongo-driver/bson"
-	"go.mongodb.org/mongo-driver/mongo"
-	"go.mongodb.org/mongo-driver/mongo/options"
-	"go.mongodb.org/mongo-driver/mongo/readpref"
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
+	"go.mongodb.org/mongo-driver/v2/mongo/readpref"
+)
+
+const (
+	fieldID       = "_id"
+	fieldChannel  = "channel"
+	fieldPriority = "priority"
+	channelPush   = "push"
 )
 
 var (
@@ -67,10 +74,10 @@ func nudgeWriteContract(correlationKey string, rawPayload []byte) (*sluice.Write
 	// MongoDB update operation with $set
 	update := bson.M{
 		"$set": bson.M{
-			"_id":             correlationKey,
+			fieldID:           correlationKey,
 			"nudge_master_id": p.NudgeMasterID,
-			"channel":         p.Channel,
-			"priority":        p.Priority,
+			fieldChannel:      p.Channel,
+			fieldPriority:     p.Priority,
 			"campaign_id":     p.CampaignID,
 			"expires_at":      p.ExpiresAt,
 			"last_updated":    p.LastUpdated,
@@ -78,7 +85,7 @@ func nudgeWriteContract(correlationKey string, rawPayload []byte) (*sluice.Write
 	}
 
 	return &sluice.WriteModel{
-		Filter: bson.M{"_id": correlationKey},
+		Filter: bson.M{fieldID: correlationKey},
 		Update: update,
 		Upsert: true,
 	}, nil
@@ -88,7 +95,8 @@ func nudgeWriteContract(correlationKey string, rawPayload []byte) (*sluice.Write
 // ReadContract translates a correlation key into a MongoDB filter.
 func nudgeReadContract(correlationKey string) (*source.ReadModel, error) {
 	return &source.ReadModel{
-		Filter: bson.M{"_id": correlationKey},
+		Filter:  bson.M{fieldID: correlationKey},
+		Options: options.Find().SetLimit(100).SetBatchSize(50),
 	}, nil
 }
 
@@ -100,10 +108,10 @@ func nudgeIndexContract(correlationKey string, payload []byte) (map[string]inter
 		return nil, fmt.Errorf("index contract: invalid payload for correlation_key %s: %w", correlationKey, err)
 	}
 	return map[string]interface{}{
-		"channel":  p.Channel,                        // equality: SET
-		"campaign": p.CampaignID,                     // equality: SET
-		"priority": float64(p.Priority),              // range:    ZSET
-		"expires":  float64(p.ExpiresAt.UnixMilli()), // range:    ZSET
+		fieldChannel:  p.Channel,                        // equality: SET
+		"campaign":    p.CampaignID,                     // equality: SET
+		fieldPriority: float64(p.Priority),              // range:    ZSET
+		"expires":     float64(p.ExpiresAt.UnixMilli()), // range:    ZSET
 	}, nil
 }
 
@@ -166,7 +174,7 @@ func (m *logMetrics) RecordUnflushedExpiry(ns, band string, count int) {
 func simulatedConsumer(ctx context.Context, workerID int, sl *sluice.Sluice, log *slog.Logger, written *atomic.Int64, wg *sync.WaitGroup) {
 	defer wg.Done()
 	nudgeMasters := []string{"nm_spring_retarget_2026", "nm_cart_abandonment", "nm_win_back_q2", "nm_first_purchase", "nm_loyalty_upgrade"}
-	channels := []string{"push", "email", "sms", "in_app"}
+	channels := []string{channelPush, "email", "sms", "in_app"}
 
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
@@ -231,7 +239,7 @@ func hotRegimeSimulator(ctx context.Context, sl *sluice.Sluice, log *slog.Logger
 				log.Info("hot regime: HotLoad (new correlation_key, writing directly)", "correlationKey", correlationKey, "err", err)
 				newPayload, _ := json.Marshal(NudgeInventoryPayload{
 					NudgeMasterID: "nm_welcome_bonus",
-					Channel:       "push",
+					Channel:       channelPush,
 					Priority:      5,
 					CampaignID:    "camp_onboarding",
 					ExpiresAt:     time.Now().Add(48 * time.Hour),
@@ -277,15 +285,15 @@ func hotRegimeSimulator(ctx context.Context, sl *sluice.Sluice, log *slog.Logger
 			log.Info("hot regime: sync HTTP response served from journal",
 				"correlationKey", correlationKey,
 				"read_latency_us", readLatency.Microseconds(),
-				"priority", readResult.Priority,
-				"channel", readResult.Channel,
+				fieldPriority, readResult.Priority,
+				fieldChannel, readResult.Channel,
 			)
 
 			// Step 6: Demonstrate Query() — find all hot correlation_keys with channel=push AND priority >= 3.
 			if sessionCount%3 == 0 {
 				results, queryErr := sl.Query(ctx, sluice.Query{
-					Equality: map[string]string{"channel": "push"},
-					RangeMin: map[string]float64{"priority": 3},
+					Equality: map[string]string{fieldChannel: channelPush},
+					RangeMin: map[string]float64{fieldPriority: 3},
 				})
 				if queryErr != nil {
 					log.Warn("hot regime: Query failed", "err", queryErr)
@@ -337,7 +345,7 @@ func run(log *slog.Logger) (err error) {
 		SetConnectTimeout(10 * time.Second).
 		SetServerSelectionTimeout(5 * time.Second)
 
-	mongoClient, err := mongo.Connect(ctx, clientOpts)
+	mongoClient, err := mongo.Connect(clientOpts)
 	if err != nil {
 		return fmt.Errorf("connect to documentdb: %w", err)
 	}
@@ -518,7 +526,7 @@ func ensureCollectionExists(ctx context.Context, client *mongo.Client, database,
 	// Create indexes for common query patterns
 	indexes := []mongo.IndexModel{
 		{
-			Keys:    bson.D{{Key: "channel", Value: 1}},
+			Keys:    bson.D{{Key: fieldChannel, Value: 1}},
 			Options: options.Index().SetName("idx_channel"),
 		},
 		{
@@ -526,7 +534,7 @@ func ensureCollectionExists(ctx context.Context, client *mongo.Client, database,
 			Options: options.Index().SetName("idx_campaign_id"),
 		},
 		{
-			Keys:    bson.D{{Key: "priority", Value: 1}},
+			Keys:    bson.D{{Key: fieldPriority, Value: 1}},
 			Options: options.Index().SetName("idx_priority"),
 		},
 		{
