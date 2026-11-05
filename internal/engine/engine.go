@@ -225,7 +225,13 @@ func (e *Engine) lockedFlush(ctx context.Context, band int, drain bool) error {
 		e.metrics.RecordFlushLockSkip(e.cfg.Namespace, bandStr)
 		return nil
 	}
-	defer e.shield.ReleaseFlushLock(ctx, band)
+	defer func(shield *shield.Shield, ctx context.Context, band int) {
+		err := shield.ReleaseFlushLock(ctx, band)
+		if err != nil {
+			slog.Warn("sluice: release flush lock error",
+				"namespace", e.cfg.Namespace, "band", band)
+		}
+	}(e.shield, ctx, band)
 	return e.flushBand(ctx, band)
 }
 
