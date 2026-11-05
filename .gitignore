@@ -14,3 +14,5 @@ coverage.html
 *.iml
 .DS_Store
 Thumbs.db
+/.claude/settings.local.json
+/.claude/

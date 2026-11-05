@@ -69,11 +69,14 @@ type Config struct {
 	Namespace          string
 	BandCount          int
 	FlushWindow        time.Duration
+	FlushTimeout       time.Duration // Explicit flush context timeout; zero falls back to FlushWindow*4
 	MaxBatchSize       int
 	KeyTTL             time.Duration // In-flight dirty key TTL
 	ActivityWindow     time.Duration // Hot correlation_key session TTL (default 4h)
 	DegradedModeDirect bool
 	HotAwareFlush      bool          // Extend TTL on successful commit
+	FlushLock          bool          // Acquire a per-band Redis advisory lock before flushing
+	AdaptiveBatch      bool          // Enable adaptive batch sizing based on flush duration
 	ContentDedup       bool          // Enable xxHash64 payload deduplication
 	IdempotencyTTL     time.Duration // TTL for WriteIdempotent keys
 

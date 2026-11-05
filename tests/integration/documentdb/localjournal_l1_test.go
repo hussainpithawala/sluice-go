@@ -91,6 +91,8 @@ func (r *countingRecorder) RecordRedisOp(_ string, op string, _ time.Duration, _
 	r.mu.Unlock()
 }
 func (r *countingRecorder) RecordFlush(string, string, int, time.Duration, error) {}
+func (r *countingRecorder) RecordFlushTimeout(string, string, int, time.Duration) {}
+func (r *countingRecorder) RecordFlushLockSkip(string, string)                    {}
 func (r *countingRecorder) RecordDirtyQueueDepth(string, string, int)             {}
 func (r *countingRecorder) RecordContractError(string, string, error)             {}
 func (r *countingRecorder) RecordDeadLetter(string, string, int)                  {}

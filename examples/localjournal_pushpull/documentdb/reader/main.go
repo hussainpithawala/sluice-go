@@ -107,14 +107,16 @@ func (m *logMetrics) RecordDirtyQueueDepth(ns, band string, depth int)          
 func (m *logMetrics) RecordContractError(ns, ck string, err error) {
 	m.log.Error("contract error", "ns", ns, "ck", ck, "err", err)
 }
-func (m *logMetrics) RecordDeadLetter(ns, band string, count int)                {}
-func (m *logMetrics) RecordDLQProcess(ns, s string, p, ok, f int)                {}
-func (m *logMetrics) RecordWarmUp(ns string, d time.Duration, err error)         {}
-func (m *logMetrics) RecordRead(ns string, d time.Duration, hot bool, err error) {}
-func (m *logMetrics) RecordHotSetSize(ns string, size int)                       {}
-func (m *logMetrics) RecordLocalCacheHit(ns string)                              {} // silent; transitions are the signal
-func (m *logMetrics) RecordLocalCacheMiss(ns string, r localjournal.MissReason)  {}
-func (m *logMetrics) RecordLocalSetSize(ns string, size int)                     {}
+func (m *logMetrics) RecordFlushTimeout(_ string, _ string, _ int, _ time.Duration) {}
+func (m *logMetrics) RecordFlushLockSkip(_ string, _ string)                        {}
+func (m *logMetrics) RecordDeadLetter(ns, band string, count int)                   {}
+func (m *logMetrics) RecordDLQProcess(ns, s string, p, ok, f int)                   {}
+func (m *logMetrics) RecordWarmUp(ns string, d time.Duration, err error)            {}
+func (m *logMetrics) RecordRead(ns string, d time.Duration, hot bool, err error)    {}
+func (m *logMetrics) RecordHotSetSize(ns string, size int)                          {}
+func (m *logMetrics) RecordLocalCacheHit(ns string)                                 {} // silent; transitions are the signal
+func (m *logMetrics) RecordLocalCacheMiss(ns string, r localjournal.MissReason)     {}
+func (m *logMetrics) RecordLocalSetSize(ns string, size int)                        {}
 func (m *logMetrics) RecordBroadcastLag(ns string, lag time.Duration) {
 	m.log.Info("broadcast-lag", "ns", ns, "lag_ms", lag.Milliseconds())
 }

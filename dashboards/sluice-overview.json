@@ -278,12 +278,106 @@
       "type": "timeseries"
     },
     {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "bars",
+            "fillOpacity": 50,
+            "lineWidth": 1
+          },
+          "unit": "ops"
+        }
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 12,
+        "x": 0,
+        "y": 16
+      },
+      "id": 20,
+      "options": {
+        "legend": {
+          "calcs": [
+            "sum",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (band) (rate(sluice_${namespace}_flush_timeout_total[1m])) or vector(0)",
+          "legendFormat": "timeouts/s band {{band}}"
+        }
+      ],
+      "title": "Flush Timeouts (context deadline exceeded)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "bars",
+            "fillOpacity": 50,
+            "lineWidth": 1
+          },
+          "unit": "ops"
+        }
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 12,
+        "x": 12,
+        "y": 16
+      },
+      "id": 21,
+      "options": {
+        "legend": {
+          "calcs": [
+            "sum",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (band) (rate(sluice_${namespace}_flush_lock_skip_total[1m])) or vector(0)",
+          "legendFormat": "lock skips/s band {{band}}"
+        }
+      ],
+      "title": "Flush Lock Skips (band held by another pod)",
+      "type": "timeseries"
+    },
+    {
       "collapsed": false,
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 16
+        "y": 22
       },
       "id": 104,
       "title": "Hot/Cold Regime",
@@ -315,7 +409,7 @@
         "h": 6,
         "w": 9,
         "x": 0,
-        "y": 17
+        "y": 23
       },
       "id": 11,
       "options": {
@@ -366,7 +460,7 @@
         "h": 6,
         "w": 6,
         "x": 9,
-        "y": 17
+        "y": 23
       },
       "id": 12,
       "options": {
@@ -414,7 +508,7 @@
         "h": 6,
         "w": 9,
         "x": 15,
-        "y": 17
+        "y": 23
       },
       "id": 13,
       "options": {
@@ -445,7 +539,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 23
+        "y": 29
       },
       "id": 102,
       "title": "L1 Local Journal (v1.0.8)",
@@ -488,7 +582,7 @@
         "h": 6,
         "w": 5,
         "x": 0,
-        "y": 24
+        "y": 30
       },
       "id": 6,
       "options": {
@@ -534,7 +628,7 @@
         "h": 6,
         "w": 7,
         "x": 9,
-        "y": 24
+        "y": 30
       },
       "id": 7,
       "options": {
@@ -580,7 +674,7 @@
         "h": 6,
         "w": 8,
         "x": 16,
-        "y": 24
+        "y": 30
       },
       "id": 8,
       "options": {
@@ -611,7 +705,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 30
+        "y": 36
       },
       "id": 103,
       "title": "DLQ & Errors",
@@ -639,7 +733,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 31
+        "y": 37
       },
       "id": 9,
       "options": {
@@ -685,7 +779,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 31
+        "y": 37
       },
       "id": 10,
       "options": {
@@ -783,7 +877,7 @@
         "h": 6,
         "w": 4,
         "x": 5,
-        "y": 24
+        "y": 30
       },
       "id": 15,
       "options": {
@@ -831,7 +925,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 31
+        "y": 37
       },
       "id": 16,
       "options": {
@@ -862,7 +956,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 39
+        "y": 45
       },
       "id": 105,
       "title": "Durability (must stay at 0)",
@@ -899,7 +993,7 @@
         "h": 6,
         "w": 6,
         "x": 0,
-        "y": 40
+        "y": 46
       },
       "id": 17,
       "options": {
@@ -947,7 +1041,7 @@
         "h": 6,
         "w": 9,
         "x": 6,
-        "y": 40
+        "y": 46
       },
       "id": 18,
       "options": {
@@ -994,7 +1088,7 @@
         "h": 6,
         "w": 9,
         "x": 15,
-        "y": 40
+        "y": 46
       },
       "id": 19,
       "options": {

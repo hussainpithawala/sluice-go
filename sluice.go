@@ -80,9 +80,12 @@ func (b *Builder) WithIndexBulkContract(fn IndexBulkContract) *Builder {
 
 func (b *Builder) WithWriteContract(wc WriteContract) *Builder { b.writeContract = wc; return b }
 func (b *Builder) WithFlushWindow(d time.Duration) *Builder    { b.cfg.FlushWindow = d; return b }
+func (b *Builder) WithFlushTimeout(d time.Duration) *Builder   { b.cfg.FlushTimeout = d; return b }
 func (b *Builder) WithMaxBatchSize(n int) *Builder             { b.cfg.MaxBatchSize = n; return b }
 func (b *Builder) WithBandCount(n int) *Builder                { b.cfg.BandCount = n; return b }
 func (b *Builder) WithKeyTTL(d time.Duration) *Builder         { b.cfg.KeyTTL = d; return b }
+func (b *Builder) WithFlushLock(v bool) *Builder               { b.cfg.FlushLock = v; return b }
+func (b *Builder) WithAdaptiveBatch(v bool) *Builder           { b.cfg.AdaptiveBatch = v; return b }
 
 // WithDegradedModeDirect makes Write() fall back to a direct datastore write
 // when the Redis write fails — but only when no older version of the key is
