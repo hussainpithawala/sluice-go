@@ -19,10 +19,13 @@ type Config struct {
 	Namespace      string
 	BandCount      int
 	FlushWindow    time.Duration
+	FlushTimeout   time.Duration // Explicit flush context timeout; zero falls back to FlushWindow*4
 	MaxBatchSize   int
 	KeyTTL         time.Duration // Post-flush TTL for cold payloads; also the backlog flush threshold
 	ActivityWindow time.Duration // Hot correlation_key session TTL (post-flush TTL for hot payloads)
 	HotAwareFlush  bool          // Give flushed hot keys the ActivityWindow TTL and refresh their marker
+	FlushLock      bool          // Acquire a per-band Redis advisory lock before flushing
+	AdaptiveBatch  bool          // Enable adaptive batch sizing based on flush duration
 }
 
 // MetricsRecorder is the subset of telemetry methods the engine needs.
@@ -34,6 +37,8 @@ type MetricsRecorder interface {
 	// loss (eviction, FLUSHDB, manual deletion) and should page someone.
 	RecordUnflushedExpiry(namespace, band string, count int)
 	RecordFlush(namespace, band string, batchSize int, duration time.Duration, err error)
+	RecordFlushTimeout(namespace, band string, batchSize int, deadline time.Duration)
+	RecordFlushLockSkip(namespace, band string)
 	RecordDirtyQueueDepth(namespace, band string, depth int)
 	RecordContractError(namespace, correlationKey string, err error)
 	RecordDeadLetter(namespace, band string, count int)
@@ -80,6 +85,7 @@ type Engine struct {
 	writeContract WriteContract
 	metrics       MetricsRecorder
 	callback      OnFlushCallback
+	adaptive      *AdaptiveBatch
 	volumeSignals []chan struct{}
 	wg            sync.WaitGroup
 	stopCh        chan struct{}
@@ -99,6 +105,14 @@ func New(
 	for i := range signals {
 		signals[i] = make(chan struct{}, 1)
 	}
+	var ab *AdaptiveBatch
+	if cfg.AdaptiveBatch {
+		target := cfg.FlushTimeout
+		if target <= 0 {
+			target = cfg.FlushWindow * 4
+		}
+		ab = NewAdaptiveBatch(cfg.MaxBatchSize, 100, target*3/5)
+	}
 	return &Engine{
 		cfg:           cfg,
 		shield:        sh,
@@ -106,6 +120,7 @@ func New(
 		writeContract: contract,
 		metrics:       metrics,
 		callback:      cb,
+		adaptive:      ab,
 		volumeSignals: signals,
 		stopCh:        make(chan struct{}),
 	}
@@ -179,6 +194,47 @@ func (e *Engine) startPreEvictionFlusher() {
 	}()
 }
 
+func (e *Engine) effectiveBatchSize() int {
+	if e.adaptive != nil {
+		return e.adaptive.Size()
+	}
+	return e.cfg.MaxBatchSize
+}
+
+func (e *Engine) flushTimeout() time.Duration {
+	if e.cfg.FlushTimeout > 0 {
+		return e.cfg.FlushTimeout
+	}
+	return e.cfg.FlushWindow * 4
+}
+
+// lockedFlush acquires the per-band advisory lock before flushing (when
+// FlushLock is enabled) and skips the cycle if another pod holds it.
+// On shutdown (drain=true) the lock is bypassed so the final flush always runs.
+func (e *Engine) lockedFlush(ctx context.Context, band int, drain bool) error {
+	if !e.cfg.FlushLock || drain {
+		return e.flushBand(ctx, band)
+	}
+	bandStr := fmt.Sprintf("%d", band)
+	acquired, err := e.shield.TryFlushLock(ctx, band, e.flushTimeout()+5*time.Second)
+	if err != nil {
+		e.metrics.RecordFlushLockSkip(e.cfg.Namespace, bandStr)
+		return err
+	}
+	if !acquired {
+		e.metrics.RecordFlushLockSkip(e.cfg.Namespace, bandStr)
+		return nil
+	}
+	defer func(shield *shield.Shield, ctx context.Context, band int) {
+		err := shield.ReleaseFlushLock(ctx, band)
+		if err != nil {
+			slog.Warn("sluice: release flush lock error",
+				"namespace", e.cfg.Namespace, "band", band)
+		}
+	}(e.shield, ctx, band)
+	return e.flushBand(ctx, band)
+}
+
 func (e *Engine) runBand(band int) {
 	defer e.wg.Done()
 	ticker := time.NewTicker(e.cfg.FlushWindow)
@@ -188,16 +244,16 @@ func (e *Engine) runBand(band int) {
 		select {
 		case <-e.stopCh:
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			_ = e.flushBand(ctx, band)
+			_ = e.lockedFlush(ctx, band, true)
 			cancel()
 			return
 		case <-ticker.C:
-			ctx, cancel := context.WithTimeout(context.Background(), e.cfg.FlushWindow*4)
-			_ = e.flushBand(ctx, band)
+			ctx, cancel := context.WithTimeout(context.Background(), e.flushTimeout())
+			_ = e.lockedFlush(ctx, band, false)
 			cancel()
 		case <-e.volumeSignals[band]:
-			ctx, cancel := context.WithTimeout(context.Background(), e.cfg.FlushWindow*4)
-			_ = e.flushBand(ctx, band)
+			ctx, cancel := context.WithTimeout(context.Background(), e.flushTimeout())
+			_ = e.lockedFlush(ctx, band, false)
 			cancel()
 		}
 	}
@@ -216,12 +272,25 @@ func (e *Engine) runBand(band int) {
 func (e *Engine) flushBand(ctx context.Context, band int) error {
 	start := time.Now()
 	bandStr := fmt.Sprintf("%d", band)
+	var batchSize int
+	defer func() {
+		timedOut := errors.Is(ctx.Err(), context.DeadlineExceeded)
+		if timedOut {
+			e.metrics.RecordFlushTimeout(e.cfg.Namespace, bandStr, batchSize, e.flushTimeout())
+			slog.Warn("sluice: flush timed out",
+				"namespace", e.cfg.Namespace, "band", band,
+				"batch_size", batchSize, "deadline", e.flushTimeout())
+		}
+		if e.adaptive != nil && batchSize > 0 {
+			e.adaptive.Adjust(time.Since(start), timedOut)
+		}
+	}()
 
 	if depth, err := e.shield.DirtyQueueDepth(ctx, band); err == nil {
 		e.metrics.RecordDirtyQueueDepth(e.cfg.Namespace, bandStr, int(depth))
 	}
 
-	records, err := e.shield.DrainBand(ctx, band, e.cfg.MaxBatchSize)
+	records, err := e.shield.DrainBand(ctx, band, e.effectiveBatchSize())
 	if err != nil {
 		e.metrics.RecordFlush(e.cfg.Namespace, bandStr, 0, time.Since(start), err)
 		return err
@@ -275,6 +344,7 @@ func (e *Engine) flushBand(ctx context.Context, band int) error {
 	if len(models) == 0 {
 		return nil
 	}
+	batchSize = len(models)
 
 	// Phase 2: BulkWrite.
 	result, flushErr := e.sink.BulkWrite(ctx, models)

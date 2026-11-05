@@ -33,10 +33,13 @@ func (c Config) toInternal() engine.Config {
 		Namespace:      c.Namespace,
 		BandCount:      c.BandCount,
 		FlushWindow:    c.FlushWindow,
+		FlushTimeout:   c.FlushTimeout,
 		MaxBatchSize:   c.MaxBatchSize,
 		KeyTTL:         c.KeyTTL,
 		ActivityWindow: c.ActivityWindow,
 		HotAwareFlush:  c.HotAwareFlush,
+		FlushLock:      c.FlushLock,
+		AdaptiveBatch:  c.AdaptiveBatch,
 	}
 }
 

@@ -153,6 +153,8 @@ func (m *logMetrics) RecordRedisOp(ns, op string, d time.Duration, err error) {
 func (m *logMetrics) RecordFlush(ns, band string, batch int, d time.Duration, err error) {
 	m.log.Info("flush", "ns", ns, "band", band, "batch", batch, "ms", d.Milliseconds(), "err", err)
 }
+func (m *logMetrics) RecordFlushTimeout(_ string, _ string, _ int, _ time.Duration) {}
+func (m *logMetrics) RecordFlushLockSkip(_ string, _ string)                        {}
 func (m *logMetrics) RecordDirtyQueueDepth(ns, band string, depth int) {
 	if depth > 100 {
 		m.log.Warn("dirty queue depth", "ns", ns, "band", band, "depth", depth)

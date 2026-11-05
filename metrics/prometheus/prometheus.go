@@ -40,6 +40,8 @@ type Recorder struct {
 	redisOpDuration    *prometheus.HistogramVec
 	flushDuration      *prometheus.HistogramVec
 	flushBatchSize     *prometheus.HistogramVec
+	flushTimeoutTotal  *prometheus.CounterVec
+	flushLockSkipTotal *prometheus.CounterVec
 	dirtyQueueDepth    *prometheus.GaugeVec
 	contractErrorTotal *prometheus.CounterVec
 	deadLetterTotal    *prometheus.CounterVec
@@ -112,6 +114,20 @@ func NewRecorderWithRegistry(namespace string, reg prometheus.Registerer) *Recor
 			Name:      "flush_batch_size",
 			Help:      "Number of keys flushed per batch operation.",
 			Buckets:   []float64{1, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000},
+		}, []string{labelBand}),
+
+		flushTimeoutTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: metricNamespace,
+			Subsystem: namespace,
+			Name:      "flush_timeout_total",
+			Help:      "Total number of flush operations that exceeded the context deadline.",
+		}, []string{labelBand}),
+
+		flushLockSkipTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: metricNamespace,
+			Subsystem: namespace,
+			Name:      "flush_lock_skip_total",
+			Help:      "Total number of flush cycles skipped because another pod held the band lock.",
 		}, []string{labelBand}),
 
 		dirtyQueueDepth: prometheus.NewGaugeVec(prometheus.GaugeOpts{
@@ -211,6 +227,8 @@ func NewRecorderWithRegistry(namespace string, reg prometheus.Registerer) *Recor
 		r.redisOpDuration,
 		r.flushDuration,
 		r.flushBatchSize,
+		r.flushTimeoutTotal,
+		r.flushLockSkipTotal,
 		r.dirtyQueueDepth,
 		r.contractErrorTotal,
 		r.deadLetterTotal,
@@ -257,6 +275,14 @@ func (r *Recorder) RecordFlush(_ string, bandStr string, batchSize int, duration
 	}
 	r.flushDuration.WithLabelValues(bandStr, errStr).Observe(duration.Seconds())
 	r.flushBatchSize.WithLabelValues(bandStr).Observe(float64(batchSize))
+}
+
+func (r *Recorder) RecordFlushTimeout(_ string, bandStr string, _ int, _ time.Duration) {
+	r.flushTimeoutTotal.WithLabelValues(bandStr).Inc()
+}
+
+func (r *Recorder) RecordFlushLockSkip(_ string, bandStr string) {
+	r.flushLockSkipTotal.WithLabelValues(bandStr).Inc()
 }
 
 func (r *Recorder) RecordDirtyQueueDepth(_ string, bandStr string, depth int) {
@@ -341,6 +367,8 @@ func (r *Recorder) Unregister(reg prometheus.Registerer) {
 	reg.Unregister(r.redisOpDuration)
 	reg.Unregister(r.flushDuration)
 	reg.Unregister(r.flushBatchSize)
+	reg.Unregister(r.flushTimeoutTotal)
+	reg.Unregister(r.flushLockSkipTotal)
 	reg.Unregister(r.dirtyQueueDepth)
 	reg.Unregister(r.contractErrorTotal)
 	reg.Unregister(r.deadLetterTotal)

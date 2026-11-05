@@ -139,7 +139,9 @@ func (m *logMetrics) RecordRedisOp(ns, op string, d time.Duration, err error) {
 func (m *logMetrics) RecordFlush(ns, band string, b int, d time.Duration, err error) {
 	m.log.Info("flush", "ns", ns, "band", band, "batch", b, "err", err)
 }
-func (m *logMetrics) RecordDirtyQueueDepth(ns, band string, depth int) {}
+func (m *logMetrics) RecordFlushTimeout(_ string, _ string, _ int, _ time.Duration) {}
+func (m *logMetrics) RecordFlushLockSkip(_ string, _ string)                        {}
+func (m *logMetrics) RecordDirtyQueueDepth(ns, band string, depth int)              {}
 func (m *logMetrics) RecordContractError(ns, ck string, err error) {
 	m.log.Error("contract error", "ns", ns, "ck", ck, "err", err)
 }

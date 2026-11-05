@@ -130,6 +130,7 @@ go get github.com/hussainpithawala/sluice-go@v1.1.0
 | `DocDBBulkReadModel.Options` is now `*options.FindOptionsBuilder` | Build it with `options.Find().SetSort(...).SetLimit(...)` |
 | `docdb.Sink.Client()` returns a v2 `*mongo.Client` | Pass a v2 client to `NewSourceWithClient` if you build one yourself |
 | `go.mod` requires Go 1.26 | Upgrade your toolchain |
+| `MetricsRecorder` gains `RecordFlushTimeout` and `RecordFlushLockSkip` | Add no-op stubs if you implement the interface yourself |
 
 `WriteModel.Many` is new and defaults to `false`, so existing contracts behave exactly as before. See
 [Multi-document writes](#multi-document-writes). Coming from 1.0.7 or earlier, also read the
@@ -266,6 +267,37 @@ Keys are committed only after the sink confirms the batch, and the engine handle
 
 A commit is conditional: it removes a dirty entry only if the key's sequence is unchanged. A newer
 write that lands mid-flush therefore stays dirty and goes out in the next batch.
+
+### Burst-load resilience
+
+Under default settings, the flush context timeout is `4 × FlushWindow`. When a burst pushes a band's
+dirty set well above `MaxBatchSize`, every pod drains and flushes the same records concurrently. If
+the combined write pressure causes the flush to exceed the fixed timeout, nothing is committed and the
+same batch retries every cycle — head-of-line blocking until payloads expire.
+
+Three opt-in features address this ([RFP #34](docs/issues/flush-timeout-burst.md)):
+
+| Feature | Builder method | Effect |
+|---|---|---|
+| **Configurable flush timeout** | `WithFlushTimeout(d)` | Replaces the hard-coded `FlushWindow * 4` multiplier with an explicit deadline. Zero preserves the default. |
+| **Per-band flush lock** | `WithFlushLock(true)` | An advisory Redis lock (`SET NX PX`) so only one pod flushes a given band at a time. Others skip the cycle. The lock auto-expires at `FlushTimeout + 5s`, so a crashed pod never blocks others indefinitely. |
+| **Adaptive batch sizing** | `WithAdaptiveBatch(true)` | Adjusts the effective batch size after each flush. On a timeout the size halves (floor 100); on a fast flush (< 60% of the timeout) it grows 10% (ceiling `MaxBatchSize`). This prevents a single burst from causing sustained head-of-line blocking. |
+
+When a flush times out, the engine emits a structured `slog.Warn` and fires `RecordFlushTimeout` so
+operators can alert without parsing error strings. When a pod skips a band because another pod holds
+the lock, `RecordFlushLockSkip` is incremented.
+
+All three features default to off and preserve current behaviour when not configured. For production
+deployments under burst-prone traffic, the recommended baseline is:
+
+```go
+sluice.New("ns").
+    WithFlushTimeout(20 * time.Second).
+    WithFlushLock(true).
+    WithAdaptiveBatch(true).
+    // ...
+    Build(ctx)
+```
 
 ### Write-path options
 
@@ -662,7 +694,7 @@ them again. The namespace must be a valid Prometheus identifier. Metrics are nam
 | Area | Metrics |
 |---|---|
 | Write path | `write_total`, `degraded_write_total{error}`, `redis_op_duration_seconds{op,error}` |
-| Flush engine | `flush_duration_seconds{band,error}`, `flush_batch_size{band}`, `dirty_queue_depth{band}` |
+| Flush engine | `flush_duration_seconds{band,error}`, `flush_batch_size{band}`, `dirty_queue_depth{band}`, `flush_timeout_total{band}`, `flush_lock_skip_total{band}` |
 | Read path | `read_duration_seconds{is_hot,error}`, `warmup_duration_seconds{error}`, `hot_set_size` |
 | L1 / broadcast | `local_cache_hit_total`, `local_cache_miss_total{reason}`, `local_set_size`, `broadcast_lag_seconds` |
 | Failures | `contract_error_total{correlation_key}`, `dead_letter_total{band}`, `dlq_process_total{strategy,outcome}` |
@@ -672,6 +704,8 @@ Signals worth watching:
 - A falling `is_hot="true"` share of reads means sessions age out before their traffic ends, so raise `ActivityWindow`.
 - The L1 hit ratio tells you how to size `MaxEntries` and `LocalTTL`.
 - `op="degraded_refused"` counts writes refused to preserve ordering.
+- A non-zero `flush_timeout_total` means flushes exceed their deadline. Enable `WithAdaptiveBatch(true)` or lower `MaxBatchSize`.
+- A sustained high `flush_lock_skip_total` means one pod is slow or stuck on a band. Check sink latency.
 
 **Ready-made assets:**
 - A Grafana dashboard: [`dashboards/sluice-overview.json`](dashboards/sluice-overview.json).
@@ -679,10 +713,10 @@ Signals worth watching:
 - `make docker-up` provisions Prometheus (`:9090`) and Grafana (`:3000`) locally.
 
 For Datadog, CloudWatch or anything else, implement `MetricsRecorder` yourself. Its methods are
-`RecordWrite`, `RecordDegradedWrite`, `RecordRedisOp`, `RecordFlush`, `RecordDirtyQueueDepth`,
-`RecordContractError`, `RecordDeadLetter`, `RecordDLQProcess`, `RecordUnflushedExpiry`,
-`RecordRead`, `RecordWarmUp`, `RecordHotSetSize`, `RecordLocalCacheHit`, `RecordLocalCacheMiss`,
-`RecordLocalSetSize` and `RecordBroadcastLag`. Gauge sampling (`WithHotSetSampleInterval`) starts only with a
+`RecordWrite`, `RecordDegradedWrite`, `RecordRedisOp`, `RecordFlush`, `RecordFlushTimeout`,
+`RecordFlushLockSkip`, `RecordDirtyQueueDepth`, `RecordContractError`, `RecordDeadLetter`,
+`RecordDLQProcess`, `RecordUnflushedExpiry`, `RecordRead`, `RecordWarmUp`, `RecordHotSetSize`,
+`RecordLocalCacheHit`, `RecordLocalCacheMiss`, `RecordLocalSetSize` and `RecordBroadcastLag`. Gauge sampling (`WithHotSetSampleInterval`) starts only with a
 non-noop recorder. More detail is in [`docs/issues/prometheus.md`](docs/issues/prometheus.md).
 
 ---
@@ -698,7 +732,10 @@ non-noop recorder. More detail is in [`docs/issues/prometheus.md`](docs/issues/p
 | **Write path** | | |
 | `WithSink(s)` · `WithWriteContract(fn)` | nil | Both required to start the flush engine |
 | `WithFlushWindow(d)` | `250ms` | Time trigger; bounds datastore lag |
+| `WithFlushTimeout(d)` | `FlushWindow * 4` | Explicit flush context deadline; zero preserves the default multiplier |
 | `WithMaxBatchSize(n)` | `1000` | Keys per bulk write; volume trigger threshold |
+| `WithFlushLock(bool)` | `false` | Per-band Redis advisory lock; prevents multi-pod flush stampede |
+| `WithAdaptiveBatch(bool)` | `false` | Auto-tune batch size: halve on timeout, grow on fast flush |
 | `WithKeyTTL(d)` | `30s` | Post-flush TTL for cold payloads; backlog trigger threshold |
 | `WithBatchedWrites(size, window)` | off | Pipeline concurrent `Write`s into shared round-trips |
 | `WithContentDedup(bool)` | `false` | Skip unchanged payloads (xxHash64) |
@@ -754,6 +791,7 @@ Every per-key and per-band key embeds `{band}` as a cluster hash tag. A namespac
 | `sl:{ns}:idxreg:{band}` · `sl:{ns}:idxexp:{band}` | `SET` · `ZSET` | — | Index registry and expiry queue |
 | `sl:{ns}:idem:{band}:{idemKey}` | `STRING` | `IdempotencyTTL` | `WriteIdempotent` guard |
 | `sl:{ns}:dlq:{band}` | `ZSET` scored by failure time | none (payloads 7 days) | Dead-letter queue |
+| `sl:{ns}:flush_lock:{band}` | `STRING` | `FlushTimeout + 5s` | Per-band advisory flush lock (opt-in via `WithFlushLock`) |
 | `sl:{ns}:bcast` | `STREAM` | `MAXLEN ~ Retention` | L1 cross-pod broadcast |
 
 </details>
@@ -806,7 +844,8 @@ make coverage           # HTML coverage report
 - Design notes for shipped features: [bulk reader](docs/issues/bulkreader.md),
   [local journal](docs/issues/local-journal.md), [Prometheus](docs/issues/prometheus.md),
   [sink silent-loss fixes](docs/issues/sink-silent-loss.md),
-  [MongoDB driver v2](docs/issues/mongo-driver-v2.md), [multi-document writes](docs/issues/update-many-support.md).
+  [MongoDB driver v2](docs/issues/mongo-driver-v2.md), [multi-document writes](docs/issues/update-many-support.md),
+  [flush timeout resilience](docs/issues/flush-timeout-burst.md).
 
 Release history and breaking changes are in [CHANGELOG.md](CHANGELOG.md).
 

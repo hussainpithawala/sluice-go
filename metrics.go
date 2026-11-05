@@ -32,6 +32,8 @@ func (n *noopMetrics) RecordWrite(_ string)                                     
 func (n *noopMetrics) RecordDegradedWrite(_ string, _ error)                           {}
 func (n *noopMetrics) RecordRedisOp(_ string, _ string, _ time.Duration, _ error)      {}
 func (n *noopMetrics) RecordFlush(_ string, _ string, _ int, _ time.Duration, _ error) {}
+func (n *noopMetrics) RecordFlushTimeout(_ string, _ string, _ int, _ time.Duration)   {}
+func (n *noopMetrics) RecordFlushLockSkip(_ string, _ string)                          {}
 func (n *noopMetrics) RecordDirtyQueueDepth(_ string, _ string, _ int)                 {}
 func (n *noopMetrics) RecordContractError(_ string, _ string, _ error)                 {}
 func (n *noopMetrics) RecordDeadLetter(_ string, _ string, _ int)                      {}

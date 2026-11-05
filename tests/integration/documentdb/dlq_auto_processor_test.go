@@ -226,6 +226,8 @@ func (c *dlqProcessCounter) RecordWrite(string)                                 
 func (c *dlqProcessCounter) RecordDegradedWrite(string, error)                        {}
 func (c *dlqProcessCounter) RecordRedisOp(string, string, time.Duration, error)       {}
 func (c *dlqProcessCounter) RecordFlush(string, string, int, time.Duration, error)    {}
+func (c *dlqProcessCounter) RecordFlushTimeout(string, string, int, time.Duration)    {}
+func (c *dlqProcessCounter) RecordFlushLockSkip(string, string)                       {}
 func (c *dlqProcessCounter) RecordDirtyQueueDepth(string, string, int)                {}
 func (c *dlqProcessCounter) RecordContractError(string, string, error)                {}
 func (c *dlqProcessCounter) RecordDeadLetter(string, string, int)                     {}
