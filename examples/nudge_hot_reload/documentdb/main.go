@@ -174,6 +174,8 @@ func (m *logMetrics) RecordTransientRetry(ns, band string, count int) {
 	m.log.Warn("transient retry", "ns", ns, "band", band, "count", count)
 }
 func (m *logMetrics) RecordOldestDirtyAge(ns, band string, age time.Duration) {}
+func (m *logMetrics) RecordIndexUpdateFailed(ns, band string)                 {}
+func (m *logMetrics) RecordDegradedIdempotentWrite(ns string)                 {}
 
 // ─── Cold Regime: Simulated Bulk Consumer ────────────────────────────────────
 // Kept at a sustainable functional load (~80 events/sec) to prevent MongoDB timeouts.
