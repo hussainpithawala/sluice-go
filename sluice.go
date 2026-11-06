@@ -22,6 +22,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"time"
 
 	"log/slog"
@@ -223,7 +224,7 @@ func (b *Builder) Build(ctx context.Context) (*Sluice, error) {
 		metrics = &noopMetrics{}
 	}
 
-	sh, err := shield.New(b.cfg.Redis.toInternal(), b.cfg.Namespace, b.cfg.BandCount, b.cfg.KeyTTL, b.cfg.ActivityWindow, b.cfg.DLQTTL)
+	sh, err := shield.New(b.cfg.Redis.toInternal(), b.cfg.Namespace, b.cfg.BandCount, b.cfg.KeyTTL, b.cfg.ActivityWindow, b.cfg.DLQTTL, b.indexContract != nil)
 	if err != nil {
 		return nil, err
 	}
@@ -524,6 +525,9 @@ func (s *Sluice) applyHydration(ctx context.Context, correlationKey string, hr s
 	if idxErr == nil && len(indexFields) > 0 {
 		if err := s.shield.UpdateIndexes(ctx, correlationKey, indexFields, s.cfg.ActivityWindow); err != nil {
 			s.metrics.RecordRedisOp(s.cfg.Namespace, "updateindexes_hydration", 0, err)
+			s.metrics.RecordIndexUpdateFailed(s.cfg.Namespace, strconv.Itoa(s.shield.BandFor(correlationKey)))
+		} else {
+			_ = s.shield.ClearIndexPending(ctx, correlationKey, "")
 		}
 	}
 }
@@ -705,6 +709,42 @@ func (s *Sluice) HotLoad(ctx context.Context, correlationKey string) error {
 //  4. Standard Volume Trigger: Falls back to depth-based flush if not hot/batched.
 
 func (s *Sluice) Write(ctx context.Context, correlationKey string, payload []byte) error {
+	return s.write(ctx, correlationKey, payload, nil)
+}
+
+// WriteIdempotent ensures exactly-once acceptance into the journal within
+// IdempotencyTTL. The guard and journal write are atomic (single Lua script),
+// so a failed write never leaves a guard behind.
+func (s *Sluice) WriteIdempotent(ctx context.Context, correlationKey string, payload []byte, idempotencyKey string) error {
+	if correlationKey == "" || idempotencyKey == "" {
+		return ErrEmptyCorrelationKey
+	}
+	idemKey := fmt.Sprintf("sl:%s:idem:{%d}:%s", s.cfg.Namespace, s.shield.BandFor(correlationKey), idempotencyKey)
+	err := s.write(ctx, correlationKey, payload, &idemArgs{
+		guardKey:   idemKey,
+		guardTTLMs: s.cfg.IdempotencyTTL.Milliseconds(),
+	})
+	if errors.Is(err, shield.ErrDuplicateKey) {
+		return ErrDuplicateIdempotencyKey
+	}
+	return err
+}
+
+// idemArgs holds idempotency guard parameters for the internal write method.
+type idemArgs struct {
+	guardKey   string
+	guardTTLMs int64
+}
+
+// write is the shared core for Write and WriteIdempotent.
+//
+// Features orchestrated here:
+//  1. Content Deduplication: Skips dirty-queue insertion if payload hash matches.
+//  2. Index Maintenance: Updates secondary SET/ZSET indexes via pipeline.
+//  3. Index Repair: Re-indexes on a dedup hit when a prior index update failed (ixp marker).
+//  4. Hot Regime Signaling: Triggers immediate flush if the correlation_key is currently hot.
+//  5. Standard Volume Trigger: Falls back to depth-based flush if not hot/batched.
+func (s *Sluice) write(ctx context.Context, correlationKey string, payload []byte, idem *idemArgs) error {
 	if s.closed.Load() {
 		return ErrLibraryClosed
 	}
@@ -719,68 +759,85 @@ func (s *Sluice) Write(ctx context.Context, correlationKey string, payload []byt
 	}
 
 	t := time.Now()
-
-	// Capture L1 version BEFORE the Redis write.
-	// This guarantees l1Version <= journal_ts. If a subsequent ReadJournal heal
-	// or Phase 2 broadcast arrives with the journal's exact ts, it will safely
-	// update L1 without violating the strict (>) version gating.
 	l1Version := t.UnixMilli()
 
-	var written bool
+	var opts *shield.WriteOpts
+	if idem != nil {
+		opts = &shield.WriteOpts{
+			GuardKey:   idem.guardKey,
+			GuardTTLMs: idem.guardTTLMs,
+		}
+	}
+
+	var result shield.WriteResult
 	var err error
 
-	// 1. Execute the Redis write (with optional xxHash64 deduplication)
 	if s.cfg.ContentDedup {
 		hash := fmt.Sprintf("%d", xxhash.Sum64(payload))
-		written, err = s.shield.WriteDedup(ctx, correlationKey, payload, hash)
+		result, err = s.shield.WriteDedup(ctx, correlationKey, payload, hash, opts)
 	} else {
-		written = true
-		err = s.shield.Write(ctx, correlationKey, payload)
+		result, err = s.shield.Write(ctx, correlationKey, payload, opts)
 	}
 
 	s.metrics.RecordRedisOp(s.cfg.Namespace, "write", time.Since(t), err)
 
-	// Handle Redis failures via degraded mode or hard error
 	if err != nil {
+		if errors.Is(err, shield.ErrDuplicateKey) {
+			return err
+		}
 		if s.cfg.DegradedModeDirect {
+			if idem != nil {
+				s.metrics.RecordDegradedIdempotentWrite(s.cfg.Namespace)
+			}
 			return s.degradedWrite(ctx, correlationKey, payload, err)
 		}
 		return fmt.Errorf("%w: %v", ErrRedisUnavailable, err)
 	}
 
-	// Only proceed with indexing and signaling if the record was actually
-	// added to the dirty set (i.e., not short-circuited by deduplication).
-	if written {
+	band := s.shield.BandFor(correlationKey)
+	bandStr := strconv.Itoa(band)
+
+	if result.Status == shield.WriteCodeIndexPend && s.cfg.IndexContract != nil {
+		curSeq, seqErr := s.shield.GetSeq(ctx, correlationKey)
+		if seqErr == nil && curSeq == result.Seq {
+			indexes, idxErr := s.cfg.IndexContract(correlationKey, payload)
+			if idxErr == nil && len(indexes) > 0 {
+				if ixErr := s.shield.UpdateIndexes(ctx, correlationKey, indexes, s.cfg.ActivityWindow); ixErr == nil {
+					_ = s.shield.ClearIndexPending(ctx, correlationKey, result.Seq)
+				} else {
+					s.metrics.RecordIndexUpdateFailed(s.cfg.Namespace, bandStr)
+				}
+			}
+		}
+	}
+
+	if result.Written {
 		s.metrics.RecordWrite(s.cfg.Namespace)
 
-		// ── L1 Write-Through (Sub-microsecond same-pod consistency) ─────
 		if s.local != nil {
 			applied := s.local.Put(correlationKey, payload, l1Version)
 			slog.Debug("WRITE-THROUGH", "crn", correlationKey, "version", l1Version, "applied", applied)
 		}
-		// 2. Index maintenance via pipeline (best-effort, Valkey-safe)
+
 		if s.cfg.IndexContract != nil {
 			indexes, idxErr := s.cfg.IndexContract(correlationKey, payload)
 			if idxErr == nil && len(indexes) > 0 {
-				_ = s.shield.UpdateIndexes(ctx, correlationKey, indexes, s.cfg.ActivityWindow)
+				if ixErr := s.shield.UpdateIndexes(ctx, correlationKey, indexes, s.cfg.ActivityWindow); ixErr != nil {
+					s.metrics.RecordIndexUpdateFailed(s.cfg.Namespace, bandStr)
+				} else {
+					_ = s.shield.ClearIndexPending(ctx, correlationKey, "")
+				}
 			}
 		}
 
-		// 3. Volume signaling (Hot regime vs Standard depth check)
-		band := s.shield.BandFor(correlationKey)
 		signaled := false
-
 		if s.cfg.HotAwareFlush {
 			isHot, hotErr := s.shield.IsHot(ctx, correlationKey)
 			if hotErr == nil && isHot {
-				// Hot correlation_key: signal immediate flush for sub-ms Read() consistency
 				s.engine.SignalVolume(band)
 				signaled = true
 			}
 		}
-
-		// Standard depth-based volume trigger
-		// (skipped if batched writes are enabled, or if hot regime already signaled)
 		if !signaled && !s.cfg.BatchedWrites {
 			if depth, depthErr := s.shield.DirtyQueueDepth(ctx, band); depthErr == nil {
 				if int(depth) >= s.cfg.MaxBatchSize {
@@ -791,36 +848,6 @@ func (s *Sluice) Write(ctx context.Context, correlationKey string, payload []byt
 	}
 
 	return nil
-}
-
-// WriteIdempotent ensures exactly-once delivery using SETNX EX.
-func (s *Sluice) WriteIdempotent(ctx context.Context, correlationKey string, payload []byte, idempotencyKey string) error {
-	if s.closed.Load() {
-		return ErrLibraryClosed
-	}
-	if s.writeContract == nil {
-		return ErrMissingWriteContract
-	}
-	if s.sk == nil {
-		return ErrMissingSink
-	}
-
-	if correlationKey == "" || idempotencyKey == "" {
-		return ErrEmptyCorrelationKey
-	}
-
-	// Idempotency key shares the {band} hash tag for Cluster Mode safety
-	idemKey := fmt.Sprintf("sl:%s:idem:{%d}:%s", s.cfg.Namespace, s.shield.BandFor(correlationKey), idempotencyKey)
-
-	ok, err := s.shield.SetNX(ctx, idemKey, "1", s.cfg.IdempotencyTTL)
-	if err != nil {
-		return err
-	}
-	if !ok {
-		return ErrDuplicateIdempotencyKey
-	}
-
-	return s.Write(ctx, correlationKey, payload)
 }
 
 // Query performs compound queries safely across bands using in-process SET intersection.

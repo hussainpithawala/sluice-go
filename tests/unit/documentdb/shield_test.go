@@ -37,7 +37,7 @@ func newTestShield(t *testing.T, namespace string) *shield.Shield {
 		PoolSize:     10,
 	}
 
-	s, err := shield.New(cfg, namespace, 16, 30*time.Second, 4*time.Hour, 0)
+	s, err := shield.New(cfg, namespace, 16, 30*time.Second, 4*time.Hour, 0, false)
 	require.NoError(t, err, "failed to create shield")
 
 	// Clean up any existing keys for this namespace with a strict timeout
@@ -94,7 +94,7 @@ func TestNew_Validation(t *testing.T) {
 			Addrs:       []string{testRedisAddr()},
 			ClusterMode: false,
 		}
-		_, err := shield.New(cfg, "test{bad}", 16, 30*time.Second, 4*time.Hour, 0)
+		_, err := shield.New(cfg, "test{bad}", 16, 30*time.Second, 4*time.Hour, 0, false)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "must not contain")
 	})
@@ -104,7 +104,7 @@ func TestNew_Validation(t *testing.T) {
 			Addrs:       []string{},
 			ClusterMode: false,
 		}
-		_, err := shield.New(cfg, "test", 16, 30*time.Second, 4*time.Hour, 0)
+		_, err := shield.New(cfg, "test", 16, 30*time.Second, 4*time.Hour, 0, false)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "at least one address")
 	})
@@ -115,7 +115,7 @@ func TestNew_Validation(t *testing.T) {
 			ClusterMode: true,
 			DB:          1,
 		}
-		_, err := shield.New(cfg, "test", 16, 30*time.Second, 4*time.Hour, 0)
+		_, err := shield.New(cfg, "test", 16, 30*time.Second, 4*time.Hour, 0, false)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "DB must be 0 in cluster mode")
 	})
@@ -134,7 +134,7 @@ func TestWrite_Basic(t *testing.T) {
 	corrKey := "user_123"
 	payload := []byte(`{"name":"Alice","age":30}`)
 
-	err := s.Write(ctx, corrKey, payload)
+	_, err := s.Write(ctx, corrKey, payload, nil)
 	require.NoError(t, err)
 
 	// Verify payload exists
@@ -165,7 +165,7 @@ func TestWrite_Coalescing(t *testing.T) {
 	// Write same key multiple times
 	for i := 0; i < 5; i++ {
 		payload := []byte(fmt.Sprintf(`{"version":%d}`, i))
-		err := s.Write(ctx, corrKey, payload)
+		_, err := s.Write(ctx, corrKey, payload, nil)
 		require.NoError(t, err)
 	}
 
@@ -196,19 +196,19 @@ func TestWriteDedup_ContentHash(t *testing.T) {
 	hash := "abc123hash"
 
 	// First write should succeed
-	written, err := s.WriteDedup(ctx, corrKey, payload, hash)
+	wr, err := s.WriteDedup(ctx, corrKey, payload, hash, nil)
 	require.NoError(t, err)
-	assert.True(t, written, "first write should be written")
+	assert.True(t, wr.Written, "first write should be written")
 
 	// Second write with same hash should be deduplicated
-	written, err = s.WriteDedup(ctx, corrKey, payload, hash)
+	wr, err = s.WriteDedup(ctx, corrKey, payload, hash, nil)
 	require.NoError(t, err)
-	assert.False(t, written, "second write should be deduplicated")
+	assert.False(t, wr.Written, "second write should be deduplicated")
 
 	// Write with different hash should succeed
-	written, err = s.WriteDedup(ctx, corrKey, []byte(`{"data":"different"}`), "def456hash")
+	wr, err = s.WriteDedup(ctx, corrKey, []byte(`{"data":"different"}`), "def456hash", nil)
 	require.NoError(t, err)
-	assert.True(t, written, "write with different hash should be written")
+	assert.True(t, wr.Written, "write with different hash should be written")
 }
 
 func TestRead_NotFound(t *testing.T) {
@@ -329,7 +329,7 @@ func TestDrainBand_Basic(t *testing.T) {
 		ReadTimeout:  3 * time.Second,
 		WriteTimeout: 3 * time.Second,
 		PoolSize:     10,
-	}, namespace, bandCount, 30*time.Second, 4*time.Hour, 0)
+	}, namespace, bandCount, 30*time.Second, 4*time.Hour, 0, false)
 	require.NoError(t, err, "shield.New")
 	defer func(s *shield.Shield) {
 		err := s.Close()
@@ -373,7 +373,8 @@ func TestDrainBand_Basic(t *testing.T) {
 	for _, k := range keys {
 		p := []byte(fmt.Sprintf(`{"key":%q,"v":1}`, k))
 		payloads[k] = p
-		require.NoError(t, s.Write(ctx, k, p), "Write %s", k)
+		_, wErr := s.Write(ctx, k, p, nil)
+		require.NoError(t, wErr, "Write %s", k)
 	}
 
 	// Pre-drain invariant: only targetBand is dirty; a neighbour band is empty.
@@ -489,7 +490,7 @@ func TestCommitKeys(t *testing.T) {
 	key := byBand[targetBand][0]
 
 	// Write the key
-	err := s.Write(ctx, key, []byte(`{"test":"data"}`))
+	_, err := s.Write(ctx, key, []byte(`{"test":"data"}`), nil)
 	require.NoError(t, err)
 
 	// Drain the band
@@ -548,7 +549,7 @@ func TestMoveToDeadLetter(t *testing.T) {
 	key := byBand[targetBand][0]
 
 	// Write the key
-	err := s.Write(ctx, key, []byte(`{"bad":"data"}`))
+	_, err := s.Write(ctx, key, []byte(`{"bad":"data"}`), nil)
 	require.NoError(t, err)
 
 	// Drain it
@@ -590,7 +591,7 @@ func TestDrainDLQ(t *testing.T) {
 	targetBand, keys := findKeysForTest(t, s, "dlq_drain", 1)
 	key := keys[0]
 
-	err := s.Write(ctx, key, []byte(`{"dlq":"test"}`))
+	_, err := s.Write(ctx, key, []byte(`{"dlq":"test"}`), nil)
 	require.NoError(t, err)
 
 	records, err := s.DrainBand(ctx, targetBand, 10)
@@ -623,7 +624,7 @@ func TestCommitDLQKeys(t *testing.T) {
 	targetBand, keys := findKeysForTest(t, s, "dlq_commit", 1)
 	key := keys[0]
 
-	err := s.Write(ctx, key, []byte(`{"commit":"dlq"}`))
+	_, err := s.Write(ctx, key, []byte(`{"commit":"dlq"}`), nil)
 	require.NoError(t, err)
 
 	records, err := s.DrainBand(ctx, targetBand, 10)
@@ -764,7 +765,7 @@ func TestBatching_EnableAndWrite(t *testing.T) {
 	for i := 0; i < 50; i++ {
 		key := fmt.Sprintf("batch_key_%03d", i)
 		payload := []byte(fmt.Sprintf(`{"batch":%d}`, i))
-		err := s.Write(ctx, key, payload)
+		_, err := s.Write(ctx, key, payload, nil)
 		require.NoError(t, err)
 	}
 
@@ -844,7 +845,7 @@ func TestOldestDirtyScore(t *testing.T) {
 	key := keys[0]
 
 	before := time.Now().UnixMilli()
-	err = s.Write(ctx, key, []byte(`{"oldest":true}`))
+	_, err = s.Write(ctx, key, []byte(`{"oldest":true}`), nil)
 	require.NoError(t, err)
 	after := time.Now().UnixMilli()
 
@@ -870,7 +871,7 @@ func TestRefreshHotTTL(t *testing.T) {
 	targetBand, keys := findKeysForTest(t, s, "refresh", 1)
 	key := keys[0]
 
-	err := s.Write(ctx, key, []byte(`{"refresh":true}`))
+	_, err := s.Write(ctx, key, []byte(`{"refresh":true}`), nil)
 	require.NoError(t, err)
 	// RefreshHotTTL only extends flushed payloads, so flush with a short TTL.
 	simulateFlush(t, s, key, 5*time.Second)
@@ -904,7 +905,7 @@ func TestZRangeWithScores(t *testing.T) {
 
 	// Write multiple keys with small delays to get different scores
 	for i, key := range keys {
-		err := s.Write(ctx, key, []byte(fmt.Sprintf(`{"i":%d}`, i)))
+		_, err := s.Write(ctx, key, []byte(fmt.Sprintf(`{"i":%d}`, i)), nil)
 		require.NoError(t, err)
 		if i < len(keys)-1 {
 			time.Sleep(2 * time.Millisecond) // Ensure different timestamps
@@ -942,7 +943,7 @@ func TestConcurrentWrites(t *testing.T) {
 			for i := 0; i < writesPerGoroutine; i++ {
 				key := fmt.Sprintf("concurrent_%d_%d", gID, i)
 				payload := []byte(fmt.Sprintf(`{"g":%d,"i":%d}`, gID, i))
-				if err := s.Write(ctx, key, payload); err != nil {
+				if _, err := s.Write(ctx, key, payload, nil); err != nil {
 					done <- err
 					return
 				}
@@ -980,7 +981,7 @@ func TestNamespaceIsolation(t *testing.T) {
 	key := "shared_key_name"
 
 	// Write to namespace A
-	err := s1.Write(ctx, key, []byte(`{"ns":"a"}`))
+	_, err := s1.Write(ctx, key, []byte(`{"ns":"a"}`), nil)
 	require.NoError(t, err)
 
 	// Should not be visible in namespace B
@@ -989,7 +990,7 @@ func TestNamespaceIsolation(t *testing.T) {
 	assert.False(t, found, "key from namespace_a should not be visible in namespace_b")
 
 	// Write to namespace B
-	err = s2.Write(ctx, key, []byte(`{"ns":"b"}`))
+	_, err = s2.Write(ctx, key, []byte(`{"ns":"b"}`), nil)
 	require.NoError(t, err)
 
 	// Read from both
@@ -1014,7 +1015,7 @@ func TestUnflushedPayloadOutlivesKeyTTL(t *testing.T) {
 		ClusterMode: false,
 		DB:          testRedisDB,
 	}
-	s, err := shield.New(cfg, "test_expiry", 16, 1*time.Second, 4*time.Hour, 0)
+	s, err := shield.New(cfg, "test_expiry", 16, 1*time.Second, 4*time.Hour, 0, false)
 	require.NoError(t, err)
 	defer func(s *shield.Shield) {
 		err := s.Close()
@@ -1028,7 +1029,7 @@ func TestUnflushedPayloadOutlivesKeyTTL(t *testing.T) {
 
 	key := "expiry_key"
 	payload := []byte(`{"expires":"never while unflushed"}`)
-	err = s.Write(ctx, key, payload)
+	_, err = s.Write(ctx, key, payload, nil)
 	require.NoError(t, err)
 
 	// Wait past KeyTTL, as during a sink outage.
@@ -1058,7 +1059,7 @@ func TestEmptyCorrelationKey(t *testing.T) {
 
 	// Write with empty key should still work (Redis allows it)
 	// but it's generally a bad practice
-	err := s.Write(ctx, "", []byte(`{"empty":"key"}`))
+	_, err := s.Write(ctx, "", []byte(`{"empty":"key"}`), nil)
 	// This test documents current behavior - adjust if you want to reject empty keys
 	if err != nil {
 		t.Logf("Write with empty key returned error (expected): %v", err)
@@ -1083,7 +1084,7 @@ func TestLargePayload(t *testing.T) {
 		largePayload[i] = 'x'
 	}
 
-	err := s.Write(ctx, key, largePayload)
+	_, err := s.Write(ctx, key, largePayload, nil)
 	require.NoError(t, err)
 
 	// Read it back
@@ -1116,7 +1117,7 @@ func TestSpecialCharactersInKey(t *testing.T) {
 	for _, key := range testCases {
 		t.Run(key, func(t *testing.T) {
 			payload := []byte(fmt.Sprintf(`{"key":"%s"}`, key))
-			err := s.Write(ctx, key, payload)
+			_, err := s.Write(ctx, key, payload, nil)
 			require.NoError(t, err)
 
 			readPayload, _, found, err := s.ReadWithTTL(ctx, key)

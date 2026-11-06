@@ -317,7 +317,7 @@ sluice.New("ns").
 |---|---|
 | `WithBatchedWrites(size, window)` | Concurrent writers share one Redis pipeline: ⌈N / size⌉ round-trips instead of N. Each `Write` still waits for its own entry and returns that entry's real error. Worth it above ~10K writes/sec with many writers. |
 | `WithContentDedup(true)` | xxHash64 fingerprint per payload. An unchanged payload skips the dirty queue, indexes and flush, and the store never sees a write it already has. |
-| `WriteIdempotent(ctx, key, payload, msgID)` | `SETNX` guard against upstream redelivery. Returns `ErrDuplicateIdempotencyKey` on a repeat; the guard is kept for `IdempotencyTTL` (default 4h). |
+| `WriteIdempotent(ctx, key, payload, msgID)` | Atomic guard against upstream redelivery. The guard and journal write execute in a single Lua script, so a failed write never leaves an orphaned guard. Returns `ErrDuplicateIdempotencyKey` on a repeat; the guard is kept for `IdempotencyTTL` (default 4h). |
 
 ### Multi-document writes
 
@@ -605,6 +605,8 @@ loud failure to a quiet drop:
 | **Losses are loud** | A dirty key whose payload is gone at flush time gets `ErrPayloadMissing` (via `OnFlush`), an error log, a `RecordUnflushedExpiry` count and a DLQ entry. **Any non-zero count should page.** |
 | **Degraded mode preserves order** | If Redis fails, `WithDegradedModeDirect` (default on) writes straight to the store *only* when no older version of the key is pending in Redis. Otherwise, including when Redis is unreachable, `Write` returns `ErrDegradedWriteUnsafe`. Retry it; don't ack it. |
 | **Survives script-cache loss** | Every Lua call site reloads and retries once on `NOSCRIPT`, which covers a Redis restart, failover or `SCRIPT FLUSH`. |
+| **Idempotency guard is atomic** | `WriteIdempotent` sets the guard as the last command in the same Lua script that writes the journal. A script failure before that point leaves no guard, so retries are never silently blocked. |
+| **Index repair on dedup hit** | When `IndexContract` is set and `ContentDedup` is on, a dedup hit checks for a pending-index marker (`ixp`). If present, the caller re-indexes and clears the marker, healing the gap left by a prior index failure. `Query` results are eventually consistent with the journal. |
 
 **Run the journal on durable Redis.** Use `maxmemory-policy noeviction` (eviction would drop
 unflushed state) plus AOF and replicas, or MemoryDB. ElastiCache alone does not persist unflushed
@@ -648,7 +650,7 @@ Each adapter uses the journal to remove the bottleneck specific to its store:
 | Store | Sink | Source | Bottleneck removed |
 |---|---|---|---|
 | DocumentDB / MongoDB | `sink/docdb`: unordered `BulkWrite` (`UpdateOne`, or `UpdateMany` with `Many`) | `source/docdb`: `FindOne`; `Find` for bulk | Per-write index I/O on a single primary; connection caps |
-| DynamoDB | `sink/dynamodb`: `BatchWriteItem`, with `UnprocessedItems` mapped back to their keys and retried | `source/dynamodb`: `GetItem` with `ConsistentRead: true`; `Query` for bulk | WCU spend: bursts flatten to a low, steady provisioned baseline; secondary lookups use Redis indexes instead of GSIs; idempotency uses `SETNX` instead of `TransactWriteItems` |
+| DynamoDB | `sink/dynamodb`: `BatchWriteItem`, with `UnprocessedItems` mapped back to their keys and retried | `source/dynamodb`: `GetItem` with `ConsistentRead: true`; `Query` for bulk | WCU spend: bursts flatten to a low, steady provisioned baseline; secondary lookups use Redis indexes instead of GSIs; idempotency uses an atomic Redis guard instead of `TransactWriteItems` |
 | PostgreSQL | `sink/postgres`: multi-row `INSERT … ON CONFLICT DO UPDATE` (or `DO NOTHING` via `Config.OnConflict`); raw parameterised `UPDATE` with `Many` | `source/postgres`: parameterised query + `Projector`, which supports joins and aggregations | Connection saturation, per-row transaction overhead, WAL/MVCC churn from repeated updates |
 
 How each bundled sink classifies failures:

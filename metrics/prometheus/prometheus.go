@@ -35,20 +35,22 @@ type Recorder struct {
 	namespace string
 
 	// Write path
-	writeTotal          *prometheus.CounterVec
-	degradedWriteTotal  *prometheus.CounterVec
-	redisOpDuration     *prometheus.HistogramVec
-	flushDuration       *prometheus.HistogramVec
-	flushBatchSize      *prometheus.HistogramVec
-	flushTimeoutTotal   *prometheus.CounterVec
-	flushLockSkipTotal  *prometheus.CounterVec
-	dirtyQueueDepth     *prometheus.GaugeVec
-	contractErrorTotal  *prometheus.CounterVec
-	deadLetterTotal     *prometheus.CounterVec
-	dlqProcessTotal     *prometheus.CounterVec
-	unflushedLossTotal  *prometheus.CounterVec
-	transientRetryTotal *prometheus.CounterVec
-	oldestDirtyAge      *prometheus.GaugeVec
+	writeTotal                   *prometheus.CounterVec
+	degradedWriteTotal           *prometheus.CounterVec
+	redisOpDuration              *prometheus.HistogramVec
+	flushDuration                *prometheus.HistogramVec
+	flushBatchSize               *prometheus.HistogramVec
+	flushTimeoutTotal            *prometheus.CounterVec
+	flushLockSkipTotal           *prometheus.CounterVec
+	dirtyQueueDepth              *prometheus.GaugeVec
+	contractErrorTotal           *prometheus.CounterVec
+	deadLetterTotal              *prometheus.CounterVec
+	dlqProcessTotal              *prometheus.CounterVec
+	unflushedLossTotal           *prometheus.CounterVec
+	transientRetryTotal          *prometheus.CounterVec
+	oldestDirtyAge               *prometheus.GaugeVec
+	indexUpdateFailedTotal       *prometheus.CounterVec
+	degradedIdempotentWriteTotal *prometheus.CounterVec
 
 	// Hot/cold regime
 	warmupDuration *prometheus.HistogramVec
@@ -181,6 +183,20 @@ func NewRecorderWithRegistry(namespace string, reg prometheus.Registerer) *Recor
 			Help:      "Age of the oldest entry in each band's dirty set. Monitors stuck-record buildup.",
 		}, []string{labelBand}),
 
+		indexUpdateFailedTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: metricNamespace,
+			Subsystem: namespace,
+			Name:      "index_update_failed_total",
+			Help:      "Total number of secondary index updates that failed.",
+		}, []string{labelBand}),
+
+		degradedIdempotentWriteTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: metricNamespace,
+			Subsystem: namespace,
+			Name:      "degraded_idempotent_write_total",
+			Help:      "Total number of idempotent writes that fell through to degraded mode.",
+		}, nil),
+
 		// Hot/cold regime
 		warmupDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Namespace: metricNamespace,
@@ -252,6 +268,8 @@ func NewRecorderWithRegistry(namespace string, reg prometheus.Registerer) *Recor
 		r.unflushedLossTotal,
 		r.transientRetryTotal,
 		r.oldestDirtyAge,
+		r.indexUpdateFailedTotal,
+		r.degradedIdempotentWriteTotal,
 		r.warmupDuration,
 		r.readDuration,
 		r.hotSetSize,
@@ -333,6 +351,14 @@ func (r *Recorder) RecordOldestDirtyAge(_ string, bandStr string, age time.Durat
 	r.oldestDirtyAge.WithLabelValues(bandStr).Set(age.Seconds())
 }
 
+func (r *Recorder) RecordIndexUpdateFailed(_ string, bandStr string) {
+	r.indexUpdateFailedTotal.WithLabelValues(bandStr).Inc()
+}
+
+func (r *Recorder) RecordDegradedIdempotentWrite(_ string) {
+	r.degradedIdempotentWriteTotal.WithLabelValues().Inc()
+}
+
 // ── Hot/cold regime ─────────────────────────────────────────────────────────
 
 func (r *Recorder) RecordWarmUp(_ string, duration time.Duration, err error) {
@@ -402,6 +428,8 @@ func (r *Recorder) Unregister(reg prometheus.Registerer) {
 	reg.Unregister(r.unflushedLossTotal)
 	reg.Unregister(r.transientRetryTotal)
 	reg.Unregister(r.oldestDirtyAge)
+	reg.Unregister(r.indexUpdateFailedTotal)
+	reg.Unregister(r.degradedIdempotentWriteTotal)
 	reg.Unregister(r.warmupDuration)
 	reg.Unregister(r.readDuration)
 	reg.Unregister(r.hotSetSize)

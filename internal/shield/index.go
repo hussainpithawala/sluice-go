@@ -418,3 +418,35 @@ func bandFromKey(key string) (int, bool) {
 	}
 	return band, true
 }
+
+// clearIndexPendingLua removes the ixp marker from a payload hash.
+// When ARGV[1] is non-empty, the clear is conditional on v == ARGV[1].
+// When ARGV[1] is empty, the marker is removed unconditionally.
+//
+// KEYS[1]=payload hash; ARGV[1]=v that was indexed ("" for unconditional).
+const clearIndexPendingLua = `
+if ARGV[1] == "" then
+    redis.call('HDEL', KEYS[1], 'ixp')
+    return 1
+end
+if redis.call('HGET', KEYS[1], 'v') == ARGV[1] then
+    redis.call('HDEL', KEYS[1], 'ixp')
+end
+return 1
+`
+
+// ClearIndexPending removes the ixp marker after a successful index update.
+// Pass seq="" for an unconditional clear, or the drained v for a conditional
+// clear that skips if a newer write has landed.
+func (s *Shield) ClearIndexPending(ctx context.Context, correlationKey string, seq string) error {
+	return s.clearIndexPendScript.Run(ctx, s.client,
+		[]string{s.payloadKey(correlationKey)},
+		seq,
+	).Err()
+}
+
+// GetSeq returns the current per-key write sequence ('v' field) from the
+// payload hash. Used by the stale-reindex guard on the dedup-repair path.
+func (s *Shield) GetSeq(ctx context.Context, correlationKey string) (string, error) {
+	return s.client.HGet(ctx, s.payloadKey(correlationKey), "v").Result()
+}

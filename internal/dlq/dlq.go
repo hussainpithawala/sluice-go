@@ -280,7 +280,7 @@ func (p *Processor) handleReInsert(ctx context.Context, band int, records []shie
 
 	for _, rec := range records {
 		newKey := p.cfg.KeyMutator(rec.CorrelationKey)
-		if err := p.shield.Write(ctx, newKey, rec.Payload); err != nil {
+		if _, err := p.shield.Write(ctx, newKey, rec.Payload, nil); err != nil {
 			failedKeys = append(failedKeys, rec.CorrelationKey)
 			total.Processed++
 			total.Failed++
