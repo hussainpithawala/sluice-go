@@ -155,6 +155,13 @@ func (b *Builder) WithDLQAutoProcess(interval time.Duration, strategy DLQStrateg
 	return b
 }
 
+// WithDLQTTL sets how long dead-letter payload hashes are kept in Redis.
+// Zero uses the default (7 days).
+func (b *Builder) WithDLQTTL(d time.Duration) *Builder {
+	b.cfg.DLQTTL = d
+	return b
+}
+
 // WithHotSetSampleInterval sets how often the hot set size gauge is sampled.
 // Sampling SCANs the Redis keyspace, so keep this coarse on large deployments.
 // Zero uses the 30s default; a negative value disables sampling.
@@ -190,7 +197,7 @@ func (b *Builder) Build(ctx context.Context) (*Sluice, error) {
 		metrics = &noopMetrics{}
 	}
 
-	sh, err := shield.New(b.cfg.Redis.toInternal(), b.cfg.Namespace, b.cfg.BandCount, b.cfg.KeyTTL, b.cfg.ActivityWindow)
+	sh, err := shield.New(b.cfg.Redis.toInternal(), b.cfg.Namespace, b.cfg.BandCount, b.cfg.KeyTTL, b.cfg.ActivityWindow, b.cfg.DLQTTL)
 	if err != nil {
 		return nil, err
 	}
@@ -360,6 +367,9 @@ func (b *Builder) validate() error {
 	}
 	if b.cfg.MaxRetryAttempts < 0 {
 		return fmt.Errorf("sluice: MaxRetryAttempts must be >= 0, got %d", b.cfg.MaxRetryAttempts)
+	}
+	if b.cfg.DLQTTL < 0 {
+		return fmt.Errorf("sluice: DLQTTL must be >= 0, got %v", b.cfg.DLQTTL)
 	}
 	return nil
 }
@@ -951,7 +961,9 @@ func (s *Sluice) startDLQProcessor() {
 				if s.closed.Load() {
 					return
 				}
-				result, err := s.ProcessDLQ(ctx, s.cfg.DLQProcessStrategy)
+				runCtx, runCancel := context.WithTimeout(ctx, interval)
+				result, err := s.ProcessDLQ(runCtx, s.cfg.DLQProcessStrategy)
+				runCancel()
 				if err != nil {
 					slog.Warn("sluice: DLQ auto-process failed",
 						"namespace", s.cfg.Namespace,

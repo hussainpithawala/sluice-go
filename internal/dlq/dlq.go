@@ -130,6 +130,7 @@ func (p *Processor) processBand(ctx context.Context, band int, total *Result) er
 			return nil
 		}
 
+		before := total.Succeeded
 		switch p.cfg.Strategy {
 		case Ignore:
 			err = p.handleIgnore(ctx, band, records, total)
@@ -141,6 +142,9 @@ func (p *Processor) processBand(ctx context.Context, band int, total *Result) er
 		if err != nil {
 			return err
 		}
+		if total.Succeeded == before {
+			return nil
+		}
 	}
 }
 
@@ -148,12 +152,8 @@ func (p *Processor) handleIgnore(ctx context.Context, band int, records []shield
 	keys := make([]string, len(records))
 	for i, rec := range records {
 		keys[i] = rec.CorrelationKey
-		p.cfg.Logger.Info("dlq: ignoring record",
-			"correlation_key", rec.CorrelationKey,
-			"payload_size", len(rec.Payload),
-			"band", band,
-		)
 	}
+	p.cfg.Logger.Info("dlq: ignoring records", "band", band, "count", len(keys))
 
 	if err := p.shield.CommitDLQKeys(ctx, band, keys); err != nil {
 		return fmt.Errorf("dlq: commit ignore band %d: %w", band, err)
@@ -166,16 +166,18 @@ func (p *Processor) handleIgnore(ctx context.Context, band int, records []shield
 func (p *Processor) handleUpsert(ctx context.Context, band int, records []shield.FlushRecord, total *Result) error {
 	models := make([]sink.WriteModel, 0, len(records))
 	corrKeys := make([]string, 0, len(records))
+	var contractFailedKeys []string
 
 	for _, rec := range records {
 		wm, err := p.contract(rec.CorrelationKey, rec.Payload)
 		if err != nil {
-			p.cfg.Logger.Warn("dlq: contract error during upsert, skipping",
+			p.cfg.Logger.Warn("dlq: contract error during upsert — terminal, removing from DLQ",
 				"correlation_key", rec.CorrelationKey,
 				"error", err,
 			)
 			total.Processed++
 			total.Failed++
+			contractFailedKeys = append(contractFailedKeys, rec.CorrelationKey)
 			continue
 		}
 		wm.Upsert = true
@@ -189,36 +191,45 @@ func (p *Processor) handleUpsert(ctx context.Context, band int, records []shield
 		corrKeys = append(corrKeys, rec.CorrelationKey)
 	}
 
+	if len(contractFailedKeys) > 0 {
+		_ = p.shield.CommitDLQKeys(ctx, band, contractFailedKeys)
+	}
+
 	if len(models) == 0 {
 		return nil
 	}
 
 	result, err := p.sink.BulkWrite(ctx, models)
 	if err != nil {
-		// Total failure — leave keys in DLQ for retry on next invocation.
 		return fmt.Errorf("dlq: bulk write band %d: %w", band, err)
 	}
 
-	// NEW: Attribution Guard. Prevents success-by-elimination silent loss.
-	// If the sink returns partial errors but fails to attribute them to a key
-	// in the batch, we abort the commit. All keys stay in the DLQ for retry.
 	if err := sink.CheckAttribution(models, result); err != nil {
 		p.cfg.Logger.Error("dlq: upsert aborted due to unattributed sink error",
 			"err", err, "band", band)
 		return fmt.Errorf("dlq: attribution check failed band %d: %w", band, err)
 	}
 
-	// Partition results: identify failed keys.
 	failedKeys := make(map[string]bool)
 	if result != nil {
+		var permanentCount, transientCount int
+		sample := make([]string, 0, 5)
 		for _, se := range result.Errors {
 			failedKeys[se.CorrelationKey] = true
-			p.cfg.Logger.Warn("dlq: upsert failed for key",
-				"correlation_key", se.CorrelationKey,
-				"code", se.Code,
-				"class", se.Class,
-				"error", se.Err,
-			)
+			if se.IsPermanent() {
+				permanentCount++
+			} else {
+				transientCount++
+			}
+			if len(sample) < 5 {
+				sample = append(sample, se.CorrelationKey)
+			}
+		}
+		if len(failedKeys) > 0 {
+			p.cfg.Logger.Warn("dlq: upsert batch had failures",
+				"band", band, "total", len(failedKeys),
+				"permanent", permanentCount, "transient", transientCount,
+				"sample_keys", sample)
 		}
 	}
 	successKeys := make([]string, 0, len(corrKeys))
@@ -240,20 +251,22 @@ func (p *Processor) handleUpsert(ctx context.Context, band int, records []shield
 
 func (p *Processor) handleReInsert(ctx context.Context, band int, records []shield.FlushRecord, total *Result) error {
 	committable := make([]string, 0, len(records))
+	var failedKeys []string
 
 	for _, rec := range records {
 		newKey := p.cfg.KeyMutator(rec.CorrelationKey)
 		if err := p.shield.Write(ctx, newKey, rec.Payload); err != nil {
-			p.cfg.Logger.Warn("dlq: reinsert write failed",
-				"original_key", rec.CorrelationKey,
-				"new_key", newKey,
-				"error", err,
-			)
+			failedKeys = append(failedKeys, rec.CorrelationKey)
 			total.Processed++
 			total.Failed++
 			continue
 		}
 		committable = append(committable, rec.CorrelationKey)
+	}
+
+	if len(failedKeys) > 0 {
+		p.cfg.Logger.Warn("dlq: reinsert batch had write failures",
+			"band", band, "failed", len(failedKeys))
 	}
 
 	if len(committable) > 0 {

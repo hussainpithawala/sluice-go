@@ -173,7 +173,7 @@ func TestReadFresh_BypassesL1(t *testing.T) {
 	// We use a temporary shield instance purely for test assertions.
 	sh, err := shield.New(shield.RedisConfig{
 		Addrs: []string{l1RedisAddr()}, ClusterMode: false, DB: l1TestDB,
-	}, namespace, 16, 30*time.Second, 4*time.Hour)
+	}, namespace, 16, 30*time.Second, 4*time.Hour, 0)
 	require.NoError(t, err)
 	defer func(sh *shield.Shield) {
 		err := sh.Close()
@@ -273,7 +273,7 @@ func TestHotLoad_EmitsSeedBroadcast(t *testing.T) {
 	}()
 
 	// Verify broadcast stream using a separate shield client
-	sh, err := shield.New(shield.RedisConfig{Addrs: []string{l1RedisAddr()}, ClusterMode: false, DB: l1TestDB}, namespace, 16, 30*time.Second, 4*time.Hour)
+	sh, err := shield.New(shield.RedisConfig{Addrs: []string{l1RedisAddr()}, ClusterMode: false, DB: l1TestDB}, namespace, 16, 30*time.Second, 4*time.Hour, 0)
 	require.NoError(t, err)
 	defer func(sh *shield.Shield) {
 		err := sh.Close()

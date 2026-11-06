@@ -91,6 +91,7 @@ type Config struct {
 	DLQAutoProcess     bool
 	DLQProcessInterval time.Duration
 	DLQProcessStrategy DLQStrategy
+	DLQTTL             time.Duration // 0 = 7 days (default); how long dead-letter payload hashes are kept
 
 	// HotSetSampleInterval controls how often the hot set size gauge is
 	// sampled via SCAN (0 → 30s default, negative disables).

@@ -22,8 +22,15 @@ const (
 	scorePosInf = "+inf"
 )
 
+func defaultDLQTTL(d time.Duration) time.Duration {
+	if d <= 0 {
+		return 7 * 24 * time.Hour
+	}
+	return d
+}
+
 // New initialises the Redis client and validates connectivity.
-func New(cfg RedisConfig, namespace string, bandCount int, keyTTL time.Duration, activityWindow time.Duration) (*Shield, error) {
+func New(cfg RedisConfig, namespace string, bandCount int, keyTTL time.Duration, activityWindow time.Duration, dlqTTL time.Duration) (*Shield, error) {
 	if strings.ContainsAny(namespace, "{}") {
 		// A '{' anywhere in namespace would hijack Redis Cluster's hash-tag
 		// parsing (only the substring between the FIRST '{' and the next '}'
@@ -93,7 +100,7 @@ func New(cfg RedisConfig, namespace string, bandCount int, keyTTL time.Duration,
 		bandCount:        bandCount,
 		keyTTL:           keyTTL,
 		activityWindow:   activityWindow,
-		dlqTTL:           7 * 24 * time.Hour, // dead-letter payloads kept 7 days
+		dlqTTL:           defaultDLQTTL(dlqTTL),
 		writeScript:      writeScript,
 		hydrateScript:    hydrateScript,
 		commitScript:     redis.NewScript(commitFlushedLua),
