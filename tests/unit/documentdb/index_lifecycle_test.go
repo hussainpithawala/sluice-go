@@ -19,7 +19,7 @@ func newTestShieldNoClean(t *testing.T, namespace string) *shield.Shield {
 		DB:          testRedisDB,
 		DialTimeout: 5 * time.Second,
 		PoolSize:    10,
-	}, namespace, 16, 30*time.Second, 4*time.Hour)
+	}, namespace, 16, 30*time.Second, 4*time.Hour, 0)
 	require.NoError(t, err)
 	return s
 }

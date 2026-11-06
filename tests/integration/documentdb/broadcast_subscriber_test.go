@@ -575,7 +575,7 @@ func TestSubscriber_ShieldWriteBroadcastsToSubscriber(t *testing.T) {
 		ReadTimeout:  3 * time.Second,
 		WriteTimeout: 3 * time.Second,
 		PoolSize:     10,
-	}, "test_bcast_shield", 16, 30*time.Second, 4*time.Hour)
+	}, "test_bcast_shield", 16, 30*time.Second, 4*time.Hour, 0)
 	require.NoError(t, err)
 	defer func(sh *shield.Shield) {
 		err := sh.Close()

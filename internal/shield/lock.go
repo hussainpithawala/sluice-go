@@ -43,3 +43,19 @@ var releaseScript = redis.NewScript(releaseFlushLockLua)
 func (s *Shield) ReleaseFlushLock(ctx context.Context, band int) error {
 	return releaseScript.Run(ctx, s.client, []string{s.flushLockKey(band)}, podID).Err()
 }
+
+func (s *Shield) dlqLockKey(band int) string {
+	return fmt.Sprintf("sl:%s:dlq_lock:{%d}", s.namespace, band)
+}
+
+// TryDLQLock acquires an advisory lock for DLQ processing of a band.
+// Semantics are identical to TryFlushLock but use a separate key space
+// so DLQ processing and flushing do not contend with each other.
+func (s *Shield) TryDLQLock(ctx context.Context, band int, ttl time.Duration) (bool, error) {
+	return s.client.SetNX(ctx, s.dlqLockKey(band), podID, ttl).Result()
+}
+
+// ReleaseDLQLock releases the DLQ advisory lock, ownership-checked.
+func (s *Shield) ReleaseDLQLock(ctx context.Context, band int) error {
+	return releaseScript.Run(ctx, s.client, []string{s.dlqLockKey(band)}, podID).Err()
+}

@@ -37,7 +37,7 @@ func newTestShield(t *testing.T, namespace string) *shield.Shield {
 		PoolSize:     10,
 	}
 
-	s, err := shield.New(cfg, namespace, 16, 30*time.Second, 4*time.Hour)
+	s, err := shield.New(cfg, namespace, 16, 30*time.Second, 4*time.Hour, 0)
 	require.NoError(t, err, "failed to create shield")
 
 	// Clean up any existing keys for this namespace with a strict timeout
@@ -94,7 +94,7 @@ func TestNew_Validation(t *testing.T) {
 			Addrs:       []string{testRedisAddr()},
 			ClusterMode: false,
 		}
-		_, err := shield.New(cfg, "test{bad}", 16, 30*time.Second, 4*time.Hour)
+		_, err := shield.New(cfg, "test{bad}", 16, 30*time.Second, 4*time.Hour, 0)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "must not contain")
 	})
@@ -104,7 +104,7 @@ func TestNew_Validation(t *testing.T) {
 			Addrs:       []string{},
 			ClusterMode: false,
 		}
-		_, err := shield.New(cfg, "test", 16, 30*time.Second, 4*time.Hour)
+		_, err := shield.New(cfg, "test", 16, 30*time.Second, 4*time.Hour, 0)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "at least one address")
 	})
@@ -115,7 +115,7 @@ func TestNew_Validation(t *testing.T) {
 			ClusterMode: true,
 			DB:          1,
 		}
-		_, err := shield.New(cfg, "test", 16, 30*time.Second, 4*time.Hour)
+		_, err := shield.New(cfg, "test", 16, 30*time.Second, 4*time.Hour, 0)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "DB must be 0 in cluster mode")
 	})
@@ -329,7 +329,7 @@ func TestDrainBand_Basic(t *testing.T) {
 		ReadTimeout:  3 * time.Second,
 		WriteTimeout: 3 * time.Second,
 		PoolSize:     10,
-	}, namespace, bandCount, 30*time.Second, 4*time.Hour)
+	}, namespace, bandCount, 30*time.Second, 4*time.Hour, 0)
 	require.NoError(t, err, "shield.New")
 	defer func(s *shield.Shield) {
 		err := s.Close()
@@ -1014,7 +1014,7 @@ func TestUnflushedPayloadOutlivesKeyTTL(t *testing.T) {
 		ClusterMode: false,
 		DB:          testRedisDB,
 	}
-	s, err := shield.New(cfg, "test_expiry", 16, 1*time.Second, 4*time.Hour)
+	s, err := shield.New(cfg, "test_expiry", 16, 1*time.Second, 4*time.Hour, 0)
 	require.NoError(t, err)
 	defer func(s *shield.Shield) {
 		err := s.Close()

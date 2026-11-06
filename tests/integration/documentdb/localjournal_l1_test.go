@@ -232,7 +232,7 @@ func verifyJournalPayload(t *testing.T, namespace, key string, expectedPayload [
 
 	verifyShield, err := shield.New(shield.RedisConfig{
 		Addrs: []string{l1RedisAddr()}, ClusterMode: false, DB: l1TestDB,
-	}, namespace, 16, 30*time.Second, 4*time.Hour)
+	}, namespace, 16, 30*time.Second, 4*time.Hour, 0)
 	require.NoError(t, err)
 	defer func(verifyShield *shield.Shield) {
 		err := verifyShield.Close()

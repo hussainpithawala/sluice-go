@@ -22,8 +22,15 @@ const (
 	scorePosInf = "+inf"
 )
 
+func defaultDLQTTL(d time.Duration) time.Duration {
+	if d <= 0 {
+		return 7 * 24 * time.Hour
+	}
+	return d
+}
+
 // New initialises the Redis client and validates connectivity.
-func New(cfg RedisConfig, namespace string, bandCount int, keyTTL time.Duration, activityWindow time.Duration) (*Shield, error) {
+func New(cfg RedisConfig, namespace string, bandCount int, keyTTL time.Duration, activityWindow time.Duration, dlqTTL time.Duration) (*Shield, error) {
 	if strings.ContainsAny(namespace, "{}") {
 		// A '{' anywhere in namespace would hijack Redis Cluster's hash-tag
 		// parsing (only the substring between the FIRST '{' and the next '}'
@@ -93,7 +100,7 @@ func New(cfg RedisConfig, namespace string, bandCount int, keyTTL time.Duration,
 		bandCount:        bandCount,
 		keyTTL:           keyTTL,
 		activityWindow:   activityWindow,
-		dlqTTL:           7 * 24 * time.Hour, // dead-letter payloads kept 7 days
+		dlqTTL:           defaultDLQTTL(dlqTTL),
 		writeScript:      writeScript,
 		hydrateScript:    hydrateScript,
 		commitScript:     redis.NewScript(commitFlushedLua),
@@ -686,8 +693,10 @@ func (s *Shield) DeadLetterDepth(ctx context.Context, band int) (int64, error) {
 func (s *Shield) DrainDLQ(ctx context.Context, band, maxBatch int) ([]FlushRecord, error) {
 	dlqKey := s.dlqKey(band)
 
+	// Score ≤ now: keys whose backoff has elapsed (or were never deferred).
+	nowMs := fmt.Sprintf("%f", float64(time.Now().UnixMilli()))
 	members, err := s.client.ZRangeByScoreWithScores(ctx, dlqKey, &redis.ZRangeBy{
-		Min: scoreNegInf, Max: scorePosInf, Offset: 0, Count: int64(maxBatch),
+		Min: scoreNegInf, Max: nowMs, Offset: 0, Count: int64(maxBatch),
 	}).Result()
 	if err != nil {
 		return nil, fmt.Errorf("sluice/shield: zrangebyscore dlq band %d: %w", band, err)
@@ -703,21 +712,19 @@ func (s *Shield) DrainDLQ(ctx context.Context, band, maxBatch int) ([]FlushRecor
 		hashKeys[i] = s.payloadKey(corrKeys[i])
 	}
 
-	// Pipeline all HMGET calls — single round-trip per shard; all keys here
-	// share this band's hash tag (see DrainBand note above).
 	pipe := s.client.Pipeline()
 	cmds := make([]*redis.SliceCmd, len(hashKeys))
 	for i, hk := range hashKeys {
-		cmds[i] = pipe.HMGet(ctx, hk, "p", "ts")
+		cmds[i] = pipe.HMGet(ctx, hk, "p", "ts", "dlq_attempts")
 	}
 	if _, err := pipe.Exec(ctx); err != nil && err != redis.Nil {
 		return nil, fmt.Errorf("sluice/shield: pipeline hmget dlq band %d: %w", band, err)
 	}
 
-	return drainAction(ctx, members, cmds, corrKeys, s, dlqKey)
+	return s.drainDLQAction(ctx, members, cmds, corrKeys, dlqKey)
 }
 
-func drainAction(ctx context.Context, members []redis.Z, cmds []*redis.SliceCmd, corrKeys []string, s *Shield, drainKey string) ([]FlushRecord, error) {
+func (s *Shield) drainDLQAction(ctx context.Context, members []redis.Z, cmds []*redis.SliceCmd, corrKeys []string, dlqKey string) ([]FlushRecord, error) {
 	records := make([]FlushRecord, 0, len(members))
 	expired := make([]interface{}, 0)
 
@@ -733,7 +740,6 @@ func drainAction(ctx context.Context, members []redis.Z, cmds []*redis.SliceCmd,
 			continue
 		}
 
-		// Extract the journal write timestamp for ordering guards and L1 versioning.
 		var ts int64
 		if len(vals) > 1 {
 			if tsStr, ok := vals[1].(string); ok && tsStr != "" {
@@ -743,20 +749,48 @@ func drainAction(ctx context.Context, members []redis.Z, cmds []*redis.SliceCmd,
 			}
 		}
 
-		// Valid payload — return WITHOUT ZREMing...
+		var attempts int
+		if len(vals) > 2 {
+			if aStr, ok := vals[2].(string); ok && aStr != "" {
+				if a, perr := strconv.Atoi(aStr); perr == nil {
+					attempts = a
+				}
+			}
+		}
+
 		records = append(records, FlushRecord{
 			CorrelationKey: corrKeys[i],
 			Payload:        []byte(payload),
 			ReceivedAt:     time.Now(),
 			JournalTS:      ts,
+			DLQAttempts:    attempts,
 		})
 	}
 
 	if len(expired) > 0 {
-		_ = s.client.ZRem(ctx, drainKey, expired...).Err()
+		_ = s.client.ZRem(ctx, dlqKey, expired...).Err()
 	}
 
 	return records, nil
+}
+
+// DeferDLQKeys updates the score of failed DLQ keys to a future timestamp
+// (next eligible retry time) and increments their attempt counter in the
+// payload hash. This is the per-key backoff mechanism.
+func (s *Shield) DeferDLQKeys(ctx context.Context, band int, keys []string, attempts []int, retryAt []float64) error {
+	if len(keys) == 0 {
+		return nil
+	}
+	dlqKey := s.dlqKey(band)
+	pipe := s.client.Pipeline()
+	for i, k := range keys {
+		pipe.ZAddXX(ctx, dlqKey, redis.Z{Score: retryAt[i], Member: k})
+		pipe.HSet(ctx, s.payloadKey(k), "dlq_attempts", attempts[i])
+	}
+	if _, err := pipe.Exec(ctx); err != nil {
+		return fmt.Errorf("sluice/shield: defer dlq keys band %d: %w", band, err)
+	}
+	return nil
 }
 
 // CommitDLQKeys removes processed correlation keys from the dead-letter sorted

@@ -117,8 +117,20 @@ full pod, a reader-only gateway, a bulk pre-warmer or a write-only ingester. See
 ## Install
 
 ```bash
-go get github.com/hussainpithawala/sluice-go@v1.1.0
+go get github.com/hussainpithawala/sluice-go@v1.1.1
 ```
+
+### Upgrading to 1.1.1
+
+1.1.1 fixes a tight-loop DLQ replay bug and adds four new DLQ builder methods:
+
+| Change | What to do |
+|---|---|
+| `WithDLQAutoProcess` no longer tight-loops when all records fail on replay | No action; the fix is automatic |
+| Contract errors during DLQ replay are now terminal (removed from DLQ) | If your contract intentionally returns errors to defer records, switch to returning a payload that the sink can handle instead |
+| DLQ per-key log lines replaced with one aggregated line per batch | Update log-parsing rules if you scrape per-key `dlq: upsert failed for key` messages |
+| New `WithDLQLock(bool)`, `WithDLQTTL(d)`, `WithDLQBackoff(base, max)`, `WithDLQMaxAttempts(n)` | Opt-in; no action required unless you want the features |
+| `shield.New()` takes a 6th parameter (`dlqTTL`) | Only affects direct `shield.New()` callers outside the builder (pass `0` for the default) |
 
 ### Upgrading to 1.1.0
 
@@ -512,8 +524,9 @@ a live-state lookup, not a replacement for querying your datastore.
 
 Records that fail non-retryably are moved to a per-band DLQ instead of being retried forever or dropped.
 Examples include a `WriteContract` error, a unique-index collision, a schema violation, or a payload
-missing at flush time. Their payloads are kept for 7 days. Each sink isolates a permanent failure to
-the offending rows, so one poison record never stalls its band; the rest of the batch commits.
+missing at flush time. Their payloads are kept for `DLQTTL` (default 7 days, configurable via
+`WithDLQTTL`). Each sink isolates a permanent failure to the offending rows, so one poison record
+never stalls its band; the rest of the batch commits.
 
 | Dead-letter reason | Cause |
 |---|---|
@@ -543,6 +556,36 @@ while a healing flag is set.
 [`examples/ticker_dlq`](examples/ticker_dlq) schedules DLQ processing in-process, and
 [`examples/asynq_dlq`](examples/asynq_dlq) schedules it across replicas with
 [Asynq](https://github.com/hibiken/asynq).
+
+### DLQ resilience
+
+When `WithDLQAutoProcess` is enabled and every record in a batch fails on replay, the processor
+exits the loop for that band and waits for the next tick instead of re-draining the same batch in a
+tight loop. Each auto-processor tick runs under a context deadline equal to the DLQ interval, so a
+slow or stuck run cannot block subsequent ticks. Contract errors during replay are treated as
+terminal: the payload hasn't changed, so the contract will fail identically every time. These keys
+are removed from the DLQ immediately.
+
+Four opt-in features provide further control:
+
+| Feature | Builder method | Effect |
+|---|---|---|
+| **Configurable payload TTL** | `WithDLQTTL(d)` | How long dead-letter payload hashes are kept. Zero retains the 7-day default. |
+| **Single-runner lock** | `WithDLQLock(true)` | A per-band `SET NX PX` advisory lock so only one replica processes a given band's DLQ per tick. The lock auto-expires after the DLQ interval, so a crashed replica does not block others. Other replicas skip the band and try again on the next tick. |
+| **Exponential backoff** | `WithDLQBackoff(base, max)` | After a key fails replay, its DLQ ZSET score is pushed to `now + base * 2^(attempt-1)` (capped at `max`, default 1h). `DrainDLQ` only fetches keys with score <= now, so deferred keys are skipped until their backoff elapses. Attempt counts are persisted in the payload hash. |
+| **Attempt cap** | `WithDLQMaxAttempts(n)` | Keys exceeding `n` replay attempts are parked (removed from the DLQ) with a WARN log. Zero means unlimited. |
+
+For production deployments with auto-processing, the recommended baseline is:
+
+```go
+sluice.New("ns").
+    WithDLQAutoProcess(2*time.Minute, sluice.DLQUpsert).
+    WithDLQLock(true).
+    WithDLQBackoff(5*time.Second, 30*time.Minute).
+    WithDLQMaxAttempts(10).
+    // ...
+    Build(ctx)
+```
 
 ---
 
@@ -754,6 +797,10 @@ non-noop recorder. More detail is in [`docs/issues/prometheus.md`](docs/issues/p
 | `WithIndexSweepInterval(d)` | `15s` | Full index sweep cadence; `-1` disables the sweep only |
 | **Operations** | | |
 | `WithDLQAutoProcess(interval, strategy)` | off | Background DLQ processing |
+| `WithDLQTTL(d)` | `7d` | How long dead-letter payload hashes are kept; zero retains the default |
+| `WithDLQLock(bool)` | `false` | Per-band advisory lock; only one replica processes a band's DLQ per tick |
+| `WithDLQBackoff(base, max)` | off | Exponential backoff on failed DLQ replays; `max` defaults to `1h` if zero |
+| `WithDLQMaxAttempts(n)` | unlimited | Park keys exceeding `n` replay attempts |
 | `WithHotSetSampleInterval(d)` | `30s` | `hot_set_size` sampling (uses SCAN); negative disables it |
 
 ## Errors
@@ -790,7 +837,8 @@ Every per-key and per-band key embeds `{band}` as a cluster hash tag. A namespac
 | `sl:{ns}:idxv:{band}:{key}` | `HASH` | follows payload | A key's current index values |
 | `sl:{ns}:idxreg:{band}` · `sl:{ns}:idxexp:{band}` | `SET` · `ZSET` | — | Index registry and expiry queue |
 | `sl:{ns}:idem:{band}:{idemKey}` | `STRING` | `IdempotencyTTL` | `WriteIdempotent` guard |
-| `sl:{ns}:dlq:{band}` | `ZSET` scored by failure time | none (payloads 7 days) | Dead-letter queue |
+| `sl:{ns}:dlq:{band}` | `ZSET` scored by failure time (or next-retry time with backoff) | none (payloads `DLQTTL`, default 7 days) | Dead-letter queue |
+| `sl:{ns}:dlq_lock:{band}` | `STRING` | DLQ interval | Per-band advisory DLQ lock (opt-in via `WithDLQLock`) |
 | `sl:{ns}:flush_lock:{band}` | `STRING` | `FlushTimeout + 5s` | Per-band advisory flush lock (opt-in via `WithFlushLock`) |
 | `sl:{ns}:bcast` | `STREAM` | `MAXLEN ~ Retention` | L1 cross-pod broadcast |
 
@@ -845,7 +893,8 @@ make coverage           # HTML coverage report
   [local journal](docs/issues/local-journal.md), [Prometheus](docs/issues/prometheus.md),
   [sink silent-loss fixes](docs/issues/sink-silent-loss.md),
   [MongoDB driver v2](docs/issues/mongo-driver-v2.md), [multi-document writes](docs/issues/update-many-support.md),
-  [flush timeout resilience](docs/issues/flush-timeout-burst.md).
+  [flush timeout resilience](docs/issues/flush-timeout-burst.md),
+  [DLQ replay resilience](docs/issues/dlq-replay-resilience.md).
 
 Release history and breaking changes are in [CHANGELOG.md](CHANGELOG.md).
 

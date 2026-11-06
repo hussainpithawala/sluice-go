@@ -91,6 +91,11 @@ type Config struct {
 	DLQAutoProcess     bool
 	DLQProcessInterval time.Duration
 	DLQProcessStrategy DLQStrategy
+	DLQTTL             time.Duration // 0 = 7 days (default); how long dead-letter payload hashes are kept
+	DLQLock            bool          // acquire a per-band advisory lock so only one replica processes a band's DLQ per tick
+	DLQBackoffBase     time.Duration // base delay for exponential backoff on failed DLQ replays; 0 disables
+	DLQBackoffMax      time.Duration // cap on backoff delay; 0 defaults to 1h
+	DLQMaxAttempts     int           // >0: park keys exceeding this many replay attempts; 0 = unlimited
 
 	// HotSetSampleInterval controls how often the hot set size gauge is
 	// sampled via SCAN (0 → 30s default, negative disables).
