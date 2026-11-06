@@ -117,6 +117,8 @@ type Engine struct {
 
 	drainCtx     context.Context  // set by DrainAndStop before closing stopCh
 	drainResults chan DrainResult // buffered; each band goroutine sends one result
+	flushCtx     context.Context  // parent for normal (non-drain) flush contexts; cancelled on shutdown
+	flushCancel  context.CancelFunc
 
 	// The following fields are indexed by band and accessed only from that
 	// band's goroutine (runBand), so no mutex is needed.
@@ -150,6 +152,7 @@ func New(
 	for i := range attempts {
 		attempts[i] = make(map[string]int)
 	}
+	flushCtx, flushCancel := context.WithCancel(context.Background())
 	return &Engine{
 		cfg:               cfg,
 		shield:            sh,
@@ -161,6 +164,8 @@ func New(
 		volumeSignals:     signals,
 		stopCh:            make(chan struct{}),
 		drainResults:      make(chan DrainResult, cfg.BandCount+1),
+		flushCtx:          flushCtx,
+		flushCancel:       flushCancel,
 		lastBatchWarn:     make([]time.Time, cfg.BandCount),
 		lastTransientWarn: make([]time.Time, cfg.BandCount),
 		attempts:          attempts,
@@ -198,17 +203,34 @@ func (e *Engine) DrainAndStop(ctx context.Context) DrainResult {
 		}
 
 		e.drainCtx = ctx
+		e.flushCancel()
 		close(e.stopCh)
 
-		e.wg.Wait()
+		done := make(chan struct{})
+		go func() { e.wg.Wait(); close(done) }()
 
-		for i := 0; i < e.cfg.BandCount; i++ {
-			r := <-e.drainResults
-			result.RecordsFlushed += r.RecordsFlushed
-			result.RecordsDeadLettered += r.RecordsDeadLettered
-			result.RecordsAbandoned += r.RecordsAbandoned
-			if r.FinalError != nil && result.FinalError == nil {
-				result.FinalError = r.FinalError
+		// Wait for goroutines to finish, but cap the wait at the drain
+		// deadline plus a grace period for post-loop depth probes.
+		grace := 3 * time.Second
+		select {
+		case <-done:
+		case <-time.After(ctxRemaining(ctx) + grace):
+			if result.FinalError == nil {
+				result.FinalError = ctx.Err()
+			}
+		}
+
+		// Collect results from bands that finished.
+		for range e.cfg.BandCount {
+			select {
+			case r := <-e.drainResults:
+				result.RecordsFlushed += r.RecordsFlushed
+				result.RecordsDeadLettered += r.RecordsDeadLettered
+				result.RecordsAbandoned += r.RecordsAbandoned
+				if r.FinalError != nil && result.FinalError == nil {
+					result.FinalError = r.FinalError
+				}
+			default:
 			}
 		}
 	})
@@ -265,6 +287,15 @@ func (e *Engine) drainBand(ctx context.Context, band int) DrainResult {
 		RecordsAbandoned:    int64(depth),
 		FinalError:          final,
 	}
+}
+
+func ctxRemaining(ctx context.Context) time.Duration {
+	if dl, ok := ctx.Deadline(); ok {
+		if r := time.Until(dl); r > 0 {
+			return r
+		}
+	}
+	return 0
 }
 
 func sleepOrDone(ctx context.Context, d time.Duration) {
@@ -380,14 +411,14 @@ func (e *Engine) runBand(band int) {
 			e.drainResults <- r
 			return
 		case <-ticker.C:
-			ctx, cancel := context.WithTimeout(context.Background(), e.flushTimeout())
+			ctx, cancel := context.WithTimeout(e.flushCtx, e.flushTimeout())
 			if _, err := e.lockedFlush(ctx, band, false); err != nil {
 				slog.Debug("sluice: flush error on ticker",
 					"namespace", e.cfg.Namespace, "band", band, "err", err)
 			}
 			cancel()
 		case <-e.volumeSignals[band]:
-			ctx, cancel := context.WithTimeout(context.Background(), e.flushTimeout())
+			ctx, cancel := context.WithTimeout(e.flushCtx, e.flushTimeout())
 			if _, err := e.lockedFlush(ctx, band, false); err != nil {
 				slog.Debug("sluice: flush error on volume signal",
 					"namespace", e.cfg.Namespace, "band", band, "err", err)
