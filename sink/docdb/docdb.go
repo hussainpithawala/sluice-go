@@ -191,6 +191,7 @@ func (s *Sink) Write(ctx context.Context, model sink.WriteModel) error {
 	return nil
 }
 
+func (s *Sink) ClassifiesErrors()               {}
 func (s *Sink) Ping(ctx context.Context) error  { return s.client.Ping(ctx, readpref.Primary()) }
 func (s *Sink) Close(ctx context.Context) error { return s.client.Disconnect(ctx) }
 

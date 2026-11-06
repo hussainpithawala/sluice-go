@@ -8,6 +8,8 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo"
 )
 
+var _ sink.ClassifiedSink = (*Sink)(nil)
+
 func TestClassifyBulkErr(t *testing.T) {
 	tests := []struct {
 		name     string

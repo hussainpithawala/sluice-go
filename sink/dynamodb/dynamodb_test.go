@@ -16,6 +16,8 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+var _ sink.ClassifiedSink = (*Sink)(nil)
+
 func setupDynamoDBSink(t *testing.T) (*Sink, func()) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)

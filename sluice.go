@@ -86,6 +86,7 @@ func (b *Builder) WithBandCount(n int) *Builder                { b.cfg.BandCount
 func (b *Builder) WithKeyTTL(d time.Duration) *Builder         { b.cfg.KeyTTL = d; return b }
 func (b *Builder) WithFlushLock(v bool) *Builder               { b.cfg.FlushLock = v; return b }
 func (b *Builder) WithAdaptiveBatch(v bool) *Builder           { b.cfg.AdaptiveBatch = v; return b }
+func (b *Builder) WithMaxRetryAttempts(n int) *Builder         { b.cfg.MaxRetryAttempts = n; return b }
 
 // WithDegradedModeDirect makes Write() fall back to a direct datastore write
 // when the Redis write fails — but only when no older version of the key is
@@ -203,6 +204,15 @@ func (b *Builder) Build(ctx context.Context) (*Sluice, error) {
 	if b.sk != nil && b.writeContract != nil {
 		if err := b.sk.Ping(ctx); err != nil {
 			return nil, fmt.Errorf("sluice: sink ping failed: %w", err)
+		}
+		if _, ok := b.sk.(sink.ClassifiedSink); !ok {
+			panic(fmt.Sprintf(
+				"sluice: sink %T does not implement sink.ClassifiedSink; "+
+					"SinkErrors with ClassUnknown will retry indefinitely. "+
+					"Set Class explicitly on all SinkErrors and add ClassifiesErrors() "+
+					"to your type to acknowledge this contract.",
+				b.sk,
+			))
 		}
 
 		if b.callback != nil {
@@ -347,6 +357,9 @@ func (b *Builder) validate() error {
 	}
 	if b.cfg.KeyTTL <= 0 {
 		b.cfg.KeyTTL = 30 * time.Second
+	}
+	if b.cfg.MaxRetryAttempts < 0 {
+		return fmt.Errorf("sluice: MaxRetryAttempts must be >= 0, got %d", b.cfg.MaxRetryAttempts)
 	}
 	return nil
 }

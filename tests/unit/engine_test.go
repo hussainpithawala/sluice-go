@@ -21,6 +21,9 @@ func (f *fakeSink) BulkWrite(ctx context.Context, models []sink.WriteModel) (*si
 func (f *fakeSink) Write(ctx context.Context, model sink.WriteModel) error { return nil }
 func (f *fakeSink) Ping(ctx context.Context) error                         { return nil }
 func (f *fakeSink) Close(ctx context.Context) error                        { return nil }
+func (f *fakeSink) ClassifiesErrors()                                      {}
+
+var _ sink.ClassifiedSink = (*fakeSink)(nil)
 
 func TestEngine_FlushBand_AttributionGuard(t *testing.T) {
 	t.Run("Unattributed error commits nothing", func(t *testing.T) {

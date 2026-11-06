@@ -100,6 +100,7 @@ func (outageSink) BulkWrite(context.Context, []sink.WriteModel) (*sink.BulkWrite
 func (outageSink) Write(context.Context, sink.WriteModel) error { return errOutage }
 func (outageSink) Ping(context.Context) error                   { return nil }
 func (outageSink) Close(context.Context) error                  { return nil }
+func (outageSink) ClassifiesErrors()                            {}
 
 func TestFlush_SinkOutageDoesNotPanicOrLoseWrites(t *testing.T) {
 	const ns = "flush_outage_unit"
@@ -186,6 +187,7 @@ func (g *gatedSink) BulkWrite(_ context.Context, models []sink.WriteModel) (*sin
 func (g *gatedSink) Write(context.Context, sink.WriteModel) error { return nil }
 func (g *gatedSink) Ping(context.Context) error                   { return nil }
 func (g *gatedSink) Close(context.Context) error                  { return nil }
+func (g *gatedSink) ClassifiesErrors()                            {}
 
 func (g *gatedSink) persisted() []string {
 	g.mu.Lock()
@@ -260,6 +262,7 @@ func (r *recordingSink) Write(_ context.Context, m sink.WriteModel) error {
 }
 func (r *recordingSink) Ping(context.Context) error  { return nil }
 func (r *recordingSink) Close(context.Context) error { return nil }
+func (r *recordingSink) ClassifiesErrors()           {}
 
 // TestBatchedWrite_RedisFailureFallsBackToDegradedMode: previously a failed
 // batch was only logged — Write had already returned nil, so the data was

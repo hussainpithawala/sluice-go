@@ -79,6 +79,7 @@ type Config struct {
 	AdaptiveBatch      bool          // Enable adaptive batch sizing based on flush duration
 	ContentDedup       bool          // Enable xxHash64 payload deduplication
 	IdempotencyTTL     time.Duration // TTL for WriteIdempotent keys
+	MaxRetryAttempts   int           // 0 = unlimited retries (default); >0 = dead-letter after N transient failures
 
 	Redis   RedisConfig
 	Metrics MetricsRecorder
