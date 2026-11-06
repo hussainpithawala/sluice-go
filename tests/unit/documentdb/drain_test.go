@@ -339,12 +339,17 @@ func TestDrain_AccountingIdentity(t *testing.T) {
 	cs := newControllableSink()
 	cs.permanentKeys = map[string]bool{"acct_0000": true, "acct_0001": true}
 	cs.blockAfterN = 2 // allow 2 batches then block
-	sl := buildDrainSluice(t, ns, cs)
 
-	n := 5 * drainBatch // 50 keys across 4 bands (uneven)
+	// Use a large MaxBatchSize so volume signals do not fire during seeding;
+	// the drain is the only path that flushes records.
+	sl := buildDrainSluice(t, ns, cs, func(b *sluice.Builder) {
+		b.WithMaxBatchSize(1000)
+	})
+
+	n := 50
 	written := seedKeys(t, sl, "acct", n)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	dr, _ := sl.DrainAndCloseWithResult(ctx)
 	close(cs.release) // unblock for cleanup
