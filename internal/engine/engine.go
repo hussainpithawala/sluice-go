@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/rand/v2"
 	"sync"
 	"time"
 
@@ -72,6 +73,26 @@ type OnFlushCallback func(correlationKeys []string, result *sink.BulkWriteResult
 // payload was gone from Redis before it could be flushed (data loss).
 var ErrPayloadMissing = errors.New("sluice: unflushed payload missing from Redis")
 
+// FlushResult carries per-batch counts from a single flushBand call.
+type FlushResult struct {
+	Flushed      int
+	DeadLettered int
+}
+
+// DrainResult describes the outcome of a shutdown drain across all bands.
+type DrainResult struct {
+	RecordsFlushed      int64
+	RecordsDeadLettered int64
+	RecordsAbandoned    int64
+	FinalError          error
+}
+
+// ErrIncompleteDrain indicates the drain did not flush all dirty records.
+// Records counted in RecordsAbandoned remain in Redis for the next instance.
+var ErrIncompleteDrain = errors.New("sluice: drain incomplete")
+
+const defaultShutdownTimeout = 30 * time.Second
+
 // ErrCodeDuplicateKey is the MongoDB / AWS DocumentDB error code for a
 // unique-index violation. The engine uses this to route permanent failures
 // to the dead-letter set instead of retrying them indefinitely.
@@ -93,6 +114,9 @@ type Engine struct {
 	wg            sync.WaitGroup
 	stopCh        chan struct{}
 	once          sync.Once
+
+	drainCtx     context.Context  // set by DrainAndStop before closing stopCh
+	drainResults chan DrainResult // buffered; each band goroutine sends one result
 
 	// The following fields are indexed by band and accessed only from that
 	// band's goroutine (runBand), so no mutex is needed.
@@ -136,6 +160,7 @@ func New(
 		adaptive:          ab,
 		volumeSignals:     signals,
 		stopCh:            make(chan struct{}),
+		drainResults:      make(chan DrainResult, cfg.BandCount+1),
 		lastBatchWarn:     make([]time.Time, cfg.BandCount),
 		lastTransientWarn: make([]time.Time, cfg.BandCount),
 		attempts:          attempts,
@@ -159,13 +184,116 @@ func (e *Engine) SignalVolume(band int) {
 	}
 }
 
-// DrainAndStop signals all band goroutines to perform a final flush and exit.
-// Blocks until all goroutines have returned. Safe to call exactly once.
-func (e *Engine) DrainAndStop() {
+// DrainAndStop signals all band goroutines to drain their dirty queues and exit.
+// Each band loops flushBand until its queue is empty or ctx expires. Returns an
+// aggregate DrainResult. Safe to call exactly once; subsequent calls return a
+// zero DrainResult.
+func (e *Engine) DrainAndStop(ctx context.Context) DrainResult {
+	var result DrainResult
 	e.once.Do(func() {
+		if _, ok := ctx.Deadline(); !ok {
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithTimeout(ctx, defaultShutdownTimeout)
+			defer cancel()
+		}
+
+		e.drainCtx = ctx
 		close(e.stopCh)
-		e.wg.Wait()
+
+		done := make(chan struct{})
+		go func() { e.wg.Wait(); close(done) }()
+
+		select {
+		case <-done:
+		case <-ctx.Done():
+			if result.FinalError == nil {
+				result.FinalError = ctx.Err()
+			}
+		}
+
+		for {
+			select {
+			case r := <-e.drainResults:
+				result.RecordsFlushed += r.RecordsFlushed
+				result.RecordsDeadLettered += r.RecordsDeadLettered
+				result.RecordsAbandoned += r.RecordsAbandoned
+				if r.FinalError != nil && result.FinalError == nil {
+					result.FinalError = r.FinalError
+				}
+			default:
+				return
+			}
+		}
 	})
+	return result
+}
+
+const (
+	drainBackoffInit = 50 * time.Millisecond
+	drainBackoffMax  = time.Second
+)
+
+// drainBand flushes a single band in a loop until the dirty queue is empty or
+// ctx expires. Uses exponential backoff (50ms → 1s cap, with jitter) on errors
+// or no progress to bound Redis and sink load.
+func (e *Engine) drainBand(ctx context.Context, band int) DrainResult {
+	var flushed, deadLettered int64
+	var final error
+	backoff := drainBackoffInit
+
+	for {
+		if err := ctx.Err(); err != nil {
+			final = err
+			break
+		}
+		r, err := e.flushBand(ctx, band)
+		flushed += int64(r.Flushed)
+		deadLettered += int64(r.DeadLettered)
+		if err != nil {
+			final = err
+			sleepOrDone(ctx, backoffWithJitter(backoff))
+			backoff = min(backoff*2, drainBackoffMax)
+			continue
+		}
+		if r.Flushed == 0 && r.DeadLettered == 0 {
+			depth, derr := e.shield.DirtyQueueDepth(ctx, band)
+			if derr != nil || depth == 0 {
+				break
+			}
+			sleepOrDone(ctx, backoffWithJitter(backoff))
+			backoff = min(backoff*2, drainBackoffMax)
+			continue
+		}
+		backoff = drainBackoffInit
+	}
+
+	probeCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	depth, _ := e.shield.DirtyQueueDepth(probeCtx, band)
+	cancel()
+
+	return DrainResult{
+		RecordsFlushed:      flushed,
+		RecordsDeadLettered: deadLettered,
+		RecordsAbandoned:    int64(depth),
+		FinalError:          final,
+	}
+}
+
+func sleepOrDone(ctx context.Context, d time.Duration) {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+	case <-t.C:
+	}
+}
+
+func backoffWithJitter(base time.Duration) time.Duration {
+	if base <= 0 {
+		return 0
+	}
+	jitter := time.Duration(rand.Int64N(int64(base) / 4))
+	return base + jitter
 }
 
 // startPreEvictionFlusher monitors the oldest dirty keys and forces a flush
@@ -227,7 +355,7 @@ func (e *Engine) flushTimeout() time.Duration {
 // lockedFlush acquires the per-band advisory lock before flushing (when
 // FlushLock is enabled) and skips the cycle if another pod holds it.
 // On shutdown (drain=true) the lock is bypassed so the final flush always runs.
-func (e *Engine) lockedFlush(ctx context.Context, band int, drain bool) error {
+func (e *Engine) lockedFlush(ctx context.Context, band int, drain bool) (FlushResult, error) {
 	if !e.cfg.FlushLock || drain {
 		return e.flushBand(ctx, band)
 	}
@@ -235,11 +363,11 @@ func (e *Engine) lockedFlush(ctx context.Context, band int, drain bool) error {
 	acquired, err := e.shield.TryFlushLock(ctx, band, e.flushTimeout()+5*time.Second)
 	if err != nil {
 		e.metrics.RecordFlushLockSkip(e.cfg.Namespace, bandStr)
-		return err
+		return FlushResult{}, err
 	}
 	if !acquired {
 		e.metrics.RecordFlushLockSkip(e.cfg.Namespace, bandStr)
-		return nil
+		return FlushResult{}, nil
 	}
 	defer func(shield *shield.Shield, ctx context.Context, band int) {
 		err := shield.ReleaseFlushLock(ctx, band)
@@ -259,23 +387,20 @@ func (e *Engine) runBand(band int) {
 	for {
 		select {
 		case <-e.stopCh:
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			if err := e.lockedFlush(ctx, band, true); err != nil {
-				slog.Debug("sluice: flush error on shutdown",
-					"namespace", e.cfg.Namespace, "band", band, "err", err)
-			}
-			cancel()
+			ticker.Stop()
+			r := e.drainBand(e.drainCtx, band)
+			e.drainResults <- r
 			return
 		case <-ticker.C:
 			ctx, cancel := context.WithTimeout(context.Background(), e.flushTimeout())
-			if err := e.lockedFlush(ctx, band, false); err != nil {
+			if _, err := e.lockedFlush(ctx, band, false); err != nil {
 				slog.Debug("sluice: flush error on ticker",
 					"namespace", e.cfg.Namespace, "band", band, "err", err)
 			}
 			cancel()
 		case <-e.volumeSignals[band]:
 			ctx, cancel := context.WithTimeout(context.Background(), e.flushTimeout())
-			if err := e.lockedFlush(ctx, band, false); err != nil {
+			if _, err := e.lockedFlush(ctx, band, false); err != nil {
 				slog.Debug("sluice: flush error on volume signal",
 					"namespace", e.cfg.Namespace, "band", band, "err", err)
 			}
@@ -294,7 +419,7 @@ func (e *Engine) runBand(band int) {
 //     - Permanent failure  → DeadLetterIfUnchanged (IsPermanent() == true).
 //     - Transient failure  → no action; keys remain in dirty set for retry.
 //     - Total failure      → no action; all keys remain in dirty set for retry.
-func (e *Engine) flushBand(ctx context.Context, band int) error {
+func (e *Engine) flushBand(ctx context.Context, band int) (FlushResult, error) {
 	start := time.Now()
 	bandStr := fmt.Sprintf("%d", band)
 	var batchSize int
@@ -316,15 +441,16 @@ func (e *Engine) flushBand(ctx context.Context, band int) error {
 	records, err := e.shield.DrainBand(ctx, band, e.effectiveBatchSize())
 	if err != nil {
 		e.metrics.RecordFlush(e.cfg.Namespace, bandStr, 0, time.Since(start), err)
-		return err
+		return FlushResult{}, err
 	}
 	if len(records) == 0 {
-		return nil
+		return FlushResult{}, nil
 	}
 
 	models, corrKeys, seqs := e.resolveRecords(ctx, band, bandStr, records)
+	deadLettered := len(records) - len(models) // contract errors + missing payloads
 	if len(models) == 0 {
-		return nil
+		return FlushResult{DeadLettered: deadLettered}, nil
 	}
 	batchSize = len(models)
 
@@ -336,7 +462,7 @@ func (e *Engine) flushBand(ctx context.Context, band int) error {
 		if e.callback != nil {
 			e.callback(corrKeys, result, flushErr)
 		}
-		return flushErr
+		return FlushResult{DeadLettered: deadLettered}, flushErr
 	}
 	if err := sink.CheckAttribution(models, result); err != nil {
 		slog.Error("sluice: flush aborted due to unattributed sink error",
@@ -344,22 +470,24 @@ func (e *Engine) flushBand(ctx context.Context, band int) error {
 		if e.callback != nil {
 			e.callback(corrKeys, result, err)
 		}
-		return err
+		return FlushResult{DeadLettered: deadLettered}, err
 	}
 
 	permanentKeys, transientKeys := e.partitionErrors(result)
 	e.trackTransientRetries(band, bandStr, transientKeys)
-	e.enforceRetryCap(ctx, band, bandStr, transientKeys, seqs)
+	cappedKeys := e.enforceRetryCap(ctx, band, bandStr, transientKeys, seqs)
 	successKeys := subtractKeys(corrKeys, permanentKeys, transientKeys)
 
 	e.commitFlushed(ctx, band, successKeys, seqs)
 	e.clearAttempts(band, successKeys, permanentKeys)
 	e.deadLetterPermanent(ctx, band, bandStr, permanentKeys, seqs)
 
+	deadLettered += len(permanentKeys) + cappedKeys
+
 	if e.callback != nil {
 		e.callback(corrKeys, result, nil)
 	}
-	return nil
+	return FlushResult{Flushed: len(successKeys), DeadLettered: deadLettered}, nil
 }
 
 // emitBandGauges records the dirty queue depth and oldest entry age for a band.
@@ -486,9 +614,9 @@ func (e *Engine) trackTransientRetries(band int, bandStr string, transientKeys m
 // enforceRetryCap routes transient keys that exceeded MaxRetryAttempts to the
 // DLQ. Capped keys are removed from transientKeys so they are not counted as
 // still-retrying in the success/fail partition.
-func (e *Engine) enforceRetryCap(ctx context.Context, band int, bandStr string, transientKeys map[string]bool, seqs map[string]string) {
+func (e *Engine) enforceRetryCap(ctx context.Context, band int, bandStr string, transientKeys map[string]bool, seqs map[string]string) int {
 	if e.cfg.MaxRetryAttempts <= 0 {
-		return
+		return 0
 	}
 	var cappedKeys []string
 	for k := range transientKeys {
@@ -497,7 +625,7 @@ func (e *Engine) enforceRetryCap(ctx context.Context, band int, bandStr string, 
 		}
 	}
 	if len(cappedKeys) == 0 {
-		return
+		return 0
 	}
 	items := make([]shield.VersionedKey, len(cappedKeys))
 	for i, k := range cappedKeys {
@@ -509,6 +637,7 @@ func (e *Engine) enforceRetryCap(ctx context.Context, band int, bandStr string, 
 		"namespace", e.cfg.Namespace, "band", band,
 		"count", len(cappedKeys), "max_attempts", e.cfg.MaxRetryAttempts)
 	e.deadLetter(ctx, band, bandStr, items, "transient_retry_exhausted")
+	return len(cappedKeys)
 }
 
 // subtractKeys returns the elements of all that are in neither permanent nor

@@ -2,6 +2,7 @@ package sluice
 
 import (
 	"errors"
+	"fmt"
 
 	"github.com/hussainpithawala/sluice-go/internal/engine"
 )
@@ -37,3 +38,21 @@ var (
 	ErrMissingReadContract     = errors.New("sluice: ReadContract is required for HotLoad/Read")
 	ErrRecordNotFound          = errors.New("sluice: record not found in journal or sink")
 )
+
+// ErrIncompleteDrain indicates that DrainAndClose did not flush all dirty
+// records. Records counted in DrainResult.RecordsAbandoned remain in Redis
+// and will be picked up by the next instance.
+var ErrIncompleteDrain = engine.ErrIncompleteDrain
+
+// DrainError wraps ErrIncompleteDrain and carries the DrainResult so callers
+// can inspect the outcome via errors.As.
+type DrainError struct {
+	Result DrainResult
+}
+
+func (e *DrainError) Error() string {
+	return fmt.Sprintf("sluice: drain incomplete: flushed=%d dead_lettered=%d abandoned=%d",
+		e.Result.RecordsFlushed, e.Result.RecordsDeadLettered, e.Result.RecordsAbandoned)
+}
+
+func (e *DrainError) Unwrap() error { return ErrIncompleteDrain }
