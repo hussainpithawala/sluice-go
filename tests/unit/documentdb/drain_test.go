@@ -38,7 +38,7 @@ func newControllableSink() *controllableSink {
 	}
 }
 
-func (c *controllableSink) BulkWrite(_ context.Context, models []sink.WriteModel) (*sink.BulkWriteResult, error) {
+func (c *controllableSink) BulkWrite(ctx context.Context, models []sink.WriteModel) (*sink.BulkWriteResult, error) {
 	c.mu.Lock()
 	c.calls++
 	call := c.calls
@@ -56,7 +56,11 @@ func (c *controllableSink) BulkWrite(_ context.Context, models []sink.WriteModel
 		default:
 			close(c.blocked)
 		}
-		<-c.release
+		select {
+		case <-c.release:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
 	}
 
 	var sinkErrors []sink.SinkError

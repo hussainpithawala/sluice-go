@@ -200,28 +200,15 @@ func (e *Engine) DrainAndStop(ctx context.Context) DrainResult {
 		e.drainCtx = ctx
 		close(e.stopCh)
 
-		done := make(chan struct{})
-		go func() { e.wg.Wait(); close(done) }()
+		e.wg.Wait()
 
-		select {
-		case <-done:
-		case <-ctx.Done():
-			if result.FinalError == nil {
-				result.FinalError = ctx.Err()
-			}
-		}
-
-		for {
-			select {
-			case r := <-e.drainResults:
-				result.RecordsFlushed += r.RecordsFlushed
-				result.RecordsDeadLettered += r.RecordsDeadLettered
-				result.RecordsAbandoned += r.RecordsAbandoned
-				if r.FinalError != nil && result.FinalError == nil {
-					result.FinalError = r.FinalError
-				}
-			default:
-				return
+		for i := 0; i < e.cfg.BandCount; i++ {
+			r := <-e.drainResults
+			result.RecordsFlushed += r.RecordsFlushed
+			result.RecordsDeadLettered += r.RecordsDeadLettered
+			result.RecordsAbandoned += r.RecordsAbandoned
+			if r.FinalError != nil && result.FinalError == nil {
+				result.FinalError = r.FinalError
 			}
 		}
 	})
@@ -255,6 +242,7 @@ func (e *Engine) drainBand(ctx context.Context, band int) DrainResult {
 			backoff = min(backoff*2, drainBackoffMax)
 			continue
 		}
+		final = nil
 		if r.Flushed == 0 && r.DeadLettered == 0 {
 			depth, derr := e.shield.DirtyQueueDepth(ctx, band)
 			if derr != nil || depth == 0 {
