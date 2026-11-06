@@ -544,3 +544,7 @@ func dumpStreamTail(ctx context.Context, redisAddrs []string, clusterMode bool, 
 func (m *logMetrics) RecordUnflushedExpiry(ns, band string, count int) {
 	m.log.Error("unflushed payload lost", "ns", ns, "band", band, "count", count)
 }
+func (m *logMetrics) RecordTransientRetry(ns, band string, count int) {
+	m.log.Warn("transient retry", "ns", ns, "band", band, "count", count)
+}
+func (m *logMetrics) RecordOldestDirtyAge(ns, band string, age time.Duration) {}
