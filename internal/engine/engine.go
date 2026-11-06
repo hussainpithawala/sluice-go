@@ -206,21 +206,12 @@ func (e *Engine) DrainAndStop(ctx context.Context) DrainResult {
 		e.flushCancel()
 		close(e.stopCh)
 
-		done := make(chan struct{})
-		go func() { e.wg.Wait(); close(done) }()
-
-		// Wait for goroutines to finish, but cap the wait at the drain
-		// deadline plus a grace period for post-loop depth probes.
-		grace := 3 * time.Second
-		select {
-		case <-done:
-		case <-time.After(ctxRemaining(ctx) + grace):
-			if result.FinalError == nil {
-				result.FinalError = ctx.Err()
-			}
-		}
-
-		// Collect results from bands that finished.
+		// Collect exactly BandCount results. Each band goroutine posts one
+		// result before calling wg.Done, so this cannot hang as long as the
+		// goroutines eventually exit. The grace timer is a safety net: if a
+		// goroutine is stuck (e.g. uncooperative sink), we stop waiting.
+		graceCtx, graceCancel := context.WithTimeout(context.Background(), ctxRemaining(ctx)+5*time.Second)
+		defer graceCancel()
 		for range e.cfg.BandCount {
 			select {
 			case r := <-e.drainResults:
@@ -230,7 +221,11 @@ func (e *Engine) DrainAndStop(ctx context.Context) DrainResult {
 				if r.FinalError != nil && result.FinalError == nil {
 					result.FinalError = r.FinalError
 				}
-			default:
+			case <-graceCtx.Done():
+				if result.FinalError == nil {
+					result.FinalError = ctx.Err()
+				}
+				return
 			}
 		}
 	})
