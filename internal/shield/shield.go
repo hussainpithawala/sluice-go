@@ -347,13 +347,6 @@ func (s *Shield) pipelineWriteResults(ctx context.Context, entries []writeEntry)
 	return results, errs
 }
 
-// pipelineWrites is a convenience wrapper used by the batcher, which only
-// needs the error per entry (not the full WriteResult).
-func (s *Shield) pipelineWrites(ctx context.Context, entries []writeEntry) []error {
-	_, errs := s.pipelineWriteResults(ctx, entries)
-	return errs
-}
-
 // WriteDedup handles xxHash64 deduplication in a separate, Valkey-safe Lua script.
 // When opts is non-nil, the idempotency guard key is threaded into the script.
 func (s *Shield) WriteDedup(ctx context.Context, correlationKey string, payload []byte, hash string, opts *WriteOpts) (WriteResult, error) {

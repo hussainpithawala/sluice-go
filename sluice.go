@@ -798,56 +798,69 @@ func (s *Sluice) write(ctx context.Context, correlationKey string, payload []byt
 	bandStr := strconv.Itoa(band)
 
 	if result.Status == shield.WriteCodeIndexPend && s.cfg.IndexContract != nil {
-		curSeq, seqErr := s.shield.GetSeq(ctx, correlationKey)
-		if seqErr == nil && curSeq == result.Seq {
-			indexes, idxErr := s.cfg.IndexContract(correlationKey, payload)
-			if idxErr == nil && len(indexes) > 0 {
-				if ixErr := s.shield.UpdateIndexes(ctx, correlationKey, indexes, s.cfg.ActivityWindow); ixErr == nil {
-					_ = s.shield.ClearIndexPending(ctx, correlationKey, result.Seq)
-				} else {
-					s.metrics.RecordIndexUpdateFailed(s.cfg.Namespace, bandStr)
-				}
-			}
-		}
+		s.repairIndex(ctx, correlationKey, payload, result.Seq, bandStr)
 	}
 
 	if result.Written {
-		s.metrics.RecordWrite(s.cfg.Namespace)
+		s.afterWrite(ctx, correlationKey, payload, l1Version, band, bandStr)
+	}
 
-		if s.local != nil {
-			applied := s.local.Put(correlationKey, payload, l1Version)
-			slog.Debug("WRITE-THROUGH", "crn", correlationKey, "version", l1Version, "applied", applied)
-		}
+	return nil
+}
 
-		if s.cfg.IndexContract != nil {
-			indexes, idxErr := s.cfg.IndexContract(correlationKey, payload)
-			if idxErr == nil && len(indexes) > 0 {
-				if ixErr := s.shield.UpdateIndexes(ctx, correlationKey, indexes, s.cfg.ActivityWindow); ixErr != nil {
-					s.metrics.RecordIndexUpdateFailed(s.cfg.Namespace, bandStr)
-				} else {
-					_ = s.shield.ClearIndexPending(ctx, correlationKey, "")
-				}
-			}
-		}
+// repairIndex re-indexes a key whose prior index update failed (ixp marker present).
+func (s *Sluice) repairIndex(ctx context.Context, correlationKey string, payload []byte, seq, bandStr string) {
+	curSeq, seqErr := s.shield.GetSeq(ctx, correlationKey)
+	if seqErr != nil || curSeq != seq {
+		return
+	}
+	indexes, idxErr := s.cfg.IndexContract(correlationKey, payload)
+	if idxErr != nil || len(indexes) == 0 {
+		return
+	}
+	if ixErr := s.shield.UpdateIndexes(ctx, correlationKey, indexes, s.cfg.ActivityWindow); ixErr == nil {
+		_ = s.shield.ClearIndexPending(ctx, correlationKey, seq)
+	} else {
+		s.metrics.RecordIndexUpdateFailed(s.cfg.Namespace, bandStr)
+	}
+}
 
-		signaled := false
-		if s.cfg.HotAwareFlush {
-			isHot, hotErr := s.shield.IsHot(ctx, correlationKey)
-			if hotErr == nil && isHot {
-				s.engine.SignalVolume(band)
-				signaled = true
-			}
-		}
-		if !signaled && !s.cfg.BatchedWrites {
-			if depth, depthErr := s.shield.DirtyQueueDepth(ctx, band); depthErr == nil {
-				if int(depth) >= s.cfg.MaxBatchSize {
-					s.engine.SignalVolume(band)
-				}
+// afterWrite handles post-write side effects: metrics, L1 write-through,
+// indexing, and flush signaling.
+func (s *Sluice) afterWrite(ctx context.Context, correlationKey string, payload []byte, l1Version int64, band int, bandStr string) {
+	s.metrics.RecordWrite(s.cfg.Namespace)
+
+	if s.local != nil {
+		applied := s.local.Put(correlationKey, payload, l1Version)
+		slog.Debug("WRITE-THROUGH", "crn", correlationKey, "version", l1Version, "applied", applied)
+	}
+
+	if s.cfg.IndexContract != nil {
+		indexes, idxErr := s.cfg.IndexContract(correlationKey, payload)
+		if idxErr == nil && len(indexes) > 0 {
+			if ixErr := s.shield.UpdateIndexes(ctx, correlationKey, indexes, s.cfg.ActivityWindow); ixErr != nil {
+				s.metrics.RecordIndexUpdateFailed(s.cfg.Namespace, bandStr)
+			} else {
+				_ = s.shield.ClearIndexPending(ctx, correlationKey, "")
 			}
 		}
 	}
 
-	return nil
+	signaled := false
+	if s.cfg.HotAwareFlush {
+		isHot, hotErr := s.shield.IsHot(ctx, correlationKey)
+		if hotErr == nil && isHot {
+			s.engine.SignalVolume(band)
+			signaled = true
+		}
+	}
+	if !signaled && !s.cfg.BatchedWrites {
+		if depth, depthErr := s.shield.DirtyQueueDepth(ctx, band); depthErr == nil {
+			if int(depth) >= s.cfg.MaxBatchSize {
+				s.engine.SignalVolume(band)
+			}
+		}
+	}
 }
 
 // Query performs compound queries safely across bands using in-process SET intersection.

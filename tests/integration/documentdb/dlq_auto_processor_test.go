@@ -241,6 +241,8 @@ func (c *dlqProcessCounter) RecordLocalSetSize(_ string, _ int)                 
 func (c *dlqProcessCounter) RecordBroadcastLag(_ string, _ time.Duration)             {}
 func (c *dlqProcessCounter) RecordTransientRetry(string, string, int)                 {}
 func (c *dlqProcessCounter) RecordOldestDirtyAge(string, string, time.Duration)       {}
+func (c *dlqProcessCounter) RecordIndexUpdateFailed(string, string)                   {}
+func (c *dlqProcessCounter) RecordDegradedIdempotentWrite(string)                     {}
 
 // TestDLQAutoProcess_ContinuesAfterProcessingError verifies that the
 // auto-processor doesn't stop if an individual DLQ processing cycle fails.

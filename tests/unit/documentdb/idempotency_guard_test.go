@@ -26,7 +26,7 @@ func guardKey(namespace string, s *shield.Shield, ck, idemKey string) string {
 func TestIdempotencyGuard_BasicFlow(t *testing.T) {
 	const namespace = "idem_basic"
 	s := newTestShield(t, namespace)
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 
 	ctx := context.Background()
 	ck := "basic_001"
@@ -63,7 +63,7 @@ func TestIdempotencyGuard_BasicFlow(t *testing.T) {
 func TestIdempotencyGuard_NoGuardOnPreExecutionFailure(t *testing.T) {
 	const namespace = "idem_prefail"
 	s := newTestShield(t, namespace)
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 
 	hook := faulthook.New()
 	s.Client().(*redis.Client).AddHook(hook)
@@ -97,7 +97,7 @@ func TestIdempotencyGuard_NoGuardOnPreExecutionFailure(t *testing.T) {
 func TestIdempotencyGuard_GuardExistsAfterAmbiguousFailure(t *testing.T) {
 	const namespace = "idem_ambiguous"
 	s := newTestShield(t, namespace)
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 
 	hook := faulthook.New()
 	s.Client().(*redis.Client).AddHook(hook)
@@ -138,7 +138,7 @@ func TestIdempotencyGuard_GuardExistsAfterAmbiguousFailure(t *testing.T) {
 func TestIdempotencyGuard_ConcurrentExactlyOneWins(t *testing.T) {
 	const namespace = "idem_concurrent"
 	s := newTestShield(t, namespace)
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 
 	ctx := context.Background()
 	ck := "concurrent_001"
@@ -159,11 +159,11 @@ func TestIdempotencyGuard_ConcurrentExactlyOneWins(t *testing.T) {
 	for i := 0; i < goroutines; i++ {
 		go func() {
 			defer wg.Done()
-			_, err := s.Write(ctx, ck, payload, opts)
-			switch {
-			case err == nil:
+			_, wErr := s.Write(ctx, ck, payload, opts)
+			switch wErr { //nolint:errorlint // sentinel comparison is intentional
+			case nil:
 				wins.Add(1)
-			case err == shield.ErrDuplicateKey:
+			case shield.ErrDuplicateKey:
 				dups.Add(1)
 			default:
 				failures.Add(1)
@@ -189,7 +189,7 @@ func TestIdempotencyGuard_ConcurrentExactlyOneWins(t *testing.T) {
 func TestIdempotencyGuard_WithContentDedup(t *testing.T) {
 	const namespace = "idem_dedup"
 	s := newTestShield(t, namespace)
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 
 	ctx := context.Background()
 	ck := "dedup_001"
