@@ -724,48 +724,6 @@ func (s *Shield) DrainDLQ(ctx context.Context, band, maxBatch int) ([]FlushRecor
 	return s.drainDLQAction(ctx, members, cmds, corrKeys, dlqKey)
 }
 
-func drainAction(ctx context.Context, members []redis.Z, cmds []*redis.SliceCmd, corrKeys []string, s *Shield, drainKey string) ([]FlushRecord, error) {
-	records := make([]FlushRecord, 0, len(members))
-	expired := make([]interface{}, 0)
-
-	for i, cmd := range cmds {
-		vals, cmdErr := cmd.Result()
-		if cmdErr != nil || vals[0] == nil {
-			expired = append(expired, corrKeys[i])
-			continue
-		}
-		payload, ok := vals[0].(string)
-		if !ok || payload == "" {
-			expired = append(expired, corrKeys[i])
-			continue
-		}
-
-		// Extract the journal write timestamp for ordering guards and L1 versioning.
-		var ts int64
-		if len(vals) > 1 {
-			if tsStr, ok := vals[1].(string); ok && tsStr != "" {
-				if f, perr := strconv.ParseFloat(tsStr, 64); perr == nil {
-					ts = int64(f)
-				}
-			}
-		}
-
-		// Valid payload — return WITHOUT ZREMing...
-		records = append(records, FlushRecord{
-			CorrelationKey: corrKeys[i],
-			Payload:        []byte(payload),
-			ReceivedAt:     time.Now(),
-			JournalTS:      ts,
-		})
-	}
-
-	if len(expired) > 0 {
-		_ = s.client.ZRem(ctx, drainKey, expired...).Err()
-	}
-
-	return records, nil
-}
-
 func (s *Shield) drainDLQAction(ctx context.Context, members []redis.Z, cmds []*redis.SliceCmd, corrKeys []string, dlqKey string) ([]FlushRecord, error) {
 	records := make([]FlushRecord, 0, len(members))
 	expired := make([]interface{}, 0)
