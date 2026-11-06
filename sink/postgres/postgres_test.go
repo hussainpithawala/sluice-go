@@ -14,6 +14,8 @@ import (
 
 const testConnString = "postgres://sluice:sluice@localhost:5432/sluice_test?sslmode=disable"
 
+var _ sink.ClassifiedSink = (*Sink)(nil)
+
 func setupPostgresSink(t *testing.T) (*Sink, *pgxpool.Pool, string, func()) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)

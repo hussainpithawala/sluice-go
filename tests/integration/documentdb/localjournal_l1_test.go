@@ -97,6 +97,8 @@ func (r *countingRecorder) RecordDirtyQueueDepth(string, string, int)           
 func (r *countingRecorder) RecordContractError(string, string, error)             {}
 func (r *countingRecorder) RecordDeadLetter(string, string, int)                  {}
 func (r *countingRecorder) RecordUnflushedExpiry(string, string, int)             {}
+func (r *countingRecorder) RecordTransientRetry(string, string, int)              {}
+func (r *countingRecorder) RecordOldestDirtyAge(string, string, time.Duration)    {}
 func (r *countingRecorder) RecordDLQProcess(string, string, int, int, int)        {}
 
 // snapshot returns a thread-safe copy of the counters.

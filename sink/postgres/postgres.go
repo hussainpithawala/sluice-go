@@ -370,6 +370,8 @@ func (s *Sink) Write(ctx context.Context, model sink.WriteModel) error {
 	return s.executeBulk(ctx, []sink.WriteModel{model}, cols)
 }
 
+func (s *Sink) ClassifiesErrors() {}
+
 func (s *Sink) Ping(ctx context.Context) error {
 	return s.pool.Ping(ctx)
 }

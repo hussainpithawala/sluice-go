@@ -16,16 +16,17 @@ import (
 
 // Config holds the engine-level tunables passed from the top-level sluice.Config.
 type Config struct {
-	Namespace      string
-	BandCount      int
-	FlushWindow    time.Duration
-	FlushTimeout   time.Duration // Explicit flush context timeout; zero falls back to FlushWindow*4
-	MaxBatchSize   int
-	KeyTTL         time.Duration // Post-flush TTL for cold payloads; also the backlog flush threshold
-	ActivityWindow time.Duration // Hot correlation_key session TTL (post-flush TTL for hot payloads)
-	HotAwareFlush  bool          // Give flushed hot keys the ActivityWindow TTL and refresh their marker
-	FlushLock      bool          // Acquire a per-band Redis advisory lock before flushing
-	AdaptiveBatch  bool          // Enable adaptive batch sizing based on flush duration
+	Namespace        string
+	BandCount        int
+	FlushWindow      time.Duration
+	FlushTimeout     time.Duration // Explicit flush context timeout; zero falls back to FlushWindow*4
+	MaxBatchSize     int
+	KeyTTL           time.Duration // Post-flush TTL for cold payloads; also the backlog flush threshold
+	ActivityWindow   time.Duration // Hot correlation_key session TTL (post-flush TTL for hot payloads)
+	HotAwareFlush    bool          // Give flushed hot keys the ActivityWindow TTL and refresh their marker
+	FlushLock        bool          // Acquire a per-band Redis advisory lock before flushing
+	AdaptiveBatch    bool          // Enable adaptive batch sizing based on flush duration
+	MaxRetryAttempts int           // 0 = unlimited retries (default); >0 = dead-letter after N transient failures
 }
 
 // MetricsRecorder is the subset of telemetry methods the engine needs.
@@ -43,6 +44,8 @@ type MetricsRecorder interface {
 	RecordContractError(namespace, correlationKey string, err error)
 	RecordDeadLetter(namespace, band string, count int)
 	RecordRedisOp(namespace, op string, duration time.Duration, err error)
+	RecordTransientRetry(namespace, band string, count int)
+	RecordOldestDirtyAge(namespace, band string, age time.Duration)
 }
 
 // WriteContract is the domain function the caller contributes.
@@ -90,6 +93,12 @@ type Engine struct {
 	wg            sync.WaitGroup
 	stopCh        chan struct{}
 	once          sync.Once
+
+	// The following fields are indexed by band and accessed only from that
+	// band's goroutine (runBand), so no mutex is needed.
+	lastBatchWarn     []time.Time      // rate-limit: one WARN per band per FlushWindow
+	lastTransientWarn []time.Time      // rate-limit: one WARN per band per FlushWindow
+	attempts          []map[string]int // per-band, per-key transient retry counter
 }
 
 // New constructs an Engine. Call Start() to begin band goroutines.
@@ -113,16 +122,23 @@ func New(
 		}
 		ab = NewAdaptiveBatch(cfg.MaxBatchSize, 100, target*3/5)
 	}
+	attempts := make([]map[string]int, cfg.BandCount)
+	for i := range attempts {
+		attempts[i] = make(map[string]int)
+	}
 	return &Engine{
-		cfg:           cfg,
-		shield:        sh,
-		sink:          sk,
-		writeContract: contract,
-		metrics:       metrics,
-		callback:      cb,
-		adaptive:      ab,
-		volumeSignals: signals,
-		stopCh:        make(chan struct{}),
+		cfg:               cfg,
+		shield:            sh,
+		sink:              sk,
+		writeContract:     contract,
+		metrics:           metrics,
+		callback:          cb,
+		adaptive:          ab,
+		volumeSignals:     signals,
+		stopCh:            make(chan struct{}),
+		lastBatchWarn:     make([]time.Time, cfg.BandCount),
+		lastTransientWarn: make([]time.Time, cfg.BandCount),
+		attempts:          attempts,
 	}
 }
 
@@ -244,16 +260,25 @@ func (e *Engine) runBand(band int) {
 		select {
 		case <-e.stopCh:
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			_ = e.lockedFlush(ctx, band, true)
+			if err := e.lockedFlush(ctx, band, true); err != nil {
+				slog.Debug("sluice: flush error on shutdown",
+					"namespace", e.cfg.Namespace, "band", band, "err", err)
+			}
 			cancel()
 			return
 		case <-ticker.C:
 			ctx, cancel := context.WithTimeout(context.Background(), e.flushTimeout())
-			_ = e.lockedFlush(ctx, band, false)
+			if err := e.lockedFlush(ctx, band, false); err != nil {
+				slog.Debug("sluice: flush error on ticker",
+					"namespace", e.cfg.Namespace, "band", band, "err", err)
+			}
 			cancel()
 		case <-e.volumeSignals[band]:
 			ctx, cancel := context.WithTimeout(context.Background(), e.flushTimeout())
-			_ = e.lockedFlush(ctx, band, false)
+			if err := e.lockedFlush(ctx, band, false); err != nil {
+				slog.Debug("sluice: flush error on volume signal",
+					"namespace", e.cfg.Namespace, "band", band, "err", err)
+			}
 			cancel()
 		}
 	}
@@ -286,9 +311,7 @@ func (e *Engine) flushBand(ctx context.Context, band int) error {
 		}
 	}()
 
-	if depth, err := e.shield.DirtyQueueDepth(ctx, band); err == nil {
-		e.metrics.RecordDirtyQueueDepth(e.cfg.Namespace, bandStr, int(depth))
-	}
+	e.emitBandGauges(ctx, band, bandStr)
 
 	records, err := e.shield.DrainBand(ctx, band, e.effectiveBatchSize())
 	if err != nil {
@@ -299,9 +322,66 @@ func (e *Engine) flushBand(ctx context.Context, band int) error {
 		return nil
 	}
 
+	models, corrKeys, seqs := e.resolveRecords(ctx, band, bandStr, records)
+	if len(models) == 0 {
+		return nil
+	}
+	batchSize = len(models)
+
+	result, flushErr := e.sink.BulkWrite(ctx, models)
+	e.metrics.RecordFlush(e.cfg.Namespace, bandStr, batchSize, time.Since(start), flushErr)
+
+	if flushErr != nil {
+		e.warnBatchFailure(band, batchSize, flushErr)
+		if e.callback != nil {
+			e.callback(corrKeys, result, flushErr)
+		}
+		return flushErr
+	}
+	if err := sink.CheckAttribution(models, result); err != nil {
+		slog.Error("sluice: flush aborted due to unattributed sink error",
+			"err", err, "namespace", e.cfg.Namespace, "band", band)
+		if e.callback != nil {
+			e.callback(corrKeys, result, err)
+		}
+		return err
+	}
+
+	permanentKeys, transientKeys := e.partitionErrors(result)
+	e.trackTransientRetries(band, bandStr, transientKeys)
+	e.enforceRetryCap(ctx, band, bandStr, transientKeys, seqs)
+	successKeys := subtractKeys(corrKeys, permanentKeys, transientKeys)
+
+	e.commitFlushed(ctx, band, successKeys, seqs)
+	e.clearAttempts(band, successKeys, permanentKeys)
+	e.deadLetterPermanent(ctx, band, bandStr, permanentKeys, seqs)
+
+	if e.callback != nil {
+		e.callback(corrKeys, result, nil)
+	}
+	return nil
+}
+
+// emitBandGauges records the dirty queue depth and oldest entry age for a band.
+func (e *Engine) emitBandGauges(ctx context.Context, band int, bandStr string) {
+	if depth, err := e.shield.DirtyQueueDepth(ctx, band); err == nil {
+		e.metrics.RecordDirtyQueueDepth(e.cfg.Namespace, bandStr, int(depth))
+	}
+	if score, err := e.shield.OldestDirtyScore(ctx, band); err == nil && score > 0 {
+		ageMs := float64(time.Now().UnixMilli()) - score
+		e.metrics.RecordOldestDirtyAge(e.cfg.Namespace, bandStr, time.Duration(ageMs)*time.Millisecond)
+	}
+}
+
+// resolveRecords applies the WriteContract to each drained record, routing
+// missing payloads and contract errors to their respective handlers. Returns
+// the models ready for BulkWrite, their correlation keys, and the per-key
+// write sequences.
+func (e *Engine) resolveRecords(
+	ctx context.Context, band int, bandStr string, records []shield.FlushRecord,
+) ([]sink.WriteModel, []string, map[string]string) {
 	seqs := make(map[string]string, len(records))
 	var missing []shield.VersionedKey
-
 	models := make([]sink.WriteModel, 0, len(records))
 	corrKeys := make([]string, 0, len(records))
 
@@ -313,21 +393,7 @@ func (e *Engine) flushBand(ctx context.Context, band int) error {
 		seqs[rec.CorrelationKey] = rec.Seq
 		wm, contractErr := e.writeContract(rec.CorrelationKey, rec.Payload)
 		if contractErr != nil {
-			e.metrics.RecordContractError(e.cfg.Namespace, rec.CorrelationKey, contractErr)
-			e.deadLetter(ctx, band, bandStr,
-				[]shield.VersionedKey{{CorrelationKey: rec.CorrelationKey, Seq: rec.Seq}}, "contract_violation")
-			if e.callback != nil {
-				e.callback(
-					[]string{rec.CorrelationKey},
-					&sink.BulkWriteResult{
-						Errors: []sink.SinkError{
-							{CorrelationKey: rec.CorrelationKey,
-								Err: fmt.Errorf("%w: %v", sink.ErrContractViolation, contractErr)},
-						},
-					},
-					contractErr,
-				)
-			}
+			e.handleContractError(ctx, band, bandStr, rec, contractErr)
 			continue
 		}
 		models = append(models, sink.WriteModel{
@@ -341,80 +407,149 @@ func (e *Engine) flushBand(ctx context.Context, band int) error {
 	}
 
 	e.handleMissingPayloads(ctx, band, bandStr, missing)
-	if len(models) == 0 {
-		return nil
+	return models, corrKeys, seqs
+}
+
+// handleContractError dead-letters a single record whose WriteContract failed
+// and notifies the flush callback.
+func (e *Engine) handleContractError(ctx context.Context, band int, bandStr string, rec shield.FlushRecord, err error) {
+	e.metrics.RecordContractError(e.cfg.Namespace, rec.CorrelationKey, err)
+	e.deadLetter(ctx, band, bandStr,
+		[]shield.VersionedKey{{CorrelationKey: rec.CorrelationKey, Seq: rec.Seq}}, "contract_violation")
+	if e.callback != nil {
+		e.callback(
+			[]string{rec.CorrelationKey},
+			&sink.BulkWriteResult{
+				Errors: []sink.SinkError{
+					{CorrelationKey: rec.CorrelationKey,
+						Err: fmt.Errorf("%w: %v", sink.ErrContractViolation, err)},
+				},
+			},
+			err,
+		)
 	}
-	batchSize = len(models)
+}
 
-	// Phase 2: BulkWrite.
-	result, flushErr := e.sink.BulkWrite(ctx, models)
-	duration := time.Since(start)
-	e.metrics.RecordFlush(e.cfg.Namespace, bandStr, len(models), duration, flushErr)
-
-	if flushErr != nil {
-		if e.callback != nil {
-			e.callback(corrKeys, result, flushErr)
-		}
-		return flushErr
+// warnBatchFailure emits a rate-limited WARN when an entire BulkWrite fails.
+func (e *Engine) warnBatchFailure(band, batchSize int, err error) {
+	if time.Since(e.lastBatchWarn[band]) > e.cfg.FlushWindow {
+		slog.Warn("sluice: bulk write failed (whole batch)",
+			"namespace", e.cfg.Namespace, "band", band,
+			"batch_size", batchSize, "err", err)
+		e.lastBatchWarn[band] = time.Now()
 	}
+}
 
-	// NEW: Attribution Guard. Prevents success-by-elimination silent loss.
-	// If the sink returns partial errors but fails to attribute them to a key
-	// in the batch, we abort the commit entirely. All keys stay dirty.
-	if err := sink.CheckAttribution(models, result); err != nil {
-		slog.Error("sluice: flush aborted due to unattributed sink error",
-			"err", err, "namespace", e.cfg.Namespace, "band", band)
-		if e.callback != nil {
-			e.callback(corrKeys, result, err)
-		}
-		return err
-	}
-
-	// CHANGED: Partition results using IsPermanent() instead of Code == 11000.
-	// This works across all sinks (DocDB, DynamoDB, Postgres) uniformly.
-	permanentKeys := make([]string, 0)
+// partitionErrors classifies per-key sink errors into permanent (DLQ) and
+// transient (retry) buckets.
+func (e *Engine) partitionErrors(result *sink.BulkWriteResult) ([]string, map[string]bool) {
+	var permanentKeys []string
 	transientKeys := make(map[string]bool)
-	if result != nil {
-		for _, se := range result.Errors {
-			if se.IsPermanent() {
-				permanentKeys = append(permanentKeys, se.CorrelationKey)
-			} else {
-				transientKeys[se.CorrelationKey] = true
-			}
+	if result == nil {
+		return permanentKeys, transientKeys
+	}
+	for _, se := range result.Errors {
+		if se.IsPermanent() {
+			permanentKeys = append(permanentKeys, se.CorrelationKey)
+		} else {
+			transientKeys[se.CorrelationKey] = true
 		}
 	}
+	return permanentKeys, transientKeys
+}
 
-	failedKeys := make(map[string]bool, len(permanentKeys)+len(transientKeys))
-	for _, k := range permanentKeys {
-		failedKeys[k] = true
+// trackTransientRetries increments per-key attempt counters and emits a
+// metric plus a rate-limited WARN for transient failures.
+func (e *Engine) trackTransientRetries(band int, bandStr string, transientKeys map[string]bool) {
+	if len(transientKeys) == 0 {
+		return
 	}
 	for k := range transientKeys {
-		failedKeys[k] = true
+		e.attempts[band][k]++
 	}
+	e.metrics.RecordTransientRetry(e.cfg.Namespace, bandStr, len(transientKeys))
+	if time.Since(e.lastTransientWarn[band]) > e.cfg.FlushWindow {
+		sample := make([]string, 0, 5)
+		for k := range transientKeys {
+			sample = append(sample, k)
+			if len(sample) >= 5 {
+				break
+			}
+		}
+		slog.Warn("sluice: transient sink errors — keys left for retry",
+			"namespace", e.cfg.Namespace, "band", band,
+			"count", len(transientKeys), "sample_keys", sample)
+		e.lastTransientWarn[band] = time.Now()
+	}
+}
 
-	successKeys := make([]string, 0, len(corrKeys))
-	for _, k := range corrKeys {
-		if !failedKeys[k] {
-			successKeys = append(successKeys, k)
+// enforceRetryCap routes transient keys that exceeded MaxRetryAttempts to the
+// DLQ. Capped keys are removed from transientKeys so they are not counted as
+// still-retrying in the success/fail partition.
+func (e *Engine) enforceRetryCap(ctx context.Context, band int, bandStr string, transientKeys map[string]bool, seqs map[string]string) {
+	if e.cfg.MaxRetryAttempts <= 0 {
+		return
+	}
+	var cappedKeys []string
+	for k := range transientKeys {
+		if e.attempts[band][k] > e.cfg.MaxRetryAttempts {
+			cappedKeys = append(cappedKeys, k)
 		}
 	}
+	if len(cappedKeys) == 0 {
+		return
+	}
+	items := make([]shield.VersionedKey, len(cappedKeys))
+	for i, k := range cappedKeys {
+		items[i] = shield.VersionedKey{CorrelationKey: k, Seq: seqs[k]}
+		delete(e.attempts[band], k)
+		delete(transientKeys, k)
+	}
+	slog.Warn("sluice: transient errors exceeded retry cap — routing to DLQ",
+		"namespace", e.cfg.Namespace, "band", band,
+		"count", len(cappedKeys), "max_attempts", e.cfg.MaxRetryAttempts)
+	e.deadLetter(ctx, band, bandStr, items, "transient_retry_exhausted")
+}
 
-	e.commitFlushed(ctx, band, successKeys, seqs)
-
-	if len(permanentKeys) > 0 {
-		items := make([]shield.VersionedKey, len(permanentKeys))
-		for i, k := range permanentKeys {
-			items[i] = shield.VersionedKey{CorrelationKey: k, Seq: seqs[k]}
+// subtractKeys returns the elements of all that are in neither permanent nor
+// transient.
+func subtractKeys(all []string, permanent []string, transient map[string]bool) []string {
+	failed := make(map[string]bool, len(permanent)+len(transient))
+	for _, k := range permanent {
+		failed[k] = true
+	}
+	for k := range transient {
+		failed[k] = true
+	}
+	out := make([]string, 0, len(all))
+	for _, k := range all {
+		if !failed[k] {
+			out = append(out, k)
 		}
-		// CHANGED: Reason is now "permanent_sink_error" instead of "duplicate_key",
-		// since IsPermanent() covers more than just 11000.
-		e.deadLetter(ctx, band, bandStr, items, "permanent_sink_error")
 	}
+	return out
+}
 
-	if e.callback != nil {
-		e.callback(corrKeys, result, nil)
+// clearAttempts removes attempt counters for keys that no longer need tracking.
+func (e *Engine) clearAttempts(band int, successKeys, permanentKeys []string) {
+	for _, k := range successKeys {
+		delete(e.attempts[band], k)
 	}
-	return nil
+	for _, k := range permanentKeys {
+		delete(e.attempts[band], k)
+	}
+}
+
+// deadLetterPermanent moves permanently-failed keys to the DLQ.
+func (e *Engine) deadLetterPermanent(ctx context.Context, band int, bandStr string, permanentKeys []string, seqs map[string]string) {
+	if len(permanentKeys) == 0 {
+		return
+	}
+	items := make([]shield.VersionedKey, len(permanentKeys))
+	for i, k := range permanentKeys {
+		items[i] = shield.VersionedKey{CorrelationKey: k, Seq: seqs[k]}
+	}
+	e.deadLetter(ctx, band, bandStr, items, "permanent_sink_error")
 }
 
 // commitFlushed commits successfully flushed keys with their post-flush TTL:

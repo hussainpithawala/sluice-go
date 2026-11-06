@@ -30,16 +30,17 @@ func (c RedisConfig) toInternal() shield.RedisConfig {
 // The read path (HotLoad/Read) is orchestrated directly by Sluice using the Source.
 func (c Config) toInternal() engine.Config {
 	return engine.Config{
-		Namespace:      c.Namespace,
-		BandCount:      c.BandCount,
-		FlushWindow:    c.FlushWindow,
-		FlushTimeout:   c.FlushTimeout,
-		MaxBatchSize:   c.MaxBatchSize,
-		KeyTTL:         c.KeyTTL,
-		ActivityWindow: c.ActivityWindow,
-		HotAwareFlush:  c.HotAwareFlush,
-		FlushLock:      c.FlushLock,
-		AdaptiveBatch:  c.AdaptiveBatch,
+		Namespace:        c.Namespace,
+		BandCount:        c.BandCount,
+		FlushWindow:      c.FlushWindow,
+		FlushTimeout:     c.FlushTimeout,
+		MaxBatchSize:     c.MaxBatchSize,
+		KeyTTL:           c.KeyTTL,
+		ActivityWindow:   c.ActivityWindow,
+		HotAwareFlush:    c.HotAwareFlush,
+		FlushLock:        c.FlushLock,
+		AdaptiveBatch:    c.AdaptiveBatch,
+		MaxRetryAttempts: c.MaxRetryAttempts,
 	}
 }
 

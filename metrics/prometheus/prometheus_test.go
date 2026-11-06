@@ -134,6 +134,45 @@ func TestRecorder_RecordRead(t *testing.T) {
 	assert.True(t, found, "read_duration_seconds metric not found")
 }
 
+func TestRecorder_RecordTransientRetry(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	rec := NewRecorderWithRegistry("test", reg)
+
+	rec.RecordTransientRetry("ns", "0", 5)
+	rec.RecordTransientRetry("ns", "0", 3)
+
+	metrics, err := reg.Gather()
+	require.NoError(t, err)
+
+	found := false
+	for _, mf := range metrics {
+		if mf.GetName() == "sluice_test_transient_retry_total" {
+			found = true
+			assert.Equal(t, float64(8), mf.GetMetric()[0].GetCounter().GetValue())
+		}
+	}
+	assert.True(t, found, "transient_retry_total metric not found")
+}
+
+func TestRecorder_RecordOldestDirtyAge(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	rec := NewRecorderWithRegistry("test", reg)
+
+	rec.RecordOldestDirtyAge("ns", "0", 5*time.Second)
+
+	metrics, err := reg.Gather()
+	require.NoError(t, err)
+
+	found := false
+	for _, mf := range metrics {
+		if mf.GetName() == "sluice_test_oldest_dirty_age_seconds" {
+			found = true
+			assert.Equal(t, float64(5), mf.GetMetric()[0].GetGauge().GetValue())
+		}
+	}
+	assert.True(t, found, "oldest_dirty_age_seconds metric not found")
+}
+
 func TestRecorder_Unregister(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	rec := NewRecorderWithRegistry("test", reg)

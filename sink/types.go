@@ -53,5 +53,13 @@ const (
 	ClassPermanent
 )
 
+// ClassifiedSink is implemented by FlushSink implementations that guarantee
+// all SinkErrors returned from BulkWrite have an explicit ErrorClass set
+// (ClassTransient or ClassPermanent, never ClassUnknown). Sinks that do not
+// implement this interface will cause a panic at Build() time.
+type ClassifiedSink interface {
+	ClassifiesErrors()
+}
+
 // ErrUnattributedSinkError is returned when a sink fails to attribute an error to a specific key.
 var ErrUnattributedSinkError = errors.New("sluice: sink returned an error with an empty or unattributed correlation key")

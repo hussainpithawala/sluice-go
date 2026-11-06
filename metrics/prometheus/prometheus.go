@@ -35,18 +35,20 @@ type Recorder struct {
 	namespace string
 
 	// Write path
-	writeTotal         *prometheus.CounterVec
-	degradedWriteTotal *prometheus.CounterVec
-	redisOpDuration    *prometheus.HistogramVec
-	flushDuration      *prometheus.HistogramVec
-	flushBatchSize     *prometheus.HistogramVec
-	flushTimeoutTotal  *prometheus.CounterVec
-	flushLockSkipTotal *prometheus.CounterVec
-	dirtyQueueDepth    *prometheus.GaugeVec
-	contractErrorTotal *prometheus.CounterVec
-	deadLetterTotal    *prometheus.CounterVec
-	dlqProcessTotal    *prometheus.CounterVec
-	unflushedLossTotal *prometheus.CounterVec
+	writeTotal          *prometheus.CounterVec
+	degradedWriteTotal  *prometheus.CounterVec
+	redisOpDuration     *prometheus.HistogramVec
+	flushDuration       *prometheus.HistogramVec
+	flushBatchSize      *prometheus.HistogramVec
+	flushTimeoutTotal   *prometheus.CounterVec
+	flushLockSkipTotal  *prometheus.CounterVec
+	dirtyQueueDepth     *prometheus.GaugeVec
+	contractErrorTotal  *prometheus.CounterVec
+	deadLetterTotal     *prometheus.CounterVec
+	dlqProcessTotal     *prometheus.CounterVec
+	unflushedLossTotal  *prometheus.CounterVec
+	transientRetryTotal *prometheus.CounterVec
+	oldestDirtyAge      *prometheus.GaugeVec
 
 	// Hot/cold regime
 	warmupDuration *prometheus.HistogramVec
@@ -165,6 +167,20 @@ func NewRecorderWithRegistry(namespace string, reg prometheus.Registerer) *Recor
 			Help:      "Dirty keys whose payload was gone before it could be flushed. Data loss; must stay 0.",
 		}, []string{labelBand}),
 
+		transientRetryTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: metricNamespace,
+			Subsystem: namespace,
+			Name:      "transient_retry_total",
+			Help:      "Total number of keys left in dirty set for retry due to transient sink errors.",
+		}, []string{labelBand}),
+
+		oldestDirtyAge: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: metricNamespace,
+			Subsystem: namespace,
+			Name:      "oldest_dirty_age_seconds",
+			Help:      "Age of the oldest entry in each band's dirty set. Monitors stuck-record buildup.",
+		}, []string{labelBand}),
+
 		// Hot/cold regime
 		warmupDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Namespace: metricNamespace,
@@ -234,6 +250,8 @@ func NewRecorderWithRegistry(namespace string, reg prometheus.Registerer) *Recor
 		r.deadLetterTotal,
 		r.dlqProcessTotal,
 		r.unflushedLossTotal,
+		r.transientRetryTotal,
+		r.oldestDirtyAge,
 		r.warmupDuration,
 		r.readDuration,
 		r.hotSetSize,
@@ -307,6 +325,14 @@ func (r *Recorder) RecordUnflushedExpiry(_ string, bandStr string, count int) {
 	r.unflushedLossTotal.WithLabelValues(bandStr).Add(float64(count))
 }
 
+func (r *Recorder) RecordTransientRetry(_ string, bandStr string, count int) {
+	r.transientRetryTotal.WithLabelValues(bandStr).Add(float64(count))
+}
+
+func (r *Recorder) RecordOldestDirtyAge(_ string, bandStr string, age time.Duration) {
+	r.oldestDirtyAge.WithLabelValues(bandStr).Set(age.Seconds())
+}
+
 // ── Hot/cold regime ─────────────────────────────────────────────────────────
 
 func (r *Recorder) RecordWarmUp(_ string, duration time.Duration, err error) {
@@ -374,6 +400,8 @@ func (r *Recorder) Unregister(reg prometheus.Registerer) {
 	reg.Unregister(r.deadLetterTotal)
 	reg.Unregister(r.dlqProcessTotal)
 	reg.Unregister(r.unflushedLossTotal)
+	reg.Unregister(r.transientRetryTotal)
+	reg.Unregister(r.oldestDirtyAge)
 	reg.Unregister(r.warmupDuration)
 	reg.Unregister(r.readDuration)
 	reg.Unregister(r.hotSetSize)

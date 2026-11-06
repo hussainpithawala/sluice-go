@@ -288,6 +288,8 @@ func (s *Sink) Write(ctx context.Context, model sink.WriteModel) error {
 	return err
 }
 
+func (s *Sink) ClassifiesErrors() {}
+
 func (s *Sink) Ping(ctx context.Context) error {
 	_, err := s.api.DescribeTable(ctx, &dynamodb.DescribeTableInput{TableName: aws.String(s.tableName)})
 	return err
