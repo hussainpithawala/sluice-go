@@ -34,7 +34,7 @@ func TestXAddBroadcast_PayloadMode(t *testing.T) {
 	// Write a key (non-batched path)
 	key := "broadcast_test_001"
 	payload := []byte(`{"broadcast":"test"}`)
-	err := s.Write(ctx, key, payload)
+	_, err := s.Write(ctx, key, payload, nil)
 	require.NoError(t, err)
 
 	// Verify stream entry was created
@@ -80,7 +80,7 @@ func TestXAddBroadcast_InvalidationMode(t *testing.T) {
 	defer cancel()
 
 	key := "broadcast_inv_001"
-	err := s.Write(ctx, key, []byte(`{"mode":"invalidation"}`))
+	_, err := s.Write(ctx, key, []byte(`{"mode":"invalidation"}`), nil)
 	require.NoError(t, err)
 
 	streamKey := shield.BroadcastKey("test_broadcast_inv")
@@ -112,7 +112,7 @@ func TestXAddBroadcast_DisabledIsNoOp(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	err := s.Write(ctx, "no_broadcast_key", []byte(`{"x":1}`))
+	_, err := s.Write(ctx, "no_broadcast_key", []byte(`{"x":1}`), nil)
 	require.NoError(t, err)
 
 	// Stream should not exist
@@ -145,7 +145,7 @@ func TestXAddBroadcast_BatchedPath(t *testing.T) {
 	// Write 5 keys through the batcher
 	for i := 0; i < 5; i++ {
 		key := fmt.Sprintf("batched_bcast_%03d", i)
-		err := s.Write(ctx, key, []byte(fmt.Sprintf(`{"i":%d}`, i)))
+		_, err := s.Write(ctx, key, []byte(fmt.Sprintf(`{"i":%d}`, i)), nil)
 		require.NoError(t, err)
 	}
 
