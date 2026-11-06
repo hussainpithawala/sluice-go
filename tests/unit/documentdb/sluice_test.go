@@ -177,6 +177,47 @@ func TestBuild_MissingRedis(t *testing.T) {
 	assert.ErrorIs(t, err, sluice.ErrMissingRedis)
 }
 
+func TestBuild_NegativeDLQTTL(t *testing.T) {
+	_, err := sluice.New("test").
+		WithRedis(sluice.RedisConfig{Addrs: []string{testRedisAddr}}).
+		WithDLQTTL(-1 * time.Second).
+		Build(context.Background())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "DLQTTL")
+}
+
+func TestBuild_NegativeDLQBackoffBase(t *testing.T) {
+	_, err := sluice.New("test").
+		WithRedis(sluice.RedisConfig{Addrs: []string{testRedisAddr}}).
+		WithDLQBackoff(-1*time.Second, 0).
+		Build(context.Background())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "DLQBackoffBase")
+}
+
+func TestBuild_NegativeDLQMaxAttempts(t *testing.T) {
+	_, err := sluice.New("test").
+		WithRedis(sluice.RedisConfig{Addrs: []string{testRedisAddr}}).
+		WithDLQMaxAttempts(-1).
+		Build(context.Background())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "DLQMaxAttempts")
+}
+
+func TestBuild_ValidDLQConfig(t *testing.T) {
+	sl, err := sluice.New("test_valid_dlq").
+		WithRedis(sluice.RedisConfig{Addrs: []string{testRedisAddr}}).
+		WithWriteContract(testContract).
+		WithDLQTTL(24*time.Hour).
+		WithDLQLock(true).
+		WithDLQBackoff(5*time.Second, 30*time.Minute).
+		WithDLQMaxAttempts(10).
+		Build(context.Background())
+	require.NoError(t, err)
+	assert.NotNil(t, sl)
+	_ = sl.DrainAndClose(context.Background())
+}
+
 func TestWrite_VolumeTrigger(t *testing.T) {
 	const batchSize = 20
 	sl, _ := buildSluice(t, func(b *sluice.Builder) {
