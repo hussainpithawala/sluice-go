@@ -221,6 +221,18 @@ type dlqOptions struct {
 	logger       *slog.Logger
 }
 
+// ─── Drain Models ────────────────────────────────────────────────────────────
+
+// DrainResult describes the outcome of a shutdown drain.
+// Flushed + Abandoned + DeadLettered equals the number of dirty records that
+// existed when the drain started (approximate when multiple pods share a band).
+type DrainResult struct {
+	RecordsFlushed      int64 // committed to the sink during the drain
+	RecordsDeadLettered int64 // moved to the DLQ during the drain (permanent failures)
+	RecordsAbandoned    int64 // still dirty in Redis when the drain stopped (recoverable by the next instance)
+	FinalError          error // last flush error, or ctx error on timeout; nil if complete
+}
+
 // ─── Query Models ────────────────────────────────────────────────────────────
 
 // Query defines the parameters for a compound lookup against the Redis journal.

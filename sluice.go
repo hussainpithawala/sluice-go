@@ -894,14 +894,23 @@ func (s *Sluice) Query(ctx context.Context, q Query) ([]QueryResult, error) {
 	return results, nil
 }
 
-// DrainAndClose flushes all remaining dirty keys, stops band goroutines,
-// and releases Redis and sink connections. Call exactly once during shutdown.
-func (s *Sluice) DrainAndClose(ctx context.Context) error {
+// DrainAndCloseWithResult flushes all remaining dirty keys, stops band
+// goroutines, and releases Redis and sink connections. Returns a DrainResult
+// describing the outcome. When the drain is incomplete (RecordsAbandoned > 0),
+// the returned error wraps ErrIncompleteDrain and can be inspected via
+// errors.As into a *DrainError.
+//
+// The first call performs the actual drain. A second call returns a zero
+// DrainResult and nil error because the CAS on closed fails early.
+//
+// The sink's Close receives a fresh 5-second grace context regardless of the
+// caller's ctx, so expired deadlines do not leak connections.
+func (s *Sluice) DrainAndCloseWithResult(ctx context.Context) (DrainResult, error) {
 	if s.broadcastSub != nil {
 		s.broadcastSub.Stop()
 	}
 	if !s.closed.CompareAndSwap(false, true) {
-		return nil
+		return DrainResult{}, nil
 	}
 	if s.dlqCancel != nil {
 		s.dlqCancel()
@@ -916,21 +925,47 @@ func (s *Sluice) DrainAndClose(ctx context.Context) error {
 		<-s.sweepDone
 	}
 
+	var dr DrainResult
 	if s.engine != nil {
 		if s.cfg.BatchedWrites {
 			s.shield.StopBatcher()
 		}
-		s.engine.DrainAndStop()
+		er := s.engine.DrainAndStop(ctx)
+		dr = DrainResult{
+			RecordsFlushed:      er.RecordsFlushed,
+			RecordsDeadLettered: er.RecordsDeadLettered,
+			RecordsAbandoned:    er.RecordsAbandoned,
+			FinalError:          er.FinalError,
+		}
 	}
 
 	if err := s.shield.Close(); err != nil {
-		return fmt.Errorf("sluice: redis close: %w", err)
+		return dr, fmt.Errorf("sluice: redis close: %w", err)
 	}
 
 	if s.sk != nil {
-		return s.sk.Close(ctx)
+		graceCtx, graceCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer graceCancel()
+		if err := s.sk.Close(graceCtx); err != nil {
+			return dr, err
+		}
 	}
-	return nil
+
+	if dr.RecordsAbandoned > 0 {
+		return dr, &DrainError{Result: dr}
+	}
+	return dr, nil
+}
+
+// DrainAndClose flushes all remaining dirty keys, stops band goroutines,
+// and releases Redis and sink connections. Call exactly once during shutdown.
+//
+// When the drain is incomplete the returned error wraps ErrIncompleteDrain;
+// use errors.As to a *DrainError to inspect the DrainResult. A second call
+// returns nil because the instance is already closed.
+func (s *Sluice) DrainAndClose(ctx context.Context) error {
+	_, err := s.DrainAndCloseWithResult(ctx)
+	return err
 }
 
 // ── DLQ Processing ──────────────────────────────────────────────────────────
