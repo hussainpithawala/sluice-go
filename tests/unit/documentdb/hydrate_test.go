@@ -49,7 +49,8 @@ func TestHydrateJournal_PendingWriteWins(t *testing.T) {
 
 	key := "hydrate_pending_key"
 	written := []byte(`{"src":"write"}`)
-	require.NoError(t, s.Write(ctx, key, written))
+	_, wErr := s.Write(ctx, key, written, nil)
+	require.NoError(t, wErr)
 
 	hr, err := s.HydrateJournal(ctx, key, []byte(`{"src":"store"}`), time.Now().Add(time.Hour).UnixMilli())
 	require.NoError(t, err)
@@ -77,7 +78,8 @@ func TestHydrateJournal_FlushedEntryWins(t *testing.T) {
 
 	key := "hydrate_flushed_key"
 	written := []byte(`{"v":2}`)
-	require.NoError(t, s.Write(ctx, key, written))
+	_, wErr := s.Write(ctx, key, written, nil)
+	require.NoError(t, wErr)
 	require.NoError(t, s.CommitKeys(ctx, s.BandFor(key), []string{key}))
 
 	hr, err := s.HydrateJournal(ctx, key, []byte(`{"v":1}`), time.Now().Add(time.Hour).UnixMilli())
@@ -98,7 +100,8 @@ func TestBulkHydrateJournal_MixedResults(t *testing.T) {
 	ctx := context.Background()
 
 	existing := []byte(`{"src":"write"}`)
-	require.NoError(t, s.Write(ctx, "bulk_existing", existing))
+	_, wErr := s.Write(ctx, "bulk_existing", existing, nil)
+	require.NoError(t, wErr)
 
 	ts := time.Now().UnixMilli()
 	items := []shield.BulkJournalItem{

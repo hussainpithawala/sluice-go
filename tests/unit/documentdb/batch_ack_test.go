@@ -41,7 +41,8 @@ func TestBatchedWrite_ReturnsOnlyAfterJournalWrite(t *testing.T) {
 	const ck = "batch_ack_001"
 
 	start := time.Now()
-	require.NoError(t, s.Write(context.Background(), ck, []byte(`{"v":1}`)))
+	_, wErr := s.Write(context.Background(), ck, []byte(`{"v":1}`), nil)
+	require.NoError(t, wErr)
 	assert.GreaterOrEqual(t, time.Since(start), 150*time.Millisecond, "Write should wait for its batch")
 
 	assert.True(t, journalHas(t, s, ck), "payload must be in the journal when Write returns")
@@ -77,7 +78,7 @@ func TestBatchedWrite_FailureIsReturnedToItsWriterOnly(t *testing.T) {
 		wg.Add(1)
 		go func(ck string) { // concurrent, so both ride the same batch
 			defer wg.Done()
-			err := s.Write(ctx, ck, []byte(`{"v":1}`))
+			_, err := s.Write(ctx, ck, []byte(`{"v":1}`), nil)
 			mu.Lock()
 			errs[ck] = err
 			mu.Unlock()
@@ -98,7 +99,8 @@ func TestBatchedWrite_RecoversFromScriptCacheFlush(t *testing.T) {
 	// Simulates a Redis restart or failover dropping the script cache.
 	require.NoError(t, s.Client().ScriptFlush(ctx).Err())
 
-	require.NoError(t, s.Write(ctx, "noscript_001", []byte(`{"v":1}`)))
+	_, wErr := s.Write(ctx, "noscript_001", []byte(`{"v":1}`), nil)
+	require.NoError(t, wErr)
 	assert.True(t, journalHas(t, s, "noscript_001"))
 }
 
@@ -110,7 +112,8 @@ func TestBroadcastWrite_RecoversFromScriptCacheFlush(t *testing.T) {
 
 	require.NoError(t, s.Client().ScriptFlush(ctx).Err())
 
-	require.NoError(t, s.Write(ctx, "bcast_noscript_001", []byte(`{"v":1}`)))
+	_, wErr := s.Write(ctx, "bcast_noscript_001", []byte(`{"v":1}`), nil)
+	require.NoError(t, wErr)
 	assert.True(t, journalHas(t, s, "bcast_noscript_001"))
 	n, err := s.Client().XLen(ctx, shield.BroadcastKey(s.Namespace())).Result()
 	require.NoError(t, err)
@@ -126,7 +129,7 @@ func TestBatchedWrite_AfterStopGoesDirect(t *testing.T) {
 	s.StopBatcher() // idempotent
 
 	done := make(chan error, 1)
-	go func() { done <- s.Write(context.Background(), "stopped_001", []byte(`{"v":1}`)) }()
+	go func() { _, err := s.Write(context.Background(), "stopped_001", []byte(`{"v":1}`), nil); done <- err }()
 	select {
 	case err := <-done:
 		require.NoError(t, err)
@@ -146,7 +149,8 @@ func TestBatchedWrite_QueuedEntriesFlushedOnStop(t *testing.T) {
 	errs := make(chan error, n)
 	for i := 0; i < n; i++ {
 		go func(i int) {
-			errs <- s.Write(context.Background(), fmt.Sprintf("drain_%d", i), []byte(`{"v":1}`))
+			_, err := s.Write(context.Background(), fmt.Sprintf("drain_%d", i), []byte(`{"v":1}`), nil)
+			errs <- err
 		}(i)
 	}
 	time.Sleep(100 * time.Millisecond) // let them enqueue
@@ -176,6 +180,7 @@ func TestStartBatcher_ContextCancelDoesNotStopBatcher(t *testing.T) {
 	s.StartBatcher(ctx)
 	cancel() // e.g. a short-lived Build context
 
-	require.NoError(t, s.Write(context.Background(), "ctx_001", []byte(`{"v":1}`)))
+	_, wErr := s.Write(context.Background(), "ctx_001", []byte(`{"v":1}`), nil)
+	require.NoError(t, wErr)
 	assert.True(t, journalHas(t, s, "ctx_001"))
 }

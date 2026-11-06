@@ -30,7 +30,7 @@ func defaultDLQTTL(d time.Duration) time.Duration {
 }
 
 // New initialises the Redis client and validates connectivity.
-func New(cfg RedisConfig, namespace string, bandCount int, keyTTL time.Duration, activityWindow time.Duration, dlqTTL time.Duration) (*Shield, error) {
+func New(cfg RedisConfig, namespace string, bandCount int, keyTTL time.Duration, activityWindow time.Duration, dlqTTL time.Duration, indexEnabled bool) (*Shield, error) {
 	if strings.ContainsAny(namespace, "{}") {
 		// A '{' anywhere in namespace would hijack Redis Cluster's hash-tag
 		// parsing (only the substring between the FIRST '{' and the next '}'
@@ -85,27 +85,40 @@ func New(cfg RedisConfig, namespace string, bandCount int, keyTTL time.Duration,
 	// EVALSHA call site reloads and retries on NOSCRIPT, which covers shards
 	// added later (resharding) and caches flushed by a restart or failover.
 	writeScript := redis.NewScript(atomicWriteLua)
+	dedupScript := redis.NewScript(atomicDedupWriteLua)
 	hydrateScript := redis.NewScript(hydrateLua)
+	clearIxpScript := redis.NewScript(clearIndexPendingLua)
 	if err := writeScript.Load(ctx, client).Err(); err != nil {
 		_ = client.Close()
 		return nil, fmt.Errorf("sluice/shield: script load: %w", err)
+	}
+	if err := dedupScript.Load(ctx, client).Err(); err != nil {
+		_ = client.Close()
+		return nil, fmt.Errorf("sluice/shield: dedup script load: %w", err)
 	}
 	if err := hydrateScript.Load(ctx, client).Err(); err != nil {
 		_ = client.Close()
 		return nil, fmt.Errorf("sluice/shield: hydrate script load: %w", err)
 	}
+	if err := clearIxpScript.Load(ctx, client).Err(); err != nil {
+		_ = client.Close()
+		return nil, fmt.Errorf("sluice/shield: clear-index-pending script load: %w", err)
+	}
 	return &Shield{
-		client:           client,
-		namespace:        namespace,
-		bandCount:        bandCount,
-		keyTTL:           keyTTL,
-		activityWindow:   activityWindow,
-		dlqTTL:           defaultDLQTTL(dlqTTL),
-		writeScript:      writeScript,
-		hydrateScript:    hydrateScript,
-		commitScript:     redis.NewScript(commitFlushedLua),
-		deadLetterScript: redis.NewScript(deadLetterIfUnchangedLua),
-		extendTTLScript:  redis.NewScript(extendTTLLua),
+		client:               client,
+		namespace:            namespace,
+		bandCount:            bandCount,
+		keyTTL:               keyTTL,
+		activityWindow:       activityWindow,
+		dlqTTL:               defaultDLQTTL(dlqTTL),
+		indexEnabled:         indexEnabled,
+		writeScript:          writeScript,
+		dedupScript:          dedupScript,
+		hydrateScript:        hydrateScript,
+		clearIndexPendScript: clearIxpScript,
+		commitScript:         redis.NewScript(commitFlushedLua),
+		deadLetterScript:     redis.NewScript(deadLetterIfUnchangedLua),
+		extendTTLScript:      redis.NewScript(extendTTLLua),
 	}, nil
 }
 
@@ -120,48 +133,50 @@ func New(cfg RedisConfig, namespace string, bandCount int, keyTTL time.Duration,
 //
 // If ctx ends while waiting, Write returns ctx.Err(); the entry may still be
 // written afterwards, so the caller's retry is a harmless duplicate upsert.
-func (s *Shield) Write(ctx context.Context, correlationKey string, payload []byte) error {
-	return s.writeWithKind(ctx, correlationKey, payload, broadcastKindUpsert)
+func (s *Shield) Write(ctx context.Context, correlationKey string, payload []byte, opts *WriteOpts) (WriteResult, error) {
+	return s.writeWithKind(ctx, correlationKey, payload, broadcastKindUpsert, opts)
 }
 
 // writeWithKind is the shared core of Write and HotLoad. The kind selects
 // the broadcast message type (upsert vs. seed); the journal write itself
 // is identical in both cases.
-func (s *Shield) writeWithKind(ctx context.Context, correlationKey string, payload []byte, kind broadcastKind) error {
+func (s *Shield) writeWithKind(ctx context.Context, correlationKey string, payload []byte, kind broadcastKind, opts *WriteOpts) (WriteResult, error) {
 	e := writeEntry{
 		correlationKey: correlationKey,
 		payload:        payload,
 		ts:             float64(time.Now().UnixMilli()),
 		kind:           kind,
 	}
+	if opts != nil {
+		e.guardKey = opts.GuardKey
+		e.guardTTLMs = opts.GuardTTLMs
+	}
 
 	done, batched, err := s.enqueueBatched(ctx, e)
 	if err != nil {
-		return err
+		return WriteResult{}, err
 	}
 	if batched {
 		select {
-		case err := <-done:
-			return err
+		case wr := <-done:
+			return wr.result, wr.err
 		case <-ctx.Done():
-			return ctx.Err()
+			return WriteResult{}, ctx.Err()
 		}
 	}
 
 	if !s.broadcastEnabled {
-		// Script.Run falls back from EVALSHA to EVAL on NOSCRIPT.
-		return s.writeScript.Run(ctx, s.client,
-			[]string{s.payloadKey(correlationKey), s.dirtyKey(correlationKey)},
-			payload, fmt.Sprintf("%.0f", e.ts), correlationKey,
-		).Err()
+		keys, args := s.writeScriptArgs(e)
+		return s.runWriteScript(ctx, keys, args)
 	}
-	return s.pipelineWrites(ctx, []writeEntry{e})[0]
+	results, errs := s.pipelineWriteResults(ctx, []writeEntry{e})
+	return results[0], errs[0]
 }
 
 // enqueueBatched hands e to the batcher. batched is false when batching is
 // disabled, not yet started, or already stopped — the caller then writes
 // directly, so a write never waits on a batcher that will not answer.
-func (s *Shield) enqueueBatched(ctx context.Context, e writeEntry) (done <-chan error, batched bool, err error) {
+func (s *Shield) enqueueBatched(ctx context.Context, e writeEntry) (done <-chan writeResult, batched bool, err error) {
 	if s.batchCh == nil {
 		return nil, false, nil
 	}
@@ -170,7 +185,7 @@ func (s *Shield) enqueueBatched(ctx context.Context, e writeEntry) (done <-chan 
 	if !s.batchRunning {
 		return nil, false, nil
 	}
-	e.done = make(chan error, 1)
+	e.done = make(chan writeResult, 1)
 	select {
 	case s.batchCh <- e:
 		return e.done, true, nil
@@ -179,15 +194,99 @@ func (s *Shield) enqueueBatched(ctx context.Context, e writeEntry) (done <-chan 
 	}
 }
 
-// pipelineWrites runs the journal write script for each entry (plus its
+// writeScriptArgs builds the KEYS and ARGV for the atomicWriteLua script call.
+// When no guard key is set, only 2 KEYS are passed so KEYS[3] is nil in Lua.
+func (s *Shield) writeScriptArgs(e writeEntry) (keys []string, args []interface{}) {
+	keys = []string{s.payloadKey(e.correlationKey), s.dirtyKey(e.correlationKey)}
+	tsStr := fmt.Sprintf("%.0f", e.ts)
+	args = []interface{}{e.payload, tsStr, e.correlationKey}
+
+	if e.guardKey != "" {
+		keys = append(keys, e.guardKey)
+		args = append(args, e.guardTTLMs) // ARGV[4]
+	} else {
+		args = append(args, "") // ARGV[4] unused but keeps positional alignment
+	}
+
+	if s.indexEnabled {
+		args = append(args, "1") // ARGV[5]
+	}
+	return keys, args
+}
+
+// runWriteScript executes the write script directly (non-pipeline path) and
+// parses the {code, e, v} reply.
+func (s *Shield) runWriteScript(ctx context.Context, keys []string, args []interface{}) (WriteResult, error) {
+	raw, err := s.writeScript.Run(ctx, s.client, keys, args...).Slice()
+	if err != nil {
+		return WriteResult{}, err
+	}
+	return parseWriteReply(raw)
+}
+
+// parseWriteReply converts a {code, e, v} Lua table into a WriteResult.
+func parseWriteReply(raw []interface{}) (WriteResult, error) {
+	if len(raw) < 3 {
+		return WriteResult{}, fmt.Errorf("sluice/shield: unexpected write reply length %d", len(raw))
+	}
+	code, err := toInt(raw[0])
+	if err != nil {
+		return WriteResult{}, fmt.Errorf("sluice/shield: bad reply code: %w", err)
+	}
+	epoch, _ := toInt64(raw[1])
+	seq := toString(raw[2])
+
+	wr := WriteResult{
+		Status:  code,
+		Epoch:   epoch,
+		Seq:     seq,
+		Written: code == WriteCodeWritten,
+	}
+	if code == WriteCodeIdemDup {
+		return wr, ErrDuplicateKey
+	}
+	return wr, nil
+}
+
+func toInt(v interface{}) (int, error) {
+	switch n := v.(type) {
+	case int64:
+		return int(n), nil
+	case string:
+		return strconv.Atoi(n)
+	default:
+		return 0, fmt.Errorf("unsupported type %T", v)
+	}
+}
+
+func toInt64(v interface{}) (int64, error) {
+	switch n := v.(type) {
+	case int64:
+		return n, nil
+	case string:
+		return strconv.ParseInt(n, 10, 64)
+	default:
+		return 0, fmt.Errorf("unsupported type %T", v)
+	}
+}
+
+func toString(v interface{}) string {
+	switch s := v.(type) {
+	case string:
+		return s
+	case int64:
+		return strconv.FormatInt(s, 10)
+	default:
+		return fmt.Sprintf("%v", v)
+	}
+}
+
+// pipelineWriteResults runs the journal write script for each entry (plus its
 // broadcast XADD, when enabled) in one pipeline and returns each entry's own
-// write result, index-aligned with entries. Entries that hit NOSCRIPT (the
-// script cache was flushed by a restart or failover) are retried once after
-// reloading the script.
-//
-// A failed broadcast XADD is logged but does not fail the write: the journal
-// write succeeded, and peers heal from L2 on their next miss.
-func (s *Shield) pipelineWrites(ctx context.Context, entries []writeEntry) []error {
+// WriteResult and error, index-aligned with entries. Entries that hit NOSCRIPT
+// are retried once after reloading the script.
+func (s *Shield) pipelineWriteResults(ctx context.Context, entries []writeEntry) ([]WriteResult, []error) {
+	results := make([]WriteResult, len(entries))
 	errs := make([]error, len(entries))
 
 	run := func(idx []int) {
@@ -195,15 +294,22 @@ func (s *Shield) pipelineWrites(ctx context.Context, entries []writeEntry) []err
 		cmds := make([]*redis.Cmd, len(idx))
 		for j, i := range idx {
 			e := entries[i]
-			cmds[j] = s.writeScript.EvalSha(ctx, pipe,
-				[]string{s.payloadKey(e.correlationKey), s.dirtyKey(e.correlationKey)},
-				e.payload, fmt.Sprintf("%.0f", e.ts), e.correlationKey,
-			)
+			keys, args := s.writeScriptArgs(e)
+			cmds[j] = s.writeScript.EvalSha(ctx, pipe, keys, args...)
 			s.enqueueBroadcast(ctx, pipe, e.correlationKey, int64(e.ts), e.kind, e.payload)
 		}
 		pipeCmds, _ := pipe.Exec(ctx)
 		for j, i := range idx {
-			errs[i] = cmds[j].Err()
+			if cmds[j].Err() != nil {
+				errs[i] = cmds[j].Err()
+			} else {
+				raw, sliceErr := cmds[j].Slice()
+				if sliceErr != nil {
+					errs[i] = sliceErr
+				} else {
+					results[i], errs[i] = parseWriteReply(raw)
+				}
+			}
 		}
 		var bcastFailed int
 		for _, c := range pipeCmds {
@@ -234,37 +340,51 @@ func (s *Shield) pipelineWrites(ctx context.Context, entries []writeEntry) []err
 			for _, i := range noscript {
 				errs[i] = fmt.Errorf("sluice/shield: reload write script: %w", err)
 			}
-			return errs
+			return results, errs
 		}
 		run(noscript)
 	}
-	return errs
+	return results, errs
 }
 
 // WriteDedup handles xxHash64 deduplication in a separate, Valkey-safe Lua script.
-func (s *Shield) WriteDedup(ctx context.Context, correlationKey string, payload []byte, hash string) (bool, error) {
+// When opts is non-nil, the idempotency guard key is threaded into the script.
+func (s *Shield) WriteDedup(ctx context.Context, correlationKey string, payload []byte, hash string, opts *WriteOpts) (WriteResult, error) {
 	band := s.BandFor(correlationKey)
-	script := redis.NewScript(atomicDedupWriteLua)
-
-	// FIX: Format timestamp as string for Lua HSET compatibility
 	tsStr := fmt.Sprintf("%.0f", float64(time.Now().UnixMilli()))
 
-	res, err := script.Run(ctx, s.client,
-		[]string{s.payloadKey(correlationKey), s.dirtyKeyForBand(band)},
+	keys := []string{s.payloadKey(correlationKey), s.dirtyKeyForBand(band)}
+
+	var guardTtl string
+	if opts != nil && opts.GuardKey != "" {
+		keys = append(keys, opts.GuardKey)
+		guardTtl = strconv.FormatInt(opts.GuardTTLMs, 10)
+	}
+
+	var indexFlag string
+	if s.indexEnabled {
+		indexFlag = "1"
+	}
+
+	raw, err := s.dedupScript.Run(ctx, s.client, keys,
 		payload, tsStr, correlationKey, s.keyTTL.Milliseconds(), hash,
-	).Int()
+		guardTtl, indexFlag,
+	).Slice()
+	if err != nil {
+		return WriteResult{}, err
+	}
 
-	written := res == 1
+	wr, parseErr := parseWriteReply(raw)
+	if parseErr != nil && !errors.Is(parseErr, ErrDuplicateKey) {
+		return wr, parseErr
+	}
 
-	// Broadcast only when actually written (not deduplicated).
-	// Deduplicated writes refresh TTL only; no state change to propagate.
-	// RFC §11.2: rely on LocalTTL alone for dedup'd entries.
-	if written && s.broadcastEnabled {
+	if wr.Written && s.broadcastEnabled {
 		ts, _ := strconv.ParseInt(tsStr, 10, 64)
 		_ = s.XAddBroadcast(ctx, correlationKey, ts, broadcastKindUpsert, payload)
 	}
 
-	return written, err // true if written, false if deduplicated
+	return wr, parseErr
 }
 
 // UpdateIndexes maintains secondary indexes via a Go-side pipeline.
@@ -429,7 +549,7 @@ func (s *Shield) SetNX(ctx context.Context, key string, value interface{}, expir
 func (s *Shield) HotLoad(ctx context.Context, correlationKey string, payload []byte) error {
 	// 1. Journal write + seed broadcast (kind=seed distinguishes promotions
 	//    from normal writes in stream telemetry).
-	if err := s.writeWithKind(ctx, correlationKey, payload, broadcastKindSeed); err != nil {
+	if _, err := s.writeWithKind(ctx, correlationKey, payload, broadcastKindSeed, nil); err != nil {
 		return err
 	}
 
@@ -1251,19 +1371,17 @@ func (s *Shield) OldestDirtyScore(ctx context.Context, band int) (float64, error
 // failed entry is never dropped: its writer receives the error and sluice
 // falls back to degraded mode or returns it to the caller.
 func (s *Shield) flushBatch(entries []writeEntry) {
-	// Not derived from a cancellable context: writers already handed these
-	// entries over and are waiting for the outcome.
 	ctx, cancel := context.WithTimeout(s.batchCtx, 10*time.Second)
 	defer cancel()
 
-	errs := s.pipelineWrites(ctx, entries)
+	results, errs := s.pipelineWriteResults(ctx, entries)
 	var failed int
 	for i, e := range entries {
 		if errs[i] != nil {
 			failed++
 		}
 		if e.done != nil {
-			e.done <- errs[i] // buffered; never blocks
+			e.done <- writeResult{result: results[i], err: errs[i]}
 		}
 	}
 	if failed > 0 {

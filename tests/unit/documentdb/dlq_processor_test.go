@@ -83,7 +83,7 @@ func dlqTestShield(t *testing.T, ns string) *shield.Shield {
 		Addrs:       []string{testRedisAddr},
 		DialTimeout: 5 * time.Second,
 		PoolSize:    10,
-	}, ns, dlqProcBands, dlqProcKeyTTL, 4*time.Hour, 0)
+	}, ns, dlqProcBands, dlqProcKeyTTL, 4*time.Hour, 0, false)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = sh.Close() })
 	return sh
@@ -93,7 +93,8 @@ func seedDLQ(t *testing.T, sh *shield.Shield, ns string, keys []string) {
 	t.Helper()
 	ctx := context.Background()
 	for _, k := range keys {
-		require.NoError(t, sh.Write(ctx, k, []byte(`{"v":1}`)))
+		_, wErr := sh.Write(ctx, k, []byte(`{"v":1}`), nil)
+		require.NoError(t, wErr)
 	}
 	// Wait for keys to land in dirty set, then flush to move to DLQ.
 	time.Sleep(50 * time.Millisecond)

@@ -15,6 +15,8 @@ type MetricsRecorder interface {
 	RecordRead(namespace string, duration time.Duration, isHot bool, err error)
 	RecordWrite(namespace string)
 	RecordDegradedWrite(namespace string, reason error)
+	RecordIndexUpdateFailed(namespace, band string)
+	RecordDegradedIdempotentWrite(namespace string)
 
 	// ── Hot/Cold Regime Metrics ────────────────────────────────────────────
 	RecordWarmUp(namespace string, duration time.Duration, err error)
@@ -49,3 +51,5 @@ func (n *noopMetrics) RecordBroadcastLag(_ string, _ time.Duration)             
 func (n *noopMetrics) RecordUnflushedExpiry(_ string, _ string, _ int)                 {}
 func (n *noopMetrics) RecordTransientRetry(_ string, _ string, _ int)                  {}
 func (n *noopMetrics) RecordOldestDirtyAge(_ string, _ string, _ time.Duration)        {}
+func (n *noopMetrics) RecordIndexUpdateFailed(_ string, _ string)                      {}
+func (n *noopMetrics) RecordDegradedIdempotentWrite(_ string)                          {}

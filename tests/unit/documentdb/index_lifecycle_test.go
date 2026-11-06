@@ -19,7 +19,7 @@ func newTestShieldNoClean(t *testing.T, namespace string) *shield.Shield {
 		DB:          testRedisDB,
 		DialTimeout: 5 * time.Second,
 		PoolSize:    10,
-	}, namespace, 16, 30*time.Second, 4*time.Hour, 0)
+	}, namespace, 16, 30*time.Second, 4*time.Hour, 0, false)
 	require.NoError(t, err)
 	return s
 }
@@ -210,7 +210,8 @@ func TestRegisterExistingIndexes_LegacyKeysAreSwept(t *testing.T) {
 func writeIndexedFlushed(t *testing.T, s *shield.Shield, ck string, ttl time.Duration) {
 	t.Helper()
 	ctx := context.Background()
-	require.NoError(t, s.Write(ctx, ck, []byte(`{"v":"`+ck+`"}`)))
+	_, wErr := s.Write(ctx, ck, []byte(`{"v":"`+ck+`"}`), nil)
+	require.NoError(t, wErr)
 	require.NoError(t, s.UpdateIndexes(ctx, ck, map[string]interface{}{
 		"channel": "push", "priority": float64(1),
 	}, time.Hour))
@@ -268,7 +269,8 @@ func TestPruneExpiredIndexes_KeepsLiveAndUnflushedKeys(t *testing.T) {
 	writeIndexedFlushed(t, s, alive, time.Hour)
 	writeIndexedFlushed(t, s, rewritten, time.Hour)
 	time.Sleep(2 * time.Millisecond)
-	require.NoError(t, s.Write(ctx, rewritten, []byte(`{"v":2}`))) // unflushed again
+	_, wErr2 := s.Write(ctx, rewritten, []byte(`{"v":2}`), nil) // unflushed again
+	require.NoError(t, wErr2)
 
 	// Pretend it is 2h later so both entries are due.
 	later := time.Now().Add(2 * time.Hour)
@@ -311,7 +313,8 @@ func TestCommitFlushed_EnqueuesOnlyIndexedKeys(t *testing.T) {
 	t.Cleanup(func() { _ = s.Close() })
 	const ck = "unindexed_001"
 
-	require.NoError(t, s.Write(context.Background(), ck, []byte(`{"v":1}`)))
+	_, wErr := s.Write(context.Background(), ck, []byte(`{"v":1}`), nil)
+	require.NoError(t, wErr)
 	simulateFlush(t, s, ck, 30*time.Second)
 
 	_, ok := expiryScore(t, s, ck)

@@ -67,7 +67,8 @@ func TestWrite_UnflushedPayloadIsPersistent(t *testing.T) {
 	s := newTestShield(t, "test_unflushed_persistent")
 	t.Cleanup(func() { _ = s.Close() })
 
-	require.NoError(t, s.Write(context.Background(), "persist_001", []byte(`{"v":1}`)))
+	_, wErr := s.Write(context.Background(), "persist_001", []byte(`{"v":1}`), nil)
+	require.NoError(t, wErr)
 	assert.Equal(t, time.Duration(-1), payloadPTTL(t, s, "persist_001"))
 }
 
@@ -77,13 +78,15 @@ func TestWrite_RewriteOfFlushedKeyClearsTTL(t *testing.T) {
 	ctx := context.Background()
 	const ck = "rewrite_001"
 
-	require.NoError(t, s.Write(ctx, ck, []byte(`{"v":1}`)))
+	_, wErr := s.Write(ctx, ck, []byte(`{"v":1}`), nil)
+	require.NoError(t, wErr)
 	simulateFlush(t, s, ck, 30*time.Second)
 	require.Greater(t, payloadPTTL(t, s, ck), time.Duration(0), "flushed payload should have a TTL")
 
 	// HSET alone would keep the 30s TTL on the new, unflushed v2.
 	time.Sleep(2 * time.Millisecond)
-	require.NoError(t, s.Write(ctx, ck, []byte(`{"v":2}`)))
+	_, wErr2 := s.Write(ctx, ck, []byte(`{"v":2}`), nil)
+	require.NoError(t, wErr2)
 	assert.Equal(t, time.Duration(-1), payloadPTTL(t, s, ck), "re-written payload must be persistent until flushed")
 }
 
@@ -93,33 +96,33 @@ func TestWriteDedup_Persistence(t *testing.T) {
 	ctx := context.Background()
 	const ck = "dedup_001"
 
-	written, err := s.WriteDedup(ctx, ck, []byte(`{"v":1}`), "h1")
+	wr, err := s.WriteDedup(ctx, ck, []byte(`{"v":1}`), "h1", nil)
 	require.NoError(t, err)
-	require.True(t, written)
+	require.True(t, wr.Written)
 	assert.Equal(t, time.Duration(-1), payloadPTTL(t, s, ck), "new payload must be persistent")
 
 	// Duplicate while unflushed: must not gain a TTL.
-	written, err = s.WriteDedup(ctx, ck, []byte(`{"v":1}`), "h1")
+	wr, err = s.WriteDedup(ctx, ck, []byte(`{"v":1}`), "h1", nil)
 	require.NoError(t, err)
-	require.False(t, written)
+	require.False(t, wr.Written)
 	assert.Equal(t, time.Duration(-1), payloadPTTL(t, s, ck), "duplicate must not add a TTL to an unflushed payload")
 
 	// Duplicate after flush with a short TTL: extended to keyTTL.
 	simulateFlush(t, s, ck, 5*time.Second)
-	_, err = s.WriteDedup(ctx, ck, []byte(`{"v":1}`), "h1")
+	_, err = s.WriteDedup(ctx, ck, []byte(`{"v":1}`), "h1", nil)
 	require.NoError(t, err)
 	assert.Greater(t, payloadPTTL(t, s, ck), 25*time.Second, "duplicate should extend a flushed TTL")
 
 	// Duplicate after flush with a longer (hot) TTL: never shortened.
 	require.NoError(t, s.Client().PExpire(ctx, shield.PayloadKey(s.Namespace(), s.BandFor(ck), ck), time.Hour).Err())
-	_, err = s.WriteDedup(ctx, ck, []byte(`{"v":1}`), "h1")
+	_, err = s.WriteDedup(ctx, ck, []byte(`{"v":1}`), "h1", nil)
 	require.NoError(t, err)
 	assert.Greater(t, payloadPTTL(t, s, ck), 50*time.Minute, "duplicate must not shorten a hot TTL")
 
 	// A changed payload after flush is persistent again.
-	written, err = s.WriteDedup(ctx, ck, []byte(`{"v":2}`), "h2")
+	wr, err = s.WriteDedup(ctx, ck, []byte(`{"v":2}`), "h2", nil)
 	require.NoError(t, err)
-	require.True(t, written)
+	require.True(t, wr.Written)
 	assert.Equal(t, time.Duration(-1), payloadPTTL(t, s, ck))
 }
 
@@ -132,11 +135,13 @@ func TestCommitFlushed_KeepsWriteThatLandedMidFlush(t *testing.T) {
 	ctx := context.Background()
 	const ck = "race_001"
 
-	require.NoError(t, s.Write(ctx, ck, []byte(`{"v":1}`)))
+	_, wErr := s.Write(ctx, ck, []byte(`{"v":1}`), nil)
+	require.NoError(t, wErr)
 	v1 := drained(t, s, ck)
 
 	// v2 lands while v1's BulkWrite is "in flight".
-	require.NoError(t, s.Write(ctx, ck, []byte(`{"v":2}`)))
+	_, wErr2 := s.Write(ctx, ck, []byte(`{"v":2}`), nil)
+	require.NoError(t, wErr2)
 
 	assert.False(t, commitAs(t, s, v1, 30*time.Second), "commit of v1 must be skipped")
 	assert.True(t, isDirtyKey(t, s, ck), "v2 must stay dirty so it is flushed next cycle")
@@ -159,9 +164,11 @@ func TestCommitFlushed_SameMillisecondRewrite(t *testing.T) {
 	const ck = "same_ms_001"
 	payloadKey := shield.PayloadKey(s.Namespace(), s.BandFor(ck), ck)
 
-	require.NoError(t, s.Write(ctx, ck, []byte(`{"v":1}`)))
+	_, wErr := s.Write(ctx, ck, []byte(`{"v":1}`), nil)
+	require.NoError(t, wErr)
 	v1 := drained(t, s, ck)
-	require.NoError(t, s.Write(ctx, ck, []byte(`{"v":2}`)))
+	_, wErr2 := s.Write(ctx, ck, []byte(`{"v":2}`), nil)
+	require.NoError(t, wErr2)
 	// Force the collision regardless of timing: give v2 v1's timestamp.
 	require.NoError(t, s.Client().HSet(ctx, payloadKey, "ts", v1.JournalTS).Err())
 
@@ -193,7 +200,8 @@ func TestCommitFlushed_NonPositiveTTLCommitsWithoutExpiry(t *testing.T) {
 	ctx := context.Background()
 	const ck = "zero_ttl_001"
 
-	require.NoError(t, s.Write(ctx, ck, []byte(`{"v":1}`)))
+	_, wErr := s.Write(ctx, ck, []byte(`{"v":1}`), nil)
+	require.NoError(t, wErr)
 	assert.True(t, commitAs(t, s, drained(t, s, ck), 0))
 
 	assert.False(t, isDirtyKey(t, s, ck))
@@ -215,13 +223,15 @@ func TestHasPendingVersion(t *testing.T) {
 
 	assert.False(t, pending(), "never written")
 
-	require.NoError(t, s.Write(ctx, ck, []byte(`{"v":1}`)))
+	_, wErr := s.Write(ctx, ck, []byte(`{"v":1}`), nil)
+	require.NoError(t, wErr)
 	assert.True(t, pending(), "awaiting flush")
 
 	simulateFlush(t, s, ck, 30*time.Second)
 	assert.False(t, pending(), "flushed: the datastore already has it")
 
-	require.NoError(t, s.Write(ctx, ck, []byte(`{"v":2}`)))
+	_, wErr2 := s.Write(ctx, ck, []byte(`{"v":2}`), nil)
+	require.NoError(t, wErr2)
 	rec := drained(t, s, ck)
 	_, err := s.DeadLetterIfUnchanged(ctx, s.BandFor(ck), []shield.VersionedKey{{CorrelationKey: ck, Seq: rec.Seq}}, "test")
 	require.NoError(t, err)
@@ -237,10 +247,12 @@ func TestDeadLetterIfUnchanged_SparesRewrittenKey(t *testing.T) {
 	band, keys := findKeysForTest(t, s, "dlq_guard", 2)
 	failed, rewritten := keys[0], keys[1]
 	for _, ck := range keys {
-		require.NoError(t, s.Write(ctx, ck, []byte(`{"v":1}`)))
+		_, wErr := s.Write(ctx, ck, []byte(`{"v":1}`), nil)
+		require.NoError(t, wErr)
 	}
 	recFailed, recRewritten := drained(t, s, failed), drained(t, s, rewritten)
-	require.NoError(t, s.Write(ctx, rewritten, []byte(`{"v":2}`))) // fixed payload arrives
+	_, wErr := s.Write(ctx, rewritten, []byte(`{"v":2}`), nil) // fixed payload arrives
+	require.NoError(t, wErr)
 
 	moved, err := s.DeadLetterIfUnchanged(ctx, band, []shield.VersionedKey{
 		{CorrelationKey: failed, Seq: recFailed.Seq},
@@ -263,8 +275,10 @@ func TestRefreshHotTTL_OnlyExtendsFlushedPayloads(t *testing.T) {
 	t.Cleanup(func() { _ = s.Close() })
 	ctx := context.Background()
 
-	require.NoError(t, s.Write(ctx, "refresh_unflushed", []byte(`{"v":1}`)))
-	require.NoError(t, s.Write(ctx, "refresh_flushed", []byte(`{"v":1}`)))
+	_, wErr := s.Write(ctx, "refresh_unflushed", []byte(`{"v":1}`), nil)
+	require.NoError(t, wErr)
+	_, wErr2 := s.Write(ctx, "refresh_flushed", []byte(`{"v":1}`), nil)
+	require.NoError(t, wErr2)
 	simulateFlush(t, s, "refresh_flushed", 5*time.Second)
 
 	for _, ck := range []string{"refresh_unflushed", "refresh_flushed"} {

@@ -99,6 +99,8 @@ func (r *countingRecorder) RecordDeadLetter(string, string, int)                
 func (r *countingRecorder) RecordUnflushedExpiry(string, string, int)             {}
 func (r *countingRecorder) RecordTransientRetry(string, string, int)              {}
 func (r *countingRecorder) RecordOldestDirtyAge(string, string, time.Duration)    {}
+func (r *countingRecorder) RecordIndexUpdateFailed(string, string)                {}
+func (r *countingRecorder) RecordDegradedIdempotentWrite(string)                  {}
 func (r *countingRecorder) RecordDLQProcess(string, string, int, int, int)        {}
 
 // snapshot returns a thread-safe copy of the counters.
@@ -232,7 +234,7 @@ func verifyJournalPayload(t *testing.T, namespace, key string, expectedPayload [
 
 	verifyShield, err := shield.New(shield.RedisConfig{
 		Addrs: []string{l1RedisAddr()}, ClusterMode: false, DB: l1TestDB,
-	}, namespace, 16, 30*time.Second, 4*time.Hour, 0)
+	}, namespace, 16, 30*time.Second, 4*time.Hour, 0, false)
 	require.NoError(t, err)
 	defer func(verifyShield *shield.Shield) {
 		err := verifyShield.Close()

@@ -73,6 +73,18 @@ groups:
         annotations:
           summary: "sluice cross-pod broadcast p99 lag exceeds 1s — check Redis Streams health"
 
+      # ── Index reconciliation ────────────────────────────────────────────
+      - alert: SluiceIndexUpdateFailed
+        # The ixp marker could not be cleared because UpdateIndexes failed.
+        # Until a dedup-hit retry repairs it, Query results may omit the key.
+        expr: increase(sluice_nudge_inventory_index_update_failed_total[5m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "sluice index update failed (band {{ $labels.band }})"
+          description: "A secondary index update failed after a write or hydration. The record is journaled but may be missing from Query results until a duplicate write heals the index. Check Redis connectivity and index contract errors."
+
       # ── DLQ ─────────────────────────────────────────────────────────────
       - alert: SluiceDLQInflowSpike
         expr: sum(rate(sluice_nudge_inventory_dead_letter_total[5m])) > 10

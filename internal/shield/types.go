@@ -3,11 +3,15 @@ package shield
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"sync"
 	"time"
 
 	"github.com/redis/go-redis/v9"
 )
+
+// ErrDuplicateKey is returned when a write script detects an idempotency guard.
+var ErrDuplicateKey = errors.New("sluice/shield: duplicate key")
 
 // FlushRecord is the internal unit that travels through the pipeline.
 type FlushRecord struct {
@@ -107,6 +111,28 @@ type RedisConfig struct {
 	TLSConfig *tls.Config
 }
 
+// WriteResult codes for the unified {code, e, v} script reply shape.
+const (
+	WriteCodeDedup     = 0 // deduplicated, accepted (no state change)
+	WriteCodeWritten   = 1 // written
+	WriteCodeIdemDup   = 2 // idempotency duplicate (nothing written)
+	WriteCodeIndexPend = 3 // deduplicated, index pending — caller must re-index
+)
+
+// WriteResult is the parsed reply from atomicWriteLua / atomicDedupWriteLua.
+type WriteResult struct {
+	Status  int
+	Epoch   int64  // 'e' field; 0 if absent
+	Seq     string // 'v' field as string
+	Written bool   // Status == WriteCodeWritten
+}
+
+// WriteOpts configures optional per-call behavior for a shield write.
+type WriteOpts struct {
+	GuardKey   string
+	GuardTTLMs int64
+}
+
 // VolumeSignaler is called by the batcher after flushing a batch to signal
 // the engine that a band may have reached its volume threshold.
 type VolumeSignaler func(band int)
@@ -117,10 +143,18 @@ type writeEntry struct {
 	payload        []byte
 	ts             float64
 	kind           broadcastKind
+	guardKey       string
+	guardTTLMs     int64
 	// done receives this entry's own write result once its batch has been
 	// executed (buffered, so the batcher never blocks on it). nil for
 	// direct writes.
-	done chan error
+	done chan writeResult
+}
+
+// writeResult carries the per-entry outcome from a pipeline batch.
+type writeResult struct {
+	result WriteResult
+	err    error
 }
 
 // Shield manages all Redis interactions for the library.
@@ -131,11 +165,14 @@ type Shield struct {
 	keyTTL         time.Duration
 	activityWindow time.Duration
 	dlqTTL         time.Duration // how long dead-letter payload hashes are kept
+	indexEnabled   bool          // when true, write scripts set the ixp marker
 	// Scripts are pre-loaded in New and run via EVALSHA; every call site
 	// reloads and retries on NOSCRIPT (script cache flushed by a restart or
 	// failover), so a cold cache never fails a write.
-	writeScript   *redis.Script
-	hydrateScript *redis.Script
+	writeScript          *redis.Script
+	dedupScript          *redis.Script
+	hydrateScript        *redis.Script
+	clearIndexPendScript *redis.Script
 
 	commitScript     *redis.Script // conditional commit + post-flush TTL
 	deadLetterScript *redis.Script // conditional move to dead-letter
@@ -172,8 +209,12 @@ type JournalRead struct {
 
 // atomicWriteLua stores the payload and marks the key dirty in one step.
 //
-// KEYS[1]=payload hash, KEYS[2]=dirty set; ARGV[1]=payload, ARGV[2]=ts,
-// ARGV[3]=correlation key.
+// KEYS[1]=payload hash, KEYS[2]=dirty set, KEYS[3]=idempotency guard (optional).
+// ARGV[1]=payload, ARGV[2]=ts, ARGV[3]=correlation key,
+// ARGV[4]=guard TTL ms (required when KEYS[3] present),
+// ARGV[5]="1" when IndexContract is set (ixp marker).
+//
+// Reply: {code, e, v} — see WriteResult / WriteResultCode constants.
 //
 // An unflushed payload exists only in Redis, so it must never carry a TTL.
 // PERSIST is required, not just omitting EXPIRE: HSET keeps whatever TTL the
@@ -185,12 +226,31 @@ type JournalRead struct {
 // HINCRBY 'v' gives every write a per-key sequence, which commit and
 // dead-letter compare against: the ms timestamp alone cannot tell apart two
 // writes in the same millisecond.
+//
+// Guard SET is the LAST command: a script failure before it leaves no guard,
+// so retries are never silently blocked.
 const atomicWriteLua = `
+if KEYS[3] and redis.call('EXISTS', KEYS[3]) == 1 then
+    local e = redis.call('HGET', KEYS[1], 'e') or '0'
+    local v = redis.call('HGET', KEYS[1], 'v') or '0'
+    return {2, e, v}
+end
+
 redis.call('HSET', KEYS[1], 'p', ARGV[1], 'ts', ARGV[2])
-redis.call('HINCRBY', KEYS[1], 'v', 1)
+local v = redis.call('HINCRBY', KEYS[1], 'v', 1)
 redis.call('PERSIST', KEYS[1])
 redis.call('ZADD', KEYS[2], ARGV[2], ARGV[3])
-return 1`
+
+if ARGV[5] == "1" then
+    redis.call('HSET', KEYS[1], 'ixp', v)
+end
+
+if KEYS[3] then
+    redis.call('SET', KEYS[3], '1', 'PX', ARGV[4])
+end
+
+local e = redis.call('HGET', KEYS[1], 'e') or '0'
+return {1, e, tostring(v)}`
 
 // commitFlushedLua commits one flushed key atomically, but only if the
 // payload is still the version that was drained (same 'v'). Otherwise a
@@ -265,7 +325,7 @@ return 0`
 //
 // KEYS[1]=payload hash
 // ARGV[1]=payload, ARGV[2]=hydration ts (captured BEFORE the Source read),
-// ARGV[3]=ttl in ms
+// ARGV[3]=ttl in ms, ARGV[4]="1" when IndexContract is set (ixp marker).
 //
 // Hydration only fills a journal miss. Every write lands in the journal
 // before the store, so an existing entry — pending flush, flushed, or
@@ -288,6 +348,9 @@ end
 redis.call('HSET', KEYS[1], 'p', ARGV[1], 'ts', ARGV[2])
 redis.call('HDEL', KEYS[1], 'h')
 redis.call('PEXPIRE', KEYS[1], ttl)
+if ARGV[4] == "1" then
+    redis.call('HSET', KEYS[1], 'ixp', '0')
+end
 return {1}
 `
 
@@ -303,13 +366,14 @@ type HydrateResult struct {
 
 // atomicDedupWriteLua is atomicWriteLua with xxHash64 content deduplication.
 //
-// KEYS[1]=payload hash, KEYS[2]=dirty set; ARGV[1]=payload, ARGV[2]=ts,
-// ARGV[3]=correlation key, ARGV[4]=ttl in ms, ARGV[5]=content hash.
+// KEYS[1]=payload hash, KEYS[2]=dirty set, KEYS[3]=idempotency guard (optional).
+// ARGV[1]=payload, ARGV[2]=ts, ARGV[3]=correlation key, ARGV[4]=ttl in ms,
+// ARGV[5]=content hash, ARGV[6]=guard TTL ms ("" when no guard),
+// ARGV[7]="1" when IndexContract is set (ixp marker).
 //
-// A duplicate refreshes the TTL of a flushed entry (extend-only, so a hot
-// key's longer TTL is kept) and leaves an unflushed, persistent entry alone.
-// A new payload is persisted exactly as in atomicWriteLua.
-// Returns 0 if deduplicated, 1 if written.
+// Reply: {code, e, v} — see WriteResult / WriteResultCode constants.
+// Ordering: guard check → dedup with marker → dedup without marker → fresh write.
+// Guard SET is LAST on every accept path.
 const atomicDedupWriteLua = `
 local payloadKey = KEYS[1]
 local dirtyKey = KEYS[2]
@@ -318,6 +382,14 @@ local score = ARGV[2]
 local corrKey = ARGV[3]
 local ttl = tonumber(ARGV[4])
 local contentHash = ARGV[5]
+local guardTtl = ARGV[6]
+local indexEnabled = ARGV[7]
+
+if KEYS[3] and redis.call('EXISTS', KEYS[3]) == 1 then
+    local e = redis.call('HGET', payloadKey, 'e') or '0'
+    local v = redis.call('HGET', payloadKey, 'v') or '0'
+    return {2, e, v}
+end
 
 local existingHash = redis.call('HGET', payloadKey, 'h')
 if existingHash == contentHash then
@@ -325,14 +397,31 @@ if existingHash == contentHash then
     if pttl >= 0 and pttl < ttl then
         redis.call('PEXPIRE', payloadKey, ttl)
     end
-    return 0
+    if KEYS[3] and guardTtl ~= "" then
+        redis.call('SET', KEYS[3], '1', 'PX', guardTtl)
+    end
+    if indexEnabled == "1" and redis.call('HEXISTS', payloadKey, 'ixp') == 1 then
+        local v = redis.call('HGET', payloadKey, 'v') or '0'
+        local e = redis.call('HGET', payloadKey, 'e') or '0'
+        return {3, e, v}
+    end
+    local e = redis.call('HGET', payloadKey, 'e') or '0'
+    local v = redis.call('HGET', payloadKey, 'v') or '0'
+    return {0, e, v}
 end
 
 redis.call('HSET', payloadKey, 'p', payload, 'ts', score, 'h', contentHash)
-redis.call('HINCRBY', payloadKey, 'v', 1)
+local v = redis.call('HINCRBY', payloadKey, 'v', 1)
 redis.call('PERSIST', payloadKey)
 redis.call('ZADD', dirtyKey, score, corrKey)
-return 1
+if indexEnabled == "1" then
+    redis.call('HSET', payloadKey, 'ixp', v)
+end
+if KEYS[3] and guardTtl ~= "" then
+    redis.call('SET', KEYS[3], '1', 'PX', guardTtl)
+end
+local e = redis.call('HGET', payloadKey, 'e') or '0'
+return {1, e, tostring(v)}
 `
 
 // Broadcasting related changes

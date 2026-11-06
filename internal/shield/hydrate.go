@@ -71,7 +71,11 @@ func (s *Shield) hydrateKeys(correlationKey string) []string {
 }
 
 func (s *Shield) hydrateArgs(payload []byte, ts int64) []interface{} {
-	return []interface{}{payload, strconv.FormatInt(ts, 10), s.activityWindow.Milliseconds()}
+	args := []interface{}{payload, strconv.FormatInt(ts, 10), s.activityWindow.Milliseconds()}
+	if s.indexEnabled {
+		args = append(args, "1")
+	}
+	return args
 }
 
 // parseHydrateResult decodes hydrateLua's reply: {1} or {0, payload, ts}.
