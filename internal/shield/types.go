@@ -20,7 +20,8 @@ type FlushRecord struct {
 	// and dead-letter are conditional on it, so a write that lands while the
 	// batch is in flight — even within the same millisecond — is never
 	// removed from the dirty set.
-	Seq string
+	Seq         string
+	DLQAttempts int // DLQ-only: number of prior replay attempts; 0 on first drain
 }
 
 // WriteOptions configures optional behaviors for a single write operation.

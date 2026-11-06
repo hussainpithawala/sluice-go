@@ -54,10 +54,14 @@ type Result struct {
 
 // Config holds DLQ processor options.
 type Config struct {
-	Strategy     Strategy
-	MaxBatchSize int
-	KeyMutator   func(string) string
-	Logger       *slog.Logger
+	Strategy       Strategy
+	MaxBatchSize   int
+	KeyMutator     func(string) string
+	Logger         *slog.Logger
+	LockTTL        time.Duration // >0 enables a per-band SET NX PX advisory lock; only one replica processes a band's DLQ per tick
+	BackoffBase    time.Duration // base delay for exponential backoff on failed DLQ replays; 0 disables backoff
+	BackoffMax     time.Duration // cap on backoff delay; 0 defaults to 1h
+	MaxDLQAttempts int           // >0: park (commit) keys that exceed this many replay attempts; 0 = unlimited
 }
 
 // Processor drains and handles dead-letter records.
@@ -104,7 +108,7 @@ func (p *Processor) Process(ctx context.Context) (*Result, error) {
 		if err := ctx.Err(); err != nil {
 			return total, err
 		}
-		if err := p.processBand(ctx, band, total); err != nil {
+		if err := p.lockedProcessBand(ctx, band, total); err != nil {
 			return total, err
 		}
 	}
@@ -114,6 +118,26 @@ func (p *Processor) Process(ctx context.Context) (*Result, error) {
 		total.Processed, total.Succeeded, total.Failed,
 	)
 	return total, nil
+}
+
+func (p *Processor) lockedProcessBand(ctx context.Context, band int, total *Result) error {
+	if p.cfg.LockTTL <= 0 {
+		return p.processBand(ctx, band, total)
+	}
+	acquired, err := p.shield.TryDLQLock(ctx, band, p.cfg.LockTTL)
+	if err != nil {
+		return fmt.Errorf("dlq: lock band %d: %w", band, err)
+	}
+	if !acquired {
+		p.cfg.Logger.Debug("dlq: skipping band, another replica holds the lock", "band", band)
+		return nil
+	}
+	defer func() {
+		if err := p.shield.ReleaseDLQLock(ctx, band); err != nil {
+			p.cfg.Logger.Warn("dlq: release DLQ lock error", "band", band, "err", err)
+		}
+	}()
+	return p.processBand(ctx, band, total)
 }
 
 func (p *Processor) processBand(ctx context.Context, band int, total *Result) error {
@@ -243,9 +267,10 @@ func (p *Processor) handleUpsert(ctx context.Context, band int, records []shield
 			return fmt.Errorf("dlq: commit upsert band %d: %w", band, commitErr)
 		}
 	}
+	parked := p.deferFailedKeys(ctx, band, records, failedKeys)
 	total.Processed += len(corrKeys)
-	total.Succeeded += len(successKeys)
-	total.Failed += len(failedKeys)
+	total.Succeeded += len(successKeys) + parked
+	total.Failed += len(failedKeys) - parked
 	return nil
 }
 
@@ -267,6 +292,13 @@ func (p *Processor) handleReInsert(ctx context.Context, band int, records []shie
 	if len(failedKeys) > 0 {
 		p.cfg.Logger.Warn("dlq: reinsert batch had write failures",
 			"band", band, "failed", len(failedKeys))
+		failedSet := make(map[string]bool, len(failedKeys))
+		for _, k := range failedKeys {
+			failedSet[k] = true
+		}
+		parked := p.deferFailedKeys(ctx, band, records, failedSet)
+		total.Failed -= parked
+		total.Succeeded += parked
 	}
 
 	if len(committable) > 0 {
@@ -278,6 +310,67 @@ func (p *Processor) handleReInsert(ctx context.Context, band int, records []shie
 	total.Processed += len(committable)
 	total.Succeeded += len(committable)
 	return nil
+}
+
+// deferFailedKeys applies exponential backoff to keys that failed during DLQ
+// replay. Keys exceeding MaxDLQAttempts are parked (committed out of the DLQ).
+// Returns the count of parked keys.
+func (p *Processor) deferFailedKeys(ctx context.Context, band int, records []shield.FlushRecord, failedSet map[string]bool) int {
+	if p.cfg.BackoffBase <= 0 || len(failedSet) == 0 {
+		return 0
+	}
+
+	var deferKeys []string
+	var deferAttempts []int
+	var deferRetryAt []float64
+	var parkedKeys []string
+
+	for _, rec := range records {
+		if !failedSet[rec.CorrelationKey] {
+			continue
+		}
+		attempt := rec.DLQAttempts + 1
+		if p.cfg.MaxDLQAttempts > 0 && attempt > p.cfg.MaxDLQAttempts {
+			parkedKeys = append(parkedKeys, rec.CorrelationKey)
+			continue
+		}
+		delay := backoffDelay(p.cfg.BackoffBase, p.cfg.BackoffMax, attempt)
+		retryAt := float64(time.Now().Add(delay).UnixMilli())
+		deferKeys = append(deferKeys, rec.CorrelationKey)
+		deferAttempts = append(deferAttempts, attempt)
+		deferRetryAt = append(deferRetryAt, retryAt)
+	}
+
+	if len(deferKeys) > 0 {
+		if err := p.shield.DeferDLQKeys(ctx, band, deferKeys, deferAttempts, deferRetryAt); err != nil {
+			p.cfg.Logger.Warn("dlq: failed to defer keys for backoff", "band", band, "err", err)
+		}
+	}
+
+	if len(parkedKeys) > 0 {
+		p.cfg.Logger.Warn("dlq: parking keys — exceeded max DLQ attempts",
+			"band", band, "count", len(parkedKeys), "max_attempts", p.cfg.MaxDLQAttempts)
+		_ = p.shield.CommitDLQKeys(ctx, band, parkedKeys)
+	}
+
+	return len(parkedKeys)
+}
+
+func backoffDelay(base, max time.Duration, attempt int) time.Duration {
+	if max <= 0 {
+		max = time.Hour
+	}
+	d := base
+	for i := 1; i < attempt; i++ {
+		d *= 2
+		if d > max {
+			return max
+		}
+	}
+	if d > max {
+		return max
+	}
+	return d
 }
 
 // DefaultKeyMutator appends a timestamp suffix to avoid key collision.

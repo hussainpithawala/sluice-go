@@ -155,10 +155,36 @@ func (b *Builder) WithDLQAutoProcess(interval time.Duration, strategy DLQStrateg
 	return b
 }
 
+// WithDLQLock enables a per-band advisory lock (SET NX PX) so that only one
+// replica processes a given band's DLQ per tick. Other replicas skip the band
+// and try again on the next tick. The lock auto-expires after the DLQ interval
+// so a crashed replica does not block others indefinitely.
+func (b *Builder) WithDLQLock(v bool) *Builder {
+	b.cfg.DLQLock = v
+	return b
+}
+
 // WithDLQTTL sets how long dead-letter payload hashes are kept in Redis.
 // Zero uses the default (7 days).
 func (b *Builder) WithDLQTTL(d time.Duration) *Builder {
 	b.cfg.DLQTTL = d
+	return b
+}
+
+// WithDLQBackoff enables exponential backoff for failed DLQ replays. After a
+// key fails, its next retry is deferred by base * 2^(attempt-1), capped at max.
+// Zero base disables backoff. Zero max defaults to 1h.
+func (b *Builder) WithDLQBackoff(base, max time.Duration) *Builder {
+	b.cfg.DLQBackoffBase = base
+	b.cfg.DLQBackoffMax = max
+	return b
+}
+
+// WithDLQMaxAttempts sets the maximum number of DLQ replay attempts per key.
+// Keys exceeding this limit are parked (committed out of the DLQ).
+// Zero means unlimited attempts.
+func (b *Builder) WithDLQMaxAttempts(n int) *Builder {
+	b.cfg.DLQMaxAttempts = n
 	return b
 }
 
@@ -370,6 +396,12 @@ func (b *Builder) validate() error {
 	}
 	if b.cfg.DLQTTL < 0 {
 		return fmt.Errorf("sluice: DLQTTL must be >= 0, got %v", b.cfg.DLQTTL)
+	}
+	if b.cfg.DLQBackoffBase < 0 {
+		return fmt.Errorf("sluice: DLQBackoffBase must be >= 0, got %v", b.cfg.DLQBackoffBase)
+	}
+	if b.cfg.DLQMaxAttempts < 0 {
+		return fmt.Errorf("sluice: DLQMaxAttempts must be >= 0, got %d", b.cfg.DLQMaxAttempts)
 	}
 	return nil
 }
@@ -920,11 +952,22 @@ func (s *Sluice) ProcessDLQ(ctx context.Context, strategy DLQStrategy, opts ...D
 		}, nil
 	}
 
+	var lockTTL time.Duration
+	if s.cfg.DLQLock {
+		lockTTL = s.cfg.DLQProcessInterval
+		if lockTTL <= 0 {
+			lockTTL = 30 * time.Second
+		}
+	}
 	proc := dlq.NewProcessor(s.shield, s.sk, wrappedContract, s.metrics, dlq.Config{
-		Strategy:     dlq.Strategy(strategy),
-		MaxBatchSize: o.maxBatchSize,
-		KeyMutator:   o.keyMutator,
-		Logger:       o.logger,
+		Strategy:       dlq.Strategy(strategy),
+		MaxBatchSize:   o.maxBatchSize,
+		KeyMutator:     o.keyMutator,
+		Logger:         o.logger,
+		LockTTL:        lockTTL,
+		BackoffBase:    s.cfg.DLQBackoffBase,
+		BackoffMax:     s.cfg.DLQBackoffMax,
+		MaxDLQAttempts: s.cfg.DLQMaxAttempts,
 	})
 
 	result, err := proc.Process(ctx)
